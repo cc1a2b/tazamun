@@ -131,6 +131,19 @@ file whenever a dependency is added or a load-bearing design decision is made.
   phase rather than added during bootstrap. The Phase 0 acceptance smoke test
   waits out the window so it exercises the violation path directly.
 
+## Portability
+
+- **Watcher relative-path mapping tries multiple roots** — the 3-OS CI matrix
+  caught a macOS-only failure: temp/session folders under `/var/folders/…` are
+  symlinks to `/private/var/folders/…`, and macOS FSEvents reports the canonical
+  `/private/var` path, so stripping the session root failed and every watch
+  event was dropped (deletions went undetected). The fix maps each event path
+  against both the original root **and** its canonicalized form. It deliberately
+  does *not* canonicalize the path that is watched (which on Windows would become
+  a `\\?\` extended-length path and risk regressing the already-passing Windows
+  job) — only the strip-prefix comparison is made permissive. Linux/Windows hit
+  the original root on the first try; macOS falls through to the canonical one.
+
 ## Dependency audit (Phase 0)
 
 `cargo audit` reports **zero security vulnerabilities** across the 495-crate

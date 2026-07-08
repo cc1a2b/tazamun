@@ -48,8 +48,13 @@ fn contains_meta(path: &Path) -> bool {
     })
 }
 
-fn to_rel(root: &Path, abs: &Path) -> Option<RelPath> {
-    let rel = abs.strip_prefix(root).ok()?;
+/// Maps an absolute event path to a session-relative path. The event path is
+/// tried against every candidate root: on macOS a session under
+/// `/var/folders/…` is reported by FSEvents as its canonical
+/// `/private/var/folders/…` form, so stripping must succeed against either the
+/// original or the canonicalized root.
+fn to_rel(roots: &[PathBuf], abs: &Path) -> Option<RelPath> {
+    let rel = roots.iter().find_map(|root| abs.strip_prefix(root).ok())?;
     let mut parts = Vec::new();
     for c in rel.components() {
         match c {
@@ -65,7 +70,16 @@ fn to_rel(root: &Path, abs: &Path) -> Option<RelPath> {
 
 /// Starts watching `root` recursively, forwarding debounced events into `tx`.
 pub fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Watcher, WatchError> {
-    let event_root = root.clone();
+    // Candidate roots for relative-path mapping: the original path plus its
+    // canonical form (they differ on macOS, where `/var` → `/private/var`).
+    // The original root is still what we watch, so Windows/Linux behaviour is
+    // unchanged. Deduplicate so the common case tries a single root.
+    let mut event_roots = vec![root.clone()];
+    if let Ok(canon) = root.canonicalize()
+        && canon != root
+    {
+        event_roots.push(canon);
+    }
     let mut debouncer =
         new_debouncer(
             DEBOUNCE,
@@ -89,7 +103,7 @@ pub fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Watcher, Wat
                             if path.is_dir() {
                                 continue;
                             }
-                            let Some(rel) = to_rel(&event_root, path) else {
+                            let Some(rel) = to_rel(&event_roots, path) else {
                                 continue;
                             };
                             let kind = if kind == WatchKind::Removed && path.is_file() {
@@ -131,12 +145,37 @@ mod tests {
 
     #[test]
     fn rel_mapping() {
-        let root = Path::new("/root");
+        let roots = vec![PathBuf::from("/root")];
         assert_eq!(
-            to_rel(root, Path::new("/root/a/b.txt")).unwrap().as_str(),
+            to_rel(&roots, Path::new("/root/a/b.txt")).unwrap().as_str(),
             "a/b.txt"
         );
-        assert!(to_rel(root, Path::new("/elsewhere/a")).is_none());
-        assert!(to_rel(root, Path::new("/root")).is_none());
+        assert!(to_rel(&roots, Path::new("/elsewhere/a")).is_none());
+        assert!(to_rel(&roots, Path::new("/root")).is_none());
+    }
+
+    #[test]
+    fn rel_mapping_tries_canonical_root() {
+        // macOS reports events under the canonical /private/var prefix while
+        // the session root is the /var symlink; stripping must still succeed.
+        let roots = vec![
+            PathBuf::from("/var/folders/x/session"),
+            PathBuf::from("/private/var/folders/x/session"),
+        ];
+        assert_eq!(
+            to_rel(
+                &roots,
+                Path::new("/private/var/folders/x/session/notes.txt")
+            )
+            .unwrap()
+            .as_str(),
+            "notes.txt"
+        );
+        assert_eq!(
+            to_rel(&roots, Path::new("/var/folders/x/session/notes.txt"))
+                .unwrap()
+                .as_str(),
+            "notes.txt"
+        );
     }
 }
