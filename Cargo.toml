@@ -56,6 +56,14 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Optimize dependency code even in debug/test builds. tazamun's own crate stays
+# unoptimized (fast compiles, good backtraces), but hot dependencies — BLAKE3,
+# FastCDC, the iroh QUIC/crypto stack — run at full speed, so the heavy
+# integration tests (a 32 MiB chunk/hash/transfer round-trip) complete quickly
+# and reliably on shared CI runners instead of timing out in a debug build.
+[profile.dev.package."*"]
+opt-level = 2
+
 # cargo-dist drives .github/workflows/release.yml (regenerate with `dist generate`).
 # pr-run-mode = "skip" keeps release.yml triggered ONLY on version tags — never
 # on pushes/PRs — so no release machinery runs until the single v0.1.0 tag.

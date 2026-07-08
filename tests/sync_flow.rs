@@ -131,7 +131,7 @@ async fn delta_edit_transfers_under_20_percent() {
         got.is_some_and(|d| d.len() == want.len() && blake3::hash(&d) == blake3::hash(want))
     };
     assert!(
-        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(60)).await,
+        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await,
         "32 MiB initial sync did not complete"
     );
 
@@ -148,7 +148,7 @@ async fn delta_edit_transfers_under_20_percent() {
     a.unlock_ok("big.bin").await;
 
     assert!(
-        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(60)).await,
+        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await,
         "delta edit did not sync"
     );
 

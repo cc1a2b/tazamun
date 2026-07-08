@@ -144,6 +144,25 @@ file whenever a dependency is added or a load-bearing design decision is made.
   job) — only the strip-prefix comparison is made permissive. Linux/Windows hit
   the original root on the first try; macOS falls through to the canonical one.
 
+## CI stability (Phase 0)
+
+The 3-OS CI matrix surfaced two environment issues (not product bugs), each
+fixed at the root:
+
+- **Dependencies are optimized in debug/test builds** (`[profile.dev.package."*"]
+  opt-level = 2`). The 32 MiB delta-sync test chunks and BLAKE3-hashes the file
+  several times; in a fully unoptimized build that is CPU-bound and timed out on
+  a slow Windows runner (~72 s). Optimizing dependency code (while keeping
+  tazamun's own crate unoptimized for fast compiles and good backtraces) brings
+  the whole `sync_flow` suite to ~1.5 s locally, with generous headroom on any
+  runner. The heavy test's wait budgets were also raised to 120 s belt-and-
+  suspenders.
+- **macOS pinned to `macos-14` + cache prefix bumped.** A macOS run failed to
+  execute the `iroh-relay` build script ("cannot execute binary file", exit
+  126) — a stale build artifact restored across an architecture change in the
+  floating `macos-latest` runner pool. Pinning a fixed-arch runner and bumping
+  the `rust-cache` prefix key make the build cache architecture-consistent.
+
 ## Dependency audit (Phase 0)
 
 `cargo audit` reports **zero security vulnerabilities** across the 495-crate
