@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{RawPeer, TestNode, WAIT, wait_until};
+use common::{RawPeer, TestNode, WAIT, WAIT_MESH, wait_until};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deny_while_held_then_grant_after_release() {
@@ -128,6 +128,9 @@ async fn holder_crash_ttl_expiry_allows_takeover() {
     let invite = a.invite().await;
     let b = TestNode::join(&invite).await;
     let c = TestNode::join(&invite).await;
+    // Full mesh: B and C only learn each other through gossip presence, so this
+    // can take a couple of beacon intervals. Also require A to have both peers'
+    // indexes so the lock below passes FRESHNESS without a race.
     assert!(
         wait_until(
             || async {
@@ -135,8 +138,9 @@ async fn holder_crash_ttl_expiry_allows_takeover() {
                     && c.read_file("crashy.txt").is_some()
                     && b.online_peers().await >= 2
                     && c.online_peers().await >= 2
+                    && a.synced_peers().await >= 2
             },
-            WAIT
+            WAIT_MESH
         )
         .await,
         "mesh did not form"

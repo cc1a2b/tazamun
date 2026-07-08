@@ -157,6 +157,14 @@ fixed at the root:
   the whole `sync_flow` suite to ~1.5 s locally, with generous headroom on any
   runner. The heavy test's wait budgets were also raised to 120 s belt-and-
   suspenders.
+- **Convergence poll budgets raised for slow runners.** `wait_until` returns as
+  soon as its predicate holds, so a larger timeout only adds slack when a runner
+  is slow — it never slows the passing path. The shared budget went from 10 s to
+  30 s, and three-node gossip mesh formation (where two joiners discover each
+  other only through presence beacons) gets a dedicated 60 s budget. Multi-node
+  lock tests also wait until the acquiring node has received every peer's index
+  (`synced` in `status`), so lease acquisition is gated on the real FRESHNESS
+  precondition rather than on a peer merely being "online".
 - **macOS pinned to `macos-14` + cache prefix bumped.** A macOS run failed to
   execute the `iroh-relay` build script ("cannot execute binary file", exit
   126) — a stale build artifact restored across an architecture change in the

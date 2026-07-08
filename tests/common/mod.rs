@@ -239,7 +239,14 @@ where
     }
 }
 
-pub const WAIT: Duration = Duration::from_secs(10);
+/// Generous poll budget for convergence assertions. `wait_until` returns as
+/// soon as the predicate holds, so a larger value only adds slack on slow or
+/// loaded CI runners without slowing the passing path.
+pub const WAIT: Duration = Duration::from_secs(30);
+
+/// Longer budget for multi-node gossip mesh formation (three nodes discovering
+/// one another through presence beacons).
+pub const WAIT_MESH: Duration = Duration::from_secs(60);
 
 /// Asserts both folders hold identical visible files (ignoring `.tazamun`).
 pub async fn assert_converged(a: &TestNode, b: &TestNode) {
