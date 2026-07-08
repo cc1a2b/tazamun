@@ -1,0 +1,460 @@
+//! Integration-test harness: fully offline in-process nodes.
+//!
+//! Every node binds to 127.0.0.1 with relays and address lookup disabled;
+//! peers learn each other exclusively through explicit invite tickets, which
+//! embed direct socket addresses.
+
+#![allow(dead_code)]
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use iroh::{Endpoint, EndpointAddr, EndpointId};
+use tazamun::daemon::{DaemonConfig, DaemonHandle, spawn};
+use tazamun::ipc::{IpcRequest, IpcResponse};
+use tazamun::locks::LockTimings;
+use tazamun::net::control::{handshake_acceptor, handshake_initiator};
+use tazamun::net::endpoint::{NetConfig, RelayChoice};
+use tazamun::proto::{Msg, read_msg, write_msg};
+use tazamun::session::{SessionKeys, SessionSecret, Ticket};
+
+pub const TEST_BIND: &str = "127.0.0.1:0";
+
+pub fn test_timings() -> LockTimings {
+    LockTimings {
+        ttl: Duration::from_secs(2),
+        renew: Duration::from_millis(500),
+        acquire_timeout: Duration::from_secs(3),
+    }
+}
+
+pub fn test_net() -> NetConfig {
+    NetConfig {
+        relay: RelayChoice::Disabled,
+        lan: false,
+        test_bind: Some(TEST_BIND.parse::<SocketAddr>().expect("valid bind addr")),
+    }
+}
+
+pub struct TestNode {
+    pub dir: tempfile::TempDir,
+    pub handle: DaemonHandle,
+}
+
+impl TestNode {
+    /// Initializes a fresh session in a temp folder and starts its daemon.
+    /// Files written into the folder before this call become the genesis
+    /// import.
+    pub async fn init() -> TestNode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tazamun::cli::init(dir.path()).expect("init");
+        Self::start(dir).await
+    }
+
+    /// Initializes the session folder but lets the caller stage files before
+    /// the daemon starts.
+    pub fn init_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tazamun::cli::init(dir.path()).expect("init");
+        dir
+    }
+
+    /// Joins an existing session from a ticket and starts the daemon.
+    pub async fn join(ticket: &str) -> TestNode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tazamun::cli::join(dir.path(), ticket).expect("join");
+        Self::start(dir).await
+    }
+
+    /// Starts a daemon over an already prepared session folder.
+    pub async fn start(dir: tempfile::TempDir) -> TestNode {
+        let handle = spawn(DaemonConfig {
+            dir: dir.path().to_path_buf(),
+            net: test_net(),
+            timings: test_timings(),
+        })
+        .await
+        .expect("daemon spawn");
+        TestNode { dir, handle }
+    }
+
+    pub fn id(&self) -> EndpointId {
+        self.handle.id()
+    }
+
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// A live invite ticket embedding this node's direct addresses.
+    pub async fn invite(&self) -> String {
+        let resp = self.handle.request(IpcRequest::Invite).await;
+        assert!(resp.ok, "invite failed: {resp:?}");
+        resp.data
+            .and_then(|d| d.get("ticket").and_then(|t| t.as_str().map(String::from)))
+            .expect("ticket in invite response")
+    }
+
+    pub async fn status(&self) -> serde_json::Value {
+        let resp = self.handle.request(IpcRequest::Status).await;
+        assert!(resp.ok, "status failed: {resp:?}");
+        resp.data.expect("status data")
+    }
+
+    pub async fn lock(&self, path: &str) -> IpcResponse {
+        self.handle
+            .request(IpcRequest::Lock { path: path.into() })
+            .await
+    }
+
+    pub async fn unlock(&self, path: &str) -> IpcResponse {
+        self.handle
+            .request(IpcRequest::Unlock { path: path.into() })
+            .await
+    }
+
+    /// Locks, asserting success.
+    pub async fn lock_ok(&self, path: &str) {
+        let resp = self.lock(path).await;
+        assert!(resp.ok, "lock {path} failed: {resp:?}");
+    }
+
+    pub async fn unlock_ok(&self, path: &str) {
+        let resp = self.unlock(path).await;
+        assert!(resp.ok, "unlock {path} failed: {resp:?}");
+    }
+
+    /// Number of authenticated + online members reported by status.
+    pub async fn online_peers(&self) -> usize {
+        self.status().await["members"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter(|e| e["online"].as_bool() == Some(true))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Number of members with a live authenticated control connection
+    /// (`conn` is Direct or Relayed, not None).
+    pub async fn connected_peers(&self) -> usize {
+        self.status().await["members"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter(|e| e["conn"].as_str().is_some_and(|c| c != "None"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    pub async fn file_count(&self) -> u64 {
+        self.status().await["file_count"].as_u64().unwrap_or(0)
+    }
+
+    pub fn abs(&self, rel: &str) -> PathBuf {
+        let mut p = self.dir.path().to_path_buf();
+        for seg in rel.split('/') {
+            p.push(seg);
+        }
+        p
+    }
+
+    pub fn write_file(&self, rel: &str, data: &[u8]) {
+        let p = self.abs(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        // Leased files are writable; new files are simply created.
+        std::fs::write(&p, data).expect("write");
+    }
+
+    pub fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.abs(rel)).ok()
+    }
+
+    pub fn delete_file(&self, rel: &str) {
+        std::fs::remove_file(self.abs(rel)).expect("remove");
+    }
+
+    pub fn is_readonly(&self, rel: &str) -> bool {
+        std::fs::metadata(self.abs(rel))
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(false)
+    }
+
+    pub fn blobs_dir_size(&self) -> u64 {
+        dir_size(&self.dir.path().join(".tazamun").join("blobs"))
+    }
+}
+
+/// Total byte size of every file under `path`, recursively.
+pub fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    total += dir_size(&entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Polls `pred` until it returns true or `timeout` elapses.
+pub async fn wait_until<F, Fut>(mut pred: F, timeout: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub const WAIT: Duration = Duration::from_secs(10);
+
+/// Asserts both folders hold identical visible files (ignoring `.tazamun`).
+pub async fn assert_converged(a: &TestNode, b: &TestNode) {
+    let same = wait_until(
+        || async { folder_snapshot(a.root()) == folder_snapshot(b.root()) },
+        WAIT,
+    )
+    .await;
+    assert!(
+        same,
+        "folders did not converge:\n a: {:?}\n b: {:?}",
+        folder_snapshot(a.root()),
+        folder_snapshot(b.root())
+    );
+}
+
+/// Map of rel path → BLAKE3(content) for every visible file.
+pub fn folder_snapshot(root: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    snapshot_walk(root, root, &mut out);
+    out
+}
+
+fn snapshot_walk(
+    root: &Path,
+    current: &Path,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy() == ".tazamun" {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            snapshot_walk(root, &path, out);
+        } else if meta.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let hash = std::fs::read(&path)
+                .map(|d| blake3::hash(&d).to_hex().to_string())
+                .unwrap_or_else(|_| "unreadable".into());
+            out.insert(rel, hash);
+        }
+    }
+}
+
+/// A protocol-level peer driven manually by tests: real endpoint, real
+/// handshake, scripted messages. Used for mute-voter and hostile-input tests.
+pub struct RawPeer {
+    pub endpoint: Endpoint,
+    pub conn: iroh::endpoint::Connection,
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+}
+
+impl RawPeer {
+    async fn build_endpoint() -> Endpoint {
+        tazamun::net::endpoint::build_endpoint(iroh::SecretKey::generate(), &test_net())
+            .await
+            .expect("raw endpoint")
+    }
+
+    fn keys_from_ticket(ticket: &str) -> SessionKeys {
+        let t = Ticket::decode(ticket).expect("decode ticket");
+        SessionKeys::derive(&t.secret)
+    }
+
+    fn addr_from_ticket(ticket: &str) -> EndpointAddr {
+        let t = Ticket::decode(ticket).expect("decode ticket");
+        t.bootstrap
+            .first()
+            .and_then(|w| w.to_endpoint_addr())
+            .expect("bootstrap addr in ticket")
+    }
+
+    /// Connects to the node behind `ticket` and completes the handshake with
+    /// the correct session secret. Sends one empty Index so the node counts
+    /// us as a synced voter.
+    pub async fn connect_authed(ticket: &str) -> RawPeer {
+        let endpoint = Self::build_endpoint().await;
+        let keys = Self::keys_from_ticket(ticket);
+        let addr = Self::addr_from_ticket(ticket);
+        let conn = endpoint
+            .connect(addr, tazamun::consts::CTL_ALPN)
+            .await
+            .expect("raw connect");
+        let me = endpoint.id();
+        let (mut send, recv) = handshake_initiator(&conn, &keys, me)
+            .await
+            .expect("raw handshake");
+        write_msg(
+            &mut send,
+            &Msg::Index {
+                lamport: 0,
+                files: vec![],
+                leases: vec![],
+            },
+        )
+        .await
+        .expect("send empty index");
+        RawPeer {
+            endpoint,
+            conn,
+            send,
+            recv,
+        }
+    }
+
+    /// Attempts the full initiator flow with a WRONG secret, deliberately
+    /// pushing a forged proof to test the node's rejection. Returns whether
+    /// an `Index` (i.e. post-auth data) was ever received.
+    pub async fn probe_with_wrong_secret(ticket: &str) -> bool {
+        let endpoint = Self::build_endpoint().await;
+        let addr = Self::addr_from_ticket(ticket);
+        let wrong = SessionKeys::derive(&SessionSecret([0xEE; 32]));
+        let Ok(conn) = endpoint.connect(addr, tazamun::consts::CTL_ALPN).await else {
+            return false;
+        };
+        let result = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            let nonce: [u8; 16] = rand::random();
+            write_msg(&mut send, &Msg::Hello { nonce }).await.ok()?;
+            // Read the acceptor's HelloAck (we cannot verify it — wrong key —
+            // and we do not care), then push a forged proof.
+            let Msg::HelloAck { nonce: nonce_b, .. } =
+                tokio::time::timeout(Duration::from_secs(5), read_msg(&mut recv))
+                    .await
+                    .ok()?
+                    .ok()?
+            else {
+                return None;
+            };
+            let forged = tazamun::net::control::proof(
+                &wrong.auth,
+                b"init",
+                &endpoint.id(),
+                &conn.remote_id(),
+                &nonce,
+                &nonce_b,
+            );
+            write_msg(&mut send, &Msg::Proof { proof: forged })
+                .await
+                .ok()?;
+            // If the node accepted us it now sends its Index.
+            match tokio::time::timeout(Duration::from_secs(2), read_msg(&mut recv)).await {
+                Ok(Ok(Msg::Index { .. })) => Some(true),
+                _ => Some(false),
+            }
+        }
+        .await;
+        endpoint.close().await;
+        result.unwrap_or(false)
+    }
+
+    /// Listens for one inbound control connection and answers the handshake
+    /// with a WRONG secret. Returns whether the dialer ever completed the
+    /// handshake (it must not).
+    pub async fn accept_with_wrong_secret(endpoint: Endpoint) -> bool {
+        let wrong = SessionKeys::derive(&SessionSecret([0xDD; 32]));
+        let me = endpoint.id();
+        let Some(incoming) = endpoint.accept().await else {
+            return false;
+        };
+        let Ok(accepting) = incoming.accept() else {
+            return false;
+        };
+        let Ok(conn) = accepting.await else {
+            return false;
+        };
+        handshake_acceptor(&conn, &wrong, me).await.is_ok()
+    }
+
+    pub async fn send_msg(&mut self, msg: &Msg) {
+        write_msg(&mut self.send, msg).await.expect("raw send");
+    }
+
+    /// Sends a raw frame header claiming `len` bytes followed by `body`.
+    pub async fn send_raw_frame(
+        &mut self,
+        len: u32,
+        body: &[u8],
+    ) -> Result<(), iroh::endpoint::WriteError> {
+        self.send.write_all(&len.to_be_bytes()).await?;
+        self.send.write_all(body).await
+    }
+
+    /// Reads the next control message with a timeout; `None` on close/error.
+    pub async fn recv_msg(&mut self, timeout: Duration) -> Option<Msg> {
+        tokio::time::timeout(timeout, read_msg(&mut self.recv))
+            .await
+            .ok()?
+            .ok()
+    }
+
+    pub fn close(&self) {
+        self.conn
+            .close(iroh::endpoint::VarInt::from_u32(0), b"test done");
+    }
+}
+
+/// Seeds a prepared (not yet started) session folder with a known member, so
+/// its daemon dials that address on startup.
+pub fn seed_known_member(dir: &Path, id: EndpointId, addr: &EndpointAddr) {
+    let mut state = tazamun::state::AppState::load(dir).expect("load state");
+    state.known_members.insert(
+        id.to_string(),
+        tazamun::session::AddrWire::from_endpoint_addr(addr),
+    );
+    state.save(dir).expect("save state");
+}
+
+/// Deterministic pseudo-random bytes for large test files.
+pub fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}

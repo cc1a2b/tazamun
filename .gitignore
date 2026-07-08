@@ -1,0 +1,13 @@
+# Build artifacts
+/target/
+
+# Runtime session metadata (contains secret material)
+.tazamun/
+**/.tazamun/
+
+# Smoke / scratch session folders (kept out of the repo)
+/tazamun-smoke/
+*-smoke/
+
+# Local-only working notes (never pushed)
+*.local.md
