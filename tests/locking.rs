@@ -90,9 +90,12 @@ async fn voter_disconnect_aborts() {
     let a = TestNode::init().await;
     // A mute peer: authenticates, sends an empty index, then never votes.
     let mute = RawPeer::connect_authed(&a.invite().await).await;
+    // Wait until the peer is a usable voter — connected AND its index received —
+    // so the lock passes the FRESHNESS precondition and actually enters the
+    // pending state (otherwise it is correctly refused with "syncing").
     assert!(
-        wait_until(|| async { a.online_peers().await >= 1 }, WAIT).await,
-        "mute peer not registered"
+        wait_until(|| async { a.synced_peers().await >= 1 }, WAIT).await,
+        "mute peer index not exchanged"
     );
 
     let started = std::time::Instant::now();

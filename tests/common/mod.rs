@@ -151,6 +151,19 @@ impl TestNode {
             .unwrap_or(0)
     }
 
+    /// Number of connected peers whose index we have received — i.e. peers that
+    /// can act as lease voters (the FRESHNESS precondition is satisfiable).
+    pub async fn synced_peers(&self) -> usize {
+        self.status().await["members"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter(|e| e["synced"].as_bool() == Some(true))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub async fn file_count(&self) -> u64 {
         self.status().await["file_count"].as_u64().unwrap_or(0)
     }

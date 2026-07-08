@@ -1906,9 +1906,14 @@ impl Actor {
                     Some((kind, rtt)) => (kind.to_string(), Some(rtt.as_millis() as u64)),
                     None => ("None".to_string(), None),
                 };
+                // Connected and past the initial index exchange — i.e. an
+                // authenticated peer whose Index we have processed, so it can
+                // participate as a lease voter.
+                let synced = connected.is_some() && self.index_received.contains(&id);
                 serde_json::json!({
                     "id": id.to_string(),
                     "online": online,
+                    "synced": synced,
                     "conn": conn,
                     "rtt_ms": rtt_ms,
                 })
