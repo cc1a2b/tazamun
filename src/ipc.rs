@@ -28,12 +28,24 @@ use crate::consts::IPC_LINE_MAX;
 #[serde(tag = "op", content = "args", rename_all = "lowercase")]
 pub enum IpcRequest {
     Status,
-    Lock { path: String },
-    Unlock { path: String },
+    Lock {
+        path: String,
+    },
+    Unlock {
+        path: String,
+    },
     Invite,
-    Versions { path: String },
-    Restore { path: String, n: usize },
+    Versions {
+        path: String,
+    },
+    Restore {
+        path: String,
+        n: usize,
+    },
     Gc,
+    /// The daemon's contribution to `tazamun doctor`: identity, bound sockets,
+    /// relay policy/status, and per-peer connectivity from telemetry.
+    Doctor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

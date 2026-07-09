@@ -11,10 +11,10 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [x] Parallel chunking with `rayon`
   - [x] Progress bars with `indicatif`
   - [x] Terminal QR-code invite rendering
-- [ ] **P2 — Connectivity insight**
-  - [ ] Live path-telemetry panel
-  - [ ] `doctor` NAT report
-  - [ ] Reconnect polish
+- [x] **P2 — Connectivity insight**
+  - [x] Live path-telemetry panel
+  - [x] `doctor` NAT report
+  - [x] Reconnect polish
 - [ ] **P3 — Relay & LAN**
   - [ ] Self-hosted relay guide (docker compose)
   - [ ] LAN mDNS auto-fallback mode

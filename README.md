@@ -282,6 +282,135 @@ index-exchange, lease, and metadata protocol.
 
 ---
 
+## 📶 Connection Health
+
+The founding idea of tazamun is *check your connection strength before you
+edit*. `status` makes the network legible, and every lock failure explains
+itself in network terms.
+
+### The status panel
+
+```text
+peer id : 7b3f2a9c1d8e4f60a5b2c7d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80912a3b4
+folder  : /home/hassan/project
+files   : 128 (94371840 bytes)
+
+members (2):
+  ● Good   9f2c4a7e10 Direct  24±3ms       Δ0
+  ● Fair   3d8b1f60ca Relayed 118±9ms      Δ1 via euw-1.relay.n0.iroh.link  ↓1.2 ↑0.0 MB/s
+
+active leases (1):
+  designs/logo.psd  held by 9f2c4a7e10  expires in 74s
+
+transfers (1):
+  ⇣ src/render/pipeline.rs   62%  8.4 MB/s
+
+recent events:
+  • peer 3d8b1f60ca upgraded Relayed→Direct (rtt 34ms)
+```
+
+Each member row is: **grade dot** · grade · id · connection type · `rtt±jitter`
+· path-change count (`Δ`) · relay hostname when relayed · live rates.
+
+- `tazamun status --watch` — a live panel refreshing every second (press `q` or
+  Ctrl-C to exit). Falls back to a single snapshot when stdout is not a TTY.
+- `tazamun status --json` — the full telemetry snapshot as stable JSON (schema
+  below), the contract for any GUI or script.
+
+### Grade thresholds
+
+| Grade | Dot | Meaning |
+|---|---|---|
+| **Good** | 🟢 green | Direct path, RTT < 80 ms, jitter < 20 ms |
+| **Fair** | 🟡 yellow | stable Relayed, or Direct with elevated RTT/jitter |
+| **Poor** | 🔴 red | flapping paths (> 3/min), RTT ≥ 300 ms, or a presence gap on a live connection |
+| **Offline** | ⚪ gray | no connection and nothing heard within 30 s |
+
+Colors auto-disable when `NO_COLOR` is set or output is not a terminal.
+
+### `status --json` schema (v1)
+
+```json
+{
+  "schema": 1,
+  "id": "<64-hex endpoint id>",
+  "dir": "<absolute path>",
+  "members": [
+    {
+      "id": "<hex>", "online": true, "synced": true,
+      "conn": "Direct|Relayed|None",
+      "grade": "Good|Fair|Poor|Offline",
+      "rtt_ms": 24.0, "rtt_jitter_ms": 3.1,
+      "path_changes": 0, "flaps_per_min": 0,
+      "relay_url": null,
+      "rate_rx_bps": 0.0, "rate_tx_bps": 0.0,
+      "bytes_rx": 0, "bytes_tx": 0,
+      "time_to_direct_ms": 42
+    }
+  ],
+  "leases": [ { "path": "...", "holder": "<hex>", "mine": false, "expires_in_ms": 74000 } ],
+  "pending_pulls": [ { "path": "...", "percent": 62, "bytes_done": 0, "bytes_total": 0, "rate_bytes_per_sec": 0 } ],
+  "events": [ { "seq": 7, "text": "peer 3d8b1f60ca upgraded Relayed→Direct (rtt 34ms)" } ],
+  "file_count": 128, "total_bytes": 94371840
+}
+```
+
+### Reading a lock failure
+
+When a lock is refused, tazamun tells you **which precondition failed**, the
+**peers it consulted** with their grades, and **what to do**:
+
+```console
+$ tazamun lock report.md
+✗ could not lock report.md: peer 3d8b1f60ca disconnected while voting on the lease
+  blocked precondition : REACHABILITY
+  what to do           : the peer whose grant was required went offline — retry once it reconnects
+  peers consulted      : 3d8b1f60ca (Offline, None)
+  (use -v for the full per-peer table)
+```
+
+Add `-v` for the full per-peer table (grade, conn, rtt, answered). If a
+consulted peer is on a degraded link, the lock still proceeds (strict
+preconditions are the only gate) but prints an advisory first:
+
+```console
+⚠ acquiring via a degraded link to 3d8b1f60ca (Relayed, 412ms) — sync may lag behind edits
+```
+
+### `tazamun doctor`
+
+A one-shot NAT & environment report — identity and bound sockets, relay
+reachability, per-peer connectivity and hole-punch status, filesystem sanity
+(watcher backend, native-FS vs WSL `/mnt` warning, read-only-enforcement
+probe), and IPC health — each with an `OK` / `WARN` / `FAIL` verdict and an
+actionable line. Exit code is `0` (all OK), `1` (any WARN), or `2` (any FAIL);
+`--json` for machine output.
+
+```text
+$ tazamun doctor
+tazamun doctor
+
+[OK  ] identity  [from daemon]
+     peer id            : 7b3f2a9c1d8e4f60…
+     bound socket       : 0.0.0.0:50794
+[OK  ] relay
+     policy             : disabled by flag (--no-relay)
+     relays             : not used — direct/LAN only
+[OK  ] connectivity  [from daemon]
+     peer 9f2c4a7e10      : Direct (Good, 24ms, direct in 42ms)
+[OK  ] filesystem
+     watcher backend    : inotify
+     session folder     : /home/hassan/project (native FS)
+     read-only enforce  : working (create+chmod probe passed)
+[OK  ] ipc
+     socket             : /home/hassan/project/.tazamun/daemon.sock
+     daemon             : responding
+
+summary: OK
+```
+
+---
+
 ## ✅ Internet Acceptance Checklist
 
 Run this once on **two machines on different networks** to confirm a real

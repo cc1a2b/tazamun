@@ -429,6 +429,17 @@ impl LockTable {
             _ => None,
         }
     }
+
+    /// For a pending local request, the `(voters_needed, voters_granted)` sets
+    /// so the daemon can name which peers have not yet answered.
+    pub fn pending_votes(&self, path: &RelPath) -> Option<(BTreeSet<Id>, BTreeSet<Id>)> {
+        match self.states.get(path) {
+            Some(LockState::PendingLocal {
+                needed, granted, ..
+            }) => Some((needed.clone(), granted.clone())),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

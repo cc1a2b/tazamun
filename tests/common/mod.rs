@@ -116,14 +116,36 @@ impl TestNode {
             .await
     }
 
-    /// Locks, asserting success.
+    /// Sends `req`, retrying the daemon's explicitly-transient states
+    /// (busy/syncing — "retry in a moment") for up to [`WAIT`], exactly as a
+    /// real script would, so heavy in-flight publishes on slow CI don't flake.
+    async fn request_retrying(&self, req: IpcRequest) -> IpcResponse {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let resp = self.handle.request(req.clone()).await;
+            let transient = matches!(
+                resp.error.as_ref().map(|e| e.code.as_str()),
+                Some("busy") | Some("syncing")
+            );
+            if resp.ok || !transient || tokio::time::Instant::now() >= deadline {
+                return resp;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Locks, asserting success (retries transient states).
     pub async fn lock_ok(&self, path: &str) {
-        let resp = self.lock(path).await;
+        let resp = self
+            .request_retrying(IpcRequest::Lock { path: path.into() })
+            .await;
         assert!(resp.ok, "lock {path} failed: {resp:?}");
     }
 
     pub async fn unlock_ok(&self, path: &str) {
-        let resp = self.unlock(path).await;
+        let resp = self
+            .request_retrying(IpcRequest::Unlock { path: path.into() })
+            .await;
         assert!(resp.ok, "unlock {path} failed: {resp:?}");
     }
 

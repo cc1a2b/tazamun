@@ -50,6 +50,8 @@ every node computes the same winner.
 | `src/net/endpoint.rs` | iroh Endpoint build (N0 preset default) + `path_info` |
 | `src/net/control.rs` | mutual proof-of-secret handshake + `PeerHandle` reader/writer |
 | `src/net/membership.rs` | encrypted presence gossip + mesh dialer |
+| `src/net/telemetry.rs` | pure per-peer health sampling + grade function (zero I/O) |
+| `src/doctor.rs` | `doctor` sections + verdicts; injectable mount classifier (zero state I/O) |
 | `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
 | `src/ipc.rs` | local socket / named pipe, one JSON line per request |
 | `src/daemon.rs` | the single state-owning actor; **all** mutation happens here |
