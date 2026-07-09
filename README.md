@@ -8,7 +8,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/cc1a2b/tazamun)](https://github.com/cc1a2b/tazamun/stargazers)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/cc1a2b/tazamun/releases)
 
-**🔒 مزامنة مجلّد لحظية بين الأنداد — بدون خادم يقرأ ملفّاتك.**
+**مزامنة مجلّد لحظية بين الأنداد — بدون خادم يقرأ ملفّاتك.**
 
 *Real-time peer-to-peer folder sync. No server ever reads your files.*
 
@@ -17,7 +17,7 @@
 > **Development status:** v0.1 is in active development. Work is tracked phase by
 > phase in [ROADMAP.md](ROADMAP.md); there is **no released version yet**.
 
-## 📖 About · نبذة
+## About · نبذة
 
 **تزامُن** (tazamun, "synchronization") is a single-binary CLI that lets remote
 collaborators share one folder with real-time peer-to-peer sync — over the open
@@ -34,7 +34,7 @@ content. No Git, no commits, no merges — just files, of every kind.
 
 `tazamun status` grades how you are connected to each member (green/yellow/red
 dot), and shows what is currently leased or syncing. See
-[Connection Health](#-connection-health) for the full panel, `--watch`, and
+[Connection Health](#connection-health) for the full panel, `--watch`, and
 `--json`:
 
 ```text
@@ -45,68 +45,68 @@ members (2):
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [The Promise](#-the-promise--الوعد)
-- [Features](#-features)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start--البداية-السريعة)
-- [Usage Examples](#-usage-examples)
-- [Command Reference](#-command-reference)
-- [How It Works](#-how-it-works)
-- [Connection Health](#-connection-health)
-- [Internet Acceptance Checklist](#-internet-acceptance-checklist)
-- [Advanced Usage](#-advanced-usage)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Support](#-support)
+- [The Promise](#the-promise--الوعد)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start--البداية-السريعة)
+- [Usage Examples](#usage-examples)
+- [Command Reference](#command-reference)
+- [How It Works](#how-it-works)
+- [Connection Health](#connection-health)
+- [Internet Acceptance Checklist](#internet-acceptance-checklist)
+- [Advanced Usage](#advanced-usage)
+- [Contributing](#contributing)
+- [License](#license)
+- [Support](#support)
 
 ---
 
-## 🔐 The Promise · الوعد
+## The Promise · الوعد
 
 > **No server can read your files.** Connections are direct whenever possible;
 > the encrypted relay fallback is self-hostable with `--relay` or disabled
 > entirely with `--no-relay`.
 
-- **🛡️ Zero-knowledge transport:** file content is chunked, BLAKE3-addressed, and
+- **Zero-knowledge transport:** file content is chunked, BLAKE3-addressed, and
   streamed peer-to-peer over iroh's authenticated, encrypted QUIC. Relays only
   ever forward opaque, end-to-end-encrypted bytes.
-- **🔑 Secret-gated membership:** knowing the gossip topic is not enough. Every
+- **Secret-gated membership:** knowing the gossip topic is not enough. Every
   control connection proves knowledge of the session secret in both directions
   before a single message is processed.
-- **🕵️ Unreadable metadata:** even presence beacons (who is online, at what
+- **Unreadable metadata:** even presence beacons (who is online, at what
   address) are XChaCha20-Poly1305 sealed under the session key.
 
 ---
 
-## ✨ Features
+## Features
 
-- **🌍 Internet-native from day one:** NAT-to-NAT via hole-punching, no port
+- **Internet-native from day one:** NAT-to-NAT via hole-punching, no port
   forwarding, no VPN, no config.
-- **🔒 Strict exclusive checkout:** every synced file sits read-only; editing
+- **Strict exclusive checkout:** every synced file sits read-only; editing
   requires an exclusive, network-granted lease, so two people never clobber
   each other's work.
-- **🧩 All file types:** text, code, images, design files, game assets, binaries
+- **All file types:** text, code, images, design files, game assets, binaries
   — no exceptions, no diff/merge assumptions.
-- **⚡ Delta sync:** content-defined chunking means a one-line edit in a 2 GB file
+- **Delta sync:** content-defined chunking means a one-line edit in a 2 GB file
   moves only the changed chunks.
 
 <details>
 <summary><b>More features</b></summary>
 
-- **🧷 The Golden Invariant:** never overwrite data a peer has not seen, never
+- **The Golden Invariant:** never overwrite data a peer has not seen, never
   silently delete user bytes. Every ambiguous situation preserves both copies
   and warns loudly.
-- **🗂️ Built-in version history:** the last 5 versions of every path are kept
+- **Built-in version history:** the last 5 versions of every path are kept
   locally; `restore` re-publishes any of them under a lease.
-- **📡 Connection-strength surface:** `status` shows each peer as Direct or
+- **Connection-strength surface:** `status` shows each peer as Direct or
   Relayed with live RTT — you always know how you are connected.
-- **🩹 Tamper-evident:** a forced write to a read-only file is quarantined
+- **Tamper-evident:** a forced write to a read-only file is quarantined
   (never deleted) and the indexed version is restored, with a loud warning.
-- **♻️ Self-healing membership:** a full mesh of authenticated control
+- **Self-healing membership:** a full mesh of authenticated control
   connections with exponential-backoff redial.
-- **🔌 Self-hostable or serverless:** bring your own relay with `--relay`, or run
+- **Self-hostable or serverless:** bring your own relay with `--relay`, or run
   fully relay-free on a LAN with `--no-relay --lan`.
 
 </details>
@@ -117,7 +117,7 @@ members (2):
 
 ---
 
-## 📦 Installation
+## Installation
 
 ### Build from source (all platforms)
 
@@ -142,7 +142,7 @@ cargo build --release
 
 ---
 
-## 🚀 Quick Start · البداية السريعة
+## Quick Start · البداية السريعة
 
 Two people, two machines, under five minutes. **Alice** shares, **Basma** joins.
 
@@ -170,7 +170,7 @@ tazamun unlock report.md     # publish + release → syncs to everyone, back to 
 
 ---
 
-## 💡 Usage Examples
+## Usage Examples
 
 ```bash
 # Initialize a brand-new session in the current folder
@@ -216,7 +216,7 @@ tazamun --dir ~/work/project status
 
 ---
 
-## 📋 Command Reference
+## Command Reference
 
 ```text
 tazamun — strict-checkout P2P folder sync. No server ever reads your files.
@@ -247,7 +247,7 @@ Exit codes: 0 success · 1 runtime error · 2 usage error
 
 ---
 
-## 🔧 How It Works
+## How It Works
 
 **Strict exclusive checkout.** Every synced file is read-only on disk. To edit,
 a node must obtain an exclusive *lease*, granted only when **all three** hold:
@@ -275,7 +275,7 @@ index-exchange, lease, and metadata protocol.
 
 ---
 
-## 📶 Connection Health
+## Connection Health
 
 The founding idea of tazamun is *check your connection strength before you
 edit*. `status` makes the network legible, and every lock failure explains
@@ -314,10 +314,10 @@ Each member row is: **grade dot** · grade · id · connection type · `rtt±jit
 
 | Grade | Dot | Meaning |
 |---|---|---|
-| **Good** | 🟢 green | Direct path, RTT < 80 ms, jitter < 20 ms |
-| **Fair** | 🟡 yellow | stable Relayed, or Direct with elevated RTT/jitter |
-| **Poor** | 🔴 red | flapping paths (> 3/min), RTT ≥ 300 ms, or a presence gap on a live connection |
-| **Offline** | ⚪ gray | no connection and nothing heard within 30 s |
+| **Good** | green | Direct path, RTT < 80 ms, jitter < 20 ms |
+| **Fair** | yellow | stable Relayed, or Direct with elevated RTT/jitter |
+| **Poor** | red | flapping paths (> 3/min), RTT ≥ 300 ms, or a presence gap on a live connection |
+| **Offline** | gray | no connection and nothing heard within 30 s |
 
 Colors auto-disable when `NO_COLOR` is set or output is not a terminal.
 
@@ -355,7 +355,7 @@ When a lock is refused, tazamun tells you **which precondition failed**, the
 
 ```console
 $ tazamun lock report.md
-✗ could not lock report.md: peer 3d8b1f60ca disconnected while voting on the lease
+could not lock report.md: peer 3d8b1f60ca disconnected while voting on the lease
   blocked precondition : REACHABILITY
   what to do           : the peer whose grant was required went offline — retry once it reconnects
   peers consulted      : 3d8b1f60ca (Offline, None)
@@ -367,7 +367,7 @@ consulted peer is on a degraded link, the lock still proceeds (strict
 preconditions are the only gate) but prints an advisory first:
 
 ```console
-⚠ acquiring via a degraded link to 3d8b1f60ca (Relayed, 412ms) — sync may lag behind edits
+acquiring via a degraded link to 3d8b1f60ca (Relayed, 412ms) — sync may lag behind edits
 ```
 
 ### `tazamun doctor`
@@ -404,7 +404,7 @@ summary: OK
 
 ---
 
-## ✅ Internet Acceptance Checklist
+## Internet Acceptance Checklist
 
 Run this once on **two machines on different networks** to confirm a real
 internet round-trip (not just localhost):
@@ -422,7 +422,7 @@ internet round-trip (not just localhost):
 
 ---
 
-## 🧰 Advanced Usage
+## Advanced Usage
 
 <details>
 <summary><b>Self-hosted relay</b></summary>
@@ -505,16 +505,16 @@ from the `conflicts/` directory, then lock the path properly to re-publish them.
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome.
 
-- **🐛 Bug reports:** open an issue with your OS, `tazamun --version`, and the
+- **Bug reports:** open an issue with your OS, `tazamun --version`, and the
   `-v` log around the problem.
-- **✨ Features:** check [`ROADMAP.md`](ROADMAP.md) first — many ideas are already
+- **Features:** check [`ROADMAP.md`](ROADMAP.md) first — many ideas are already
   planned and scoped.
-- **📝 Docs:** clarity fixes and translations (Arabic especially) are appreciated.
-- **🔧 Pull requests:** the CI gate is `cargo fmt --check`, `cargo clippy
+- **Docs:** clarity fixes and translations (Arabic especially) are appreciated.
+- **Pull requests:** the CI gate is `cargo fmt --check`, `cargo clippy
   --all-targets -- -D warnings`, and `cargo test`. Please keep it green.
 
 ```bash
@@ -527,7 +527,7 @@ cargo fmt --check
 
 ---
 
-## 📄 License
+## License
 
 Released under the [MIT License](LICENSE).
 
@@ -537,19 +537,19 @@ Copyright (c) 2025-2026 Hussain Alsharman
 
 ---
 
-## ⭐ Support
+## Support
 
-⭐ **Star** the repo, **follow** [@cc1a2b](https://github.com/cc1a2b), and
+**Star** the repo, **follow** [@cc1a2b](https://github.com/cc1a2b), and
 **share** tazamun with anyone who needs private, serverless folder sync.
 
 ---
 
 <div align="center">
 
-**🔒 مزامنة بين الأنداد — بدون خادم يقرأ ملفّاتك.**
+**مزامنة بين الأنداد — بدون خادم يقرأ ملفّاتك.**
 
 *Peer-to-peer sync. No server reads your files.*
 
-Built with ❤️ by [cc1a2b](https://github.com/cc1a2b)
+Built with by [cc1a2b](https://github.com/cc1a2b)
 
 </div>
