@@ -94,6 +94,116 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Phase 1 — performance & terminal UX
+
+### New dependencies
+
+- **`rayon` (1.12)** — the per-chunk BLAKE3 hash/copy stage of publishing runs
+  as order-preserving parallel batches on a small dedicated pool.
+- **`indicatif` (0.18)** — terminal progress bars/spinners for pulls and big
+  publishes in the foreground daemon; multi-bar via `MultiProgress`.
+- **`qrcode` (0.14)** — renders the invite ticket as a terminal QR code
+  (unicode half-blocks); pure encoding, no I/O.
+- **`console` (0.16)** — terminal size/TTY introspection for the QR fallback;
+  already in the tree transitively via indicatif, so this adds no new code to
+  the dependency graph.
+- **`criterion` (0.8, dev-only)** — statistics-backed benches for the chunking
+  path; `[[bench]] harness = false`, never part of the shipped binary.
+- **`blake3` gains the `rayon` feature** — needed only to *evaluate*
+  `Hasher::update_rayon` as a candidate (see below; it lost decisively).
+
+### Parallel chunking — measurements (i9-14900HX, 16 logical CPUs, WSL2)
+
+Bench: `benches/chunking.rs`, seeded synthetic files generated at bench start
+(never committed), page-cache-warm reads, criterion medians.
+
+Baseline (sequential `StreamCDC` cut + inline BLAKE3, pre-change):
+
+| input | time | throughput |
+|---|---|---|
+| 4 MiB | 2.650 ms | 1.474 GiB/s |
+| 64 MiB | 44.157 ms | 1.415 GiB/s |
+| 512 MiB | 342.20 ms | 1.461 GiB/s |
+
+Decision inputs:
+
+- **Pure sequential scan floor** (`scan_only_slice`, in-memory FastCDC scan,
+  no I/O/hash/copy): **22.24 ms / 64 MiB (2.81 GiB/s)**. The cut scan is
+  mandated sequential, so by Amdahl the hard ceiling for any parallel-hash
+  scheme on this machine is 44.16 / 22.24 = **1.99×** — the 2× acceptance
+  target is exactly at, not above, the theoretical limit.
+- **`blake3::Hasher::update_rayon` per chunk: rejected.** 390.5 ms / 64 MiB —
+  **8.8× slower than baseline**; per-call rayon dispatch swamps 64–256 KiB
+  chunks.
+- **Hash-pool sizing measured, not assumed:** with the overlapped pipeline the
+  64 MiB time was 31.7 ms with 16 hash threads, 27.9 ms with 8, and flat at
+  ~26.0–26.1 ms for 1–4 — BLAKE3 (~4.7 GiB/s/thread) saturates a 2.8 GiB/s
+  scan with 1–2 threads, and extra hashers only steal cycles from the scan
+  thread. Default pool = `min(cores, 4)`, overridable with `TAZAMUN_THREADS`.
+
+Final design: `chunk_bytes`/`chunk_stream` keep their exact signatures with
+windowed slice-semantics scanning + order-preserving parallel hash batches; a
+new `chunk_file` fast path (used by `publish_local` and `disk_matches`) adds a
+reader thread with three recycled 4 MiB window buffers so the caller thread
+runs only the sequential scan plus in-order emission. Cut points are
+byte-identical across all three entry points (window cuts are finalized only
+with ≥ `CDC_MAX` lookahead or EOF, which provably matches whole-slice
+semantics; unit tests pin equality including tiny-window and trickle-read
+cases).
+
+After (default pool):
+
+| input | time | throughput | speedup |
+|---|---|---|---|
+| 4 MiB | 2.607 ms | 1.498 GiB/s | 1.02× |
+| 64 MiB | 26.607 ms | 2.349 GiB/s | **1.66×** |
+| 512 MiB | 208.15 ms | 2.402 GiB/s | **1.64×** |
+
+**Acceptance note (≥2× target):** not reachable on this machine — the
+sequential scan alone is 50.3% of the baseline, capping any hashing
+parallelism at 1.99×; the achieved 26.6 ms sits within 16% of the 22.2 ms
+floor, the residual being carry copies, cross-core cache handoff of freshly
+read windows, and emit bookkeeping. Going past this requires making the *scan*
+faster (SIMD gear hash or segment-parallel CDC), which changes or risks the
+cut-point contract and is out of scope for this phase. The 4 MiB case is flat
+by design: pipeline startup roughly equals the savings at that size.
+
+**Memory bound:** peak RSS of the full 512 MiB bench process = **44 MiB**
+(budget: 256 MiB). Method: kernel high-water mark `VmHWM` from
+`/proc/<pid>/status` polled to process exit — VmHWM is monotonic and
+kernel-maintained, so the final reading is the true peak (GNU time is not
+installed in this WSL image). The pipeline holds 3 × ~4.5 MiB recycled window
+buffers plus in-flight batch copies regardless of file size.
+
+### Terminal UX decisions
+
+- **Progress is presentation-only.** Pull bars and the publish spinner live in
+  `src/ui/progress.rs`; the transfer layer only increments an optional shared
+  byte meter. No protocol, state, or transfer semantics changed — headless runs
+  (`Ui::disabled()`, non-TTY stdout, CI) behave byte-identically to before.
+- **Bars and logs coexist through a suspending writer.** tracing output is
+  routed through a `MakeWriter` that wraps each write in
+  `MultiProgress::suspend`, so a log line never tears through a rendering bar.
+  Side effect: daemon logs now go to stderr in all modes (previously stdout) —
+  consistent streams regardless of whether bars are active.
+- **Bars auto-disable off-TTY and honor `NO_COLOR`** (colorless templates when
+  set). Detection via `std::io::IsTerminal` on stdout and stderr.
+- **`status` transfer rows reuse the bar meters.** Active pulls report
+  percentage, bytes, and average rate from the same atomics that drive the
+  bars; `pending_pulls` entries became objects (`path`/`percent`/`bytes_*`/
+  `rate_bytes_per_sec`).
+- **QR invite encodes the exact ticket string, nothing else**, rendered as
+  unicode half-blocks (inverted polarity for dark terminals — phone scanners
+  read both). Falls back to the plain ticket with a note when the terminal is
+  narrower than the code.
+- **Unix IPC socket falls back to a short hashed path for deep folders**
+  (found during live verification): `sockaddr_un` caps socket paths at ~107
+  bytes, so `.tazamun/daemon.sock` cannot bind under deeply nested session
+  folders. When the in-folder path exceeds a conservative 100-byte budget,
+  daemon and CLI both derive `$XDG_RUNTIME_DIR/tazamun-<blake3-16hex>.sock`
+  (or the temp dir) from the absolute folder path — same fallback on both
+  sides, so they always meet.
+
 ## Phase 0 — bootstrap decisions
 
 - **Source lives on the native Linux filesystem (`~/projects/tazamun`), not a

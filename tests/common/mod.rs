@@ -74,6 +74,7 @@ impl TestNode {
             dir: dir.path().to_path_buf(),
             net: test_net(),
             timings: test_timings(),
+            ui: tazamun::ui::progress::Ui::disabled(),
         })
         .await
         .expect("daemon spawn");

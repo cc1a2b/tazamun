@@ -31,6 +31,7 @@ use crate::state::{AppState, RelPath, VersionEntry};
 use crate::sync::index::{diff, sanitize_rel_path};
 use crate::sync::transfer::{Published, Staged, Transfer, TransferError};
 use crate::sync::vclock::{self, Causality};
+use crate::ui::progress::{Meter, Ui};
 use crate::versions;
 use crate::watcher::WatchEvent;
 
@@ -56,6 +57,8 @@ pub struct DaemonConfig {
     pub dir: PathBuf,
     pub net: NetConfig,
     pub timings: LockTimings,
+    /// Terminal progress presentation; `Ui::disabled()` for headless runs.
+    pub ui: Ui,
 }
 
 /// What triggered a publish, deciding what happens after it commits.
@@ -384,6 +387,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         redial_scheduled: BTreeSet::new(),
         backoff: BTreeMap::new(),
         pending_pulls: BTreeMap::new(),
+        pull_meters: BTreeMap::new(),
         deferred: BTreeMap::new(),
         pending_acquires: BTreeMap::new(),
         pending_unlocks: BTreeMap::new(),
@@ -392,6 +396,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         recheck: BTreeSet::new(),
         gc_running: false,
         gc_dirty: false,
+        ui: cfg.ui.clone(),
         keys,
         events_tx: events_tx.clone(),
         member_cmds: member_cmds_tx,
@@ -434,6 +439,7 @@ struct Actor {
     redial_scheduled: BTreeSet<EndpointId>,
     backoff: BTreeMap<EndpointId, Duration>,
     pending_pulls: BTreeMap<RelPath, PullJob>,
+    pull_meters: BTreeMap<RelPath, std::sync::Arc<Meter>>,
     deferred: BTreeMap<RelPath, DeferredApply>,
     pending_acquires: BTreeMap<RelPath, (u64, oneshot::Sender<IpcResponse>)>,
     pending_unlocks: BTreeMap<RelPath, ()>,
@@ -442,6 +448,7 @@ struct Actor {
     recheck: BTreeSet<RelPath>,
     gc_running: bool,
     gc_dirty: bool,
+    ui: Ui,
     keys: SessionKeys,
     events_tx: mpsc::Sender<Event>,
     member_cmds: mpsc::Sender<MemberCmd>,
@@ -1051,9 +1058,11 @@ impl Actor {
         let from_addr = self
             .known_member_addr(&from)
             .unwrap_or_else(|| EndpointAddr::new(from));
+        let meter = self.ui.pull_meter(rel.as_str(), record.size);
+        self.pull_meters.insert(rel.clone(), meter.clone());
         tokio::spawn(async move {
             let result = transfer
-                .pull_stage(&endpoint, from_addr, &rel, &record)
+                .pull_stage(&endpoint, from_addr, &rel, &record, Some(meter))
                 .await;
             let _ = events
                 .send(Event::PullStaged {
@@ -1333,8 +1342,15 @@ impl Actor {
         self.busy.insert(rel.clone());
         let transfer = self.transfer.clone();
         let events = self.events_tx.clone();
+        // A spinner is only worth showing when re-chunking takes real time.
+        const SPINNER_MIN_BYTES: u64 = 8 * 1024 * 1024;
+        let spinner = std::fs::metadata(rel.to_fs_path(&self.dir))
+            .ok()
+            .filter(|m| m.len() >= SPINNER_MIN_BYTES)
+            .map(|_| self.ui.publish_spinner(rel.as_str()));
         tokio::spawn(async move {
             let result = transfer.publish_local(&rel).await;
+            drop(spinner);
             let _ = events.send(Event::PublishDone { rel, result, cause }).await;
         });
     }
@@ -1949,16 +1965,28 @@ impl Actor {
                 )
             })
             .collect();
+        // Transfer rows: one object per active pull, with live percentage
+        // and average rate fed by the same meters that drive the bars.
+        let pending_pulls: Vec<serde_json::Value> = self
+            .pending_pulls
+            .keys()
+            .map(|p| {
+                let meter = self.pull_meters.get(p);
+                serde_json::json!({
+                    "path": p.as_str(),
+                    "percent": meter.map(|m| m.percent()).unwrap_or(0),
+                    "bytes_done": meter.map(|m| m.bytes_done()).unwrap_or(0),
+                    "bytes_total": meter.map(|m| m.bytes_total()).unwrap_or(0),
+                    "rate_bytes_per_sec": meter.map(|m| m.rate()).unwrap_or(0),
+                })
+            })
+            .collect();
         serde_json::json!({
             "id": self.me.to_string(),
             "dir": self.dir.display().to_string(),
             "members": members,
             "leases": leases,
-            "pending_pulls": self
-                .pending_pulls
-                .keys()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>(),
+            "pending_pulls": pending_pulls,
             "file_count": live_files.len(),
             "total_bytes": live_files.iter().map(|(_, r)| r.size).sum::<u64>(),
             "files": files_json,

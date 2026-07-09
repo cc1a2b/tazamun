@@ -91,8 +91,9 @@ pub enum IpcError {
 pub fn socket_name(dir: &Path) -> Result<Name<'static>, IpcError> {
     #[cfg(unix)]
     {
-        let path = crate::state::AppState::meta_dir(dir).join("daemon.sock");
-        Ok(path.to_fs_name::<GenericFilePath>()?.into_owned())
+        Ok(socket_file(dir)
+            .to_fs_name::<GenericFilePath>()?
+            .into_owned())
     }
     #[cfg(not(unix))]
     {
@@ -104,9 +105,24 @@ pub fn socket_name(dir: &Path) -> Result<Name<'static>, IpcError> {
     }
 }
 
+/// `sockaddr_un` caps socket paths at ~107 bytes, so deeply nested session
+/// folders cannot host the socket in `.tazamun/`. Both daemon and CLI derive
+/// the same fallback deterministically from the absolute folder path.
 #[cfg(unix)]
 fn socket_file(dir: &Path) -> PathBuf {
-    crate::state::AppState::meta_dir(dir).join("daemon.sock")
+    const SUN_PATH_BUDGET: usize = 100;
+    let in_folder = crate::state::AppState::meta_dir(dir).join("daemon.sock");
+    if in_folder.as_os_str().len() <= SUN_PATH_BUDGET {
+        return in_folder;
+    }
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let digest = blake3::hash(abs.to_string_lossy().as_bytes());
+    let hex = data_encoding::HEXLOWER.encode(&digest.as_bytes()[..8]);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    runtime.join(format!("tazamun-{hex}.sock"))
 }
 
 /// One line in, one line out, with the line cap enforced on read.

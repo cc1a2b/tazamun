@@ -14,6 +14,7 @@ use crate::locks::LockTimings;
 use crate::net::endpoint::{NetConfig, RelayChoice};
 use crate::session::{AddrWire, SessionSecret, Ticket};
 use crate::state::{AppState, encode_hex32};
+use crate::ui::progress::Ui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -53,7 +54,11 @@ pub enum Cmd {
     /// Show members, connections, leases and pending pulls.
     Status,
     /// Print a fresh invite ticket for this session.
-    Invite,
+    Invite {
+        /// Also render the ticket as a scannable QR code.
+        #[arg(long)]
+        qr: bool,
+    },
     /// Acquire an exclusive lease and make the file writable.
     Lock { path: String },
     /// Publish pending edits and release the lease.
@@ -83,7 +88,7 @@ pub enum CliError {
 }
 
 /// Runs one parsed command to completion.
-pub async fn run(cli: Cli) -> Result<(), CliError> {
+pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
     let dir = std::path::absolute(&cli.dir).map_err(crate::state::StateError::Io)?;
     match cli.cmd {
         Cmd::Init => init(&dir),
@@ -92,19 +97,23 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             relay,
             no_relay,
             lan,
-        } => start(&dir, relay, no_relay, lan).await,
+        } => start(&dir, relay, no_relay, lan, ui).await,
         Cmd::Status => {
             let data = request(&dir, IpcRequest::Status).await?;
             print_status(&data);
             Ok(())
         }
-        Cmd::Invite => {
+        Cmd::Invite { qr } => {
             let data = request(&dir, IpcRequest::Invite).await?;
             let ticket = data
                 .get("ticket")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            println!("Share this ticket to invite someone:\n\n  {ticket}\n");
+            if qr {
+                print_qr_invite(ticket);
+            } else {
+                println!("Share this ticket to invite someone:\n\n  {ticket}\n");
+            }
             Ok(())
         }
         Cmd::Lock { path } => {
@@ -253,6 +262,7 @@ async fn start(
     relay: Option<String>,
     no_relay: bool,
     lan: bool,
+    ui: Ui,
 ) -> Result<(), CliError> {
     let relay_choice = match (relay, no_relay) {
         (Some(url), _) => {
@@ -271,6 +281,7 @@ async fn start(
             test_bind: None,
         },
         timings: LockTimings::default(),
+        ui,
     };
     let handle = crate::daemon::spawn(cfg).await?;
     println!("tazamun daemon running");
@@ -344,9 +355,48 @@ fn print_status(data: &serde_json::Value) {
     if !pulls.is_empty() {
         println!("\npending pulls ({}):", pulls.len());
         for p in pulls {
-            println!("  {}", p.as_str().unwrap_or("-"));
+            let path = p["path"].as_str().unwrap_or("-");
+            let percent = p["percent"].as_u64().unwrap_or(0);
+            let rate = p["rate_bytes_per_sec"].as_u64().unwrap_or(0) as f64 / 1_000_000.0;
+            println!("  {path}  {percent:>3}%  {rate:.1} MB/s");
         }
     }
+}
+
+/// Renders the exact ticket string as a terminal QR code (unicode
+/// half-blocks, inverted for dark terminals — phone scanners read both
+/// polarities). Falls back to the plain ticket when the terminal is too
+/// narrow for a scannable code.
+fn print_qr_invite(ticket: &str) {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+
+    let code = match QrCode::new(ticket.as_bytes()) {
+        Ok(code) => code,
+        Err(e) => {
+            println!("(QR encoding failed: {e}; showing the plain ticket)\n");
+            println!("Share this ticket to invite someone:\n\n  {ticket}\n");
+            return;
+        }
+    };
+    let image = code
+        .render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .build();
+    let qr_width = image.lines().next().map(|l| l.chars().count()).unwrap_or(0);
+    let term_cols = console::Term::stdout().size().1 as usize;
+    // Unknown width (pipes) counts as wide enough — the QR was asked for.
+    if term_cols != 0 && qr_width > term_cols {
+        println!(
+            "(terminal is {term_cols} columns; the QR needs {qr_width} — showing the plain ticket)\n"
+        );
+        println!("Share this ticket to invite someone:\n\n  {ticket}\n");
+        return;
+    }
+    println!("Scan to join this session:\n");
+    println!("{image}");
+    println!("\nSame ticket as text:\n\n  {ticket}\n");
 }
 
 fn print_versions(data: &serde_json::Value) {
