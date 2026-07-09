@@ -130,10 +130,18 @@ async fn delta_edit_transfers_under_20_percent() {
         let got = node.read_file("big.bin");
         got.is_some_and(|d| d.len() == want.len() && blake3::hash(&d) == blake3::hash(want))
     };
-    assert!(
-        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await,
-        "32 MiB initial sync did not complete"
-    );
+    // On timeout, dump both nodes' full state so CI failures are diagnosable.
+    async fn dump(label: &str, a: &TestNode, b: &TestNode, want_len: usize) {
+        eprintln!("--- {label}: A status ---\n{}", a.status().await);
+        eprintln!("--- {label}: B status ---\n{}", b.status().await);
+        let b_len = b.read_file("big.bin").map(|d| d.len());
+        eprintln!("--- {label}: B big.bin len {b_len:?}, want {want_len}");
+    }
+    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await;
+    if !ok {
+        dump("initial sync timeout", &a, &b, data.len()).await;
+    }
+    assert!(ok, "32 MiB initial sync did not complete");
 
     // Byte accounting: measure the receiver's blob store before the edit.
     let before = b.blobs_dir_size();
@@ -147,10 +155,11 @@ async fn delta_edit_transfers_under_20_percent() {
     a.write_file("big.bin", &data);
     a.unlock_ok("big.bin").await;
 
-    assert!(
-        wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await,
-        "delta edit did not sync"
-    );
+    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await;
+    if !ok {
+        dump("delta edit timeout", &a, &b, data.len()).await;
+    }
+    assert!(ok, "delta edit did not sync");
 
     let growth = b.blobs_dir_size().saturating_sub(before);
     let budget = (SIZE as u64) / 5;

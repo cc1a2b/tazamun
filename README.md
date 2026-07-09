@@ -201,6 +201,9 @@ tazamun status
 # Print a fresh invite ticket with your current live addresses
 tazamun invite
 
+# Same, rendered as a scannable QR code in the terminal
+tazamun invite --qr
+
 # Take the exclusive lease on a path, edit, then release + sync
 tazamun lock assets/logo.png
 tazamun unlock assets/logo.png
@@ -321,6 +324,50 @@ Disable relays and use local mDNS discovery — nothing leaves the local network
 ```bash
 tazamun start --no-relay --lan
 ```
+
+</details>
+
+<details>
+<summary><b>Invite by QR</b></summary>
+
+Hand a phone-to-laptop invite across the room without copy-pasting: render the
+exact `tzm1…` ticket as a terminal QR code and scan it.
+
+```console
+$ tazamun invite --qr
+Scan to join this session:
+
+█████████████████████████████
+████ ▄▄▄▄▄ █▄▀ ▄██ █ ▄▄▄▄▄ ████
+████ █   █ █▀▀█▄▀▄██ █   █ ████
+████ █▄▄▄█ █ ▄█▀▄▀ █ █▄▄▄█ ████
+████▄▄▄▄▄▄▄█▄█▄█▄█▄█▄▄▄▄▄▄▄████
+█████████████████████████████
+        …(full code)…
+
+Same ticket as text:
+
+  tzm1kkfcqzhqmshy4ilzmw…
+```
+
+The QR encodes the ticket string and nothing else. If the terminal is too
+narrow for a scannable code, the plain ticket is printed with a note instead.
+
+</details>
+
+<details>
+<summary><b>Performance tuning</b></summary>
+
+Publishing chunks and hashes files with a small worker pool sized
+automatically from the machine (hashing saturates the content-defined scan
+with very few threads, so more is not better). Override it explicitly with:
+
+```bash
+TAZAMUN_THREADS=2 tazamun start
+```
+
+Any positive integer works; unset means the measured default
+(`min(cores, 4)`).
 
 </details>
 

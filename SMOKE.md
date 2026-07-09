@@ -120,3 +120,59 @@ A force-write must therefore fall outside that window to be seen as a fresh user
 edit; the acceptance run waits it out before forcing the overwrite. The narrow
 race this implies (a user force-write within 2 s of a daemon write to the same
 path) is recorded as a known limitation in `DECISIONS.md`.
+
+---
+
+# P1 addendum — performance & terminal UX
+
+Re-run of the full acceptance script with the Phase 1 release binary
+(parallel chunk hashing, progress bars, QR invites): **all 27 assertions
+passed unchanged** — same transcript shape as above, exit code 0.
+
+New behavior exercised on top of the 27 assertions:
+
+## Live progress bars (pull of a 200 MiB file)
+
+Both daemons ran under a pseudo-terminal so `Ui::detect()` enabled bars; the
+joiner pulled a 200 MiB genesis file over loopback QUIC. Captured frames from
+the puller's terminal (color codes stripped):
+
+```text
+⇣ big-asset.bin · 2597 chunks    147.13 MiB / 200.00 MiB   96.03 MiB/s [====================>        ]  74%
+⇣ big-asset.bin · 2597 chunks    163.69 MiB / 200.00 MiB   99.34 MiB/s [======================>      ]  82%
+⇣ big-asset.bin · 2597 chunks    192.72 MiB / 200.00 MiB  104.88 MiB/s [==========================>  ]  96%
+2026-07-09T14:36:01Z  INFO applied remote version path=big-asset.bin peer=ef80caf509
+```
+
+The final line is ordinary tracing output landing *after* the bar cleared —
+log lines and bars coexist through the suspending writer, no torn frames.
+The pulled file was byte-identical to the source (`cmp` clean), and with the
+bars disabled (non-TTY logs-to-file daemons) the same pull produces plain logs
+only — presentation never touches transfer semantics.
+
+## `status` transfer rows (live percentage + rate)
+
+Snapshots taken from a second shell while the same 200 MiB pull was in
+flight on a fresh joiner:
+
+```text
+pending pulls (1):
+  big-asset.bin    0%  0.0 MB/s
+
+pending pulls (1):
+  big-asset.bin   48%  126.5 MB/s
+```
+
+## QR invite
+
+`tazamun invite --qr` renders the exact `tzm1…` ticket as a unicode
+half-block QR (scannable, inverted polarity for dark terminals) followed by
+the same ticket as text; plain `tazamun invite` output is unchanged, and a
+too-narrow terminal falls back to the plain ticket with a note.
+
+## Publish path (parallel chunker) under the same script
+
+The genesis import of the 200 MiB file and every lock/edit/unlock in the
+script went through the new `chunk_file` pipeline (reader thread + sequential
+FastCDC scan + rayon hash batches) — byte-identical cut points and hashes,
+measured 1.66× faster on the 64 MiB benchmark (details in `DECISIONS.md`).

@@ -7,10 +7,10 @@ below is **out of scope for v0.1** and tracked here for later milestones.
 
 ## Post-v0.1
 
-- [ ] **P1 — Throughput & UX polish**
-  - [ ] Parallel chunking with `rayon`
-  - [ ] Progress bars with `indicatif`
-  - [ ] Terminal QR-code invite rendering
+- [x] **P1 — Throughput & UX polish**
+  - [x] Parallel chunking with `rayon`
+  - [x] Progress bars with `indicatif`
+  - [x] Terminal QR-code invite rendering
 - [ ] **P2 — Connectivity insight**
   - [ ] Live path-telemetry panel
   - [ ] `doctor` NAT report

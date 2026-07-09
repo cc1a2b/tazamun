@@ -15,6 +15,7 @@ pub mod proto;
 pub mod session;
 pub mod state;
 pub mod sync;
+pub mod ui;
 pub mod versions;
 pub mod watcher;
 

@@ -143,8 +143,7 @@ impl Transfer {
         let abs = rel.to_fs_path(&self.root);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let chunk_task = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&abs)?;
-            chunker::chunk_stream(std::io::BufReader::new(file), |_, data| {
+            chunker::chunk_file(&abs, |_, data| {
                 tx.blocking_send(data)
                     .map_err(|_| chunker::ChunkError::Io(std::io::Error::other("sink closed")))
             })
@@ -252,14 +251,16 @@ impl Transfer {
 
     /// Pulls one remote record: fetches only locally missing chunks from
     /// `from` (≤ [`FETCH_CONCURRENCY`] in flight, BLAKE3-verified by
-    /// iroh-blobs) and assembles a verified staging file.
-    #[instrument(skip(self, endpoint, record), fields(peer = %from.id.fmt_short(), path = %rel))]
+    /// iroh-blobs) and assembles a verified staging file. `meter`, when
+    /// given, receives byte progress for the terminal bar and `status` rows.
+    #[instrument(skip(self, endpoint, record, meter), fields(peer = %from.id.fmt_short(), path = %rel))]
     pub async fn pull_stage(
         &self,
         endpoint: &Endpoint,
         from: EndpointAddr,
         rel: &RelPath,
         record: &FileRecord,
+        meter: Option<Arc<crate::ui::progress::Meter>>,
     ) -> Result<Staged, TransferError> {
         let conn = endpoint
             .connect(from, iroh_blobs::ALPN)
@@ -269,17 +270,35 @@ impl Transfer {
         let refs = self
             .resolve_manifest(&record.manifest, record.size, Some(&conn), &mut tags)
             .await?;
+        if let Some(m) = &meter {
+            m.set_chunks(refs.len());
+        }
 
-        // Unique hashes still missing locally.
+        // Unique hashes still missing locally; count file bytes per unique
+        // hash so progress reflects coverage of the whole file (duplicate
+        // chunks are fetched once but advance the bar by all occurrences).
+        let mut bytes_by_hash: std::collections::HashMap<[u8; 32], u64> =
+            std::collections::HashMap::new();
+        for r in &refs {
+            *bytes_by_hash.entry(r.hash).or_insert(0) += u64::from(r.len);
+        }
         let mut missing: Vec<Hash> = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut already_local: u64 = 0;
         for r in &refs {
             if seen.insert(r.hash) {
                 let h = Hash::from_bytes(r.hash);
-                if !self.store.blobs().has(h).await.map_err(store_err)? {
+                if self.store.blobs().has(h).await.map_err(store_err)? {
+                    already_local += bytes_by_hash.get(&r.hash).copied().unwrap_or(0);
+                } else {
                     missing.push(h);
                 }
             }
+        }
+        if already_local > 0
+            && let Some(m) = &meter
+        {
+            m.inc(already_local);
         }
         let missing_count = missing.len();
 
@@ -304,10 +323,16 @@ impl Transfer {
                 Some(res) => {
                     let h = res.map_err(|e| TransferError::Join(e.to_string()))??;
                     tags.push(self.store.tags().temp_tag(h).await.map_err(store_err)?);
+                    if let Some(m) = &meter {
+                        m.inc(bytes_by_hash.get(h.as_bytes()).copied().unwrap_or(0));
+                    }
                 }
             }
         }
         debug!(fetched = missing_count, chunks = refs.len(), "pull fetched");
+        if let Some(m) = &meter {
+            m.finish();
+        }
 
         let staged = self.assemble(&refs).await?;
         Ok(Staged {
@@ -389,8 +414,7 @@ impl Transfer {
             .resolve_manifest(&record.manifest, record.size, None, &mut tags)
             .await?;
         let got = tokio::task::spawn_blocking(move || -> Result<Vec<ChunkRef>, TransferError> {
-            let file = std::fs::File::open(&abs)?;
-            let (refs, _) = chunker::chunk_stream(std::io::BufReader::new(file), |_, _| Ok(()))?;
+            let (refs, _) = chunker::chunk_file(&abs, |_, _| Ok(()))?;
             Ok(refs)
         })
         .await

@@ -41,7 +41,7 @@ every node computes the same winner.
 | `src/proto.rs` | control framing (`u32` len + postcard, reject 0 / > 4 MiB) + `Msg` |
 | `src/sync/vclock.rs` | pure version-vector algebra (no I/O) |
 | `src/sync/index.rs` | `sanitize_rel_path` (the only untrusted-path gate) + `diff` (no I/O) |
-| `src/sync/chunker.rs` | FastCDC — deterministic, pure cut function |
+| `src/sync/chunker.rs` | FastCDC — deterministic cut function; parallel hash pipeline (`chunk_file`) |
 | `src/sync/transfer.rs` | iroh-blobs store; publish / pull-stage / materialize / GC-protect |
 | `src/locks.rs` | pure lease state machine (injected clock, zero I/O) + orchestration types |
 | `src/guard.rs` | read-only enforcement + quarantine (never deletes) |
@@ -50,6 +50,7 @@ every node computes the same winner.
 | `src/net/endpoint.rs` | iroh Endpoint build (N0 preset default) + `path_info` |
 | `src/net/control.rs` | mutual proof-of-secret handshake + `PeerHandle` reader/writer |
 | `src/net/membership.rs` | encrypted presence gossip + mesh dialer |
+| `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
 | `src/ipc.rs` | local socket / named pipe, one JSON line per request |
 | `src/daemon.rs` | the single state-owning actor; **all** mutation happens here |
 | `src/cli.rs` / `src/main.rs` | clap surface + thin binary |
