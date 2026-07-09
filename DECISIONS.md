@@ -96,6 +96,17 @@ file whenever a dependency is added or a load-bearing design decision is made.
 
 ## Phase 2 — connection health & observability
 
+- **Test harness retries explicitly-transient lock states.** The 32 MiB delta
+  test writes a large file and immediately unlocks; on a slow runner the
+  watcher-driven publish is still in flight, so `unlock` correctly returns
+  `busy` ("retry in a moment"). The harness's `lock_ok`/`unlock_ok` now retry
+  the `busy`/`syncing` codes for up to the standard wait budget — exactly what
+  a real script would do — instead of failing on the first transient. The
+  daemon behaviour is unchanged; only the test's expectation of instant
+  success was wrong. (A future phase may let the CLI auto-retry these for
+  large-file ergonomics; out of scope here.)
+
+
 - **Zero new dependencies.** Telemetry, grading, the status panel, `--watch`,
   `doctor`, and JSON output are all built on the existing `indicatif`/`console`
   stack from P1 plus `serde_json`. No crate was added.
