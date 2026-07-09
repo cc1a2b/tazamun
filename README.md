@@ -415,11 +415,7 @@ Copyright (c) 2025-2026 Hussain Alsharman
 
 ---
 
-## ☕ Support
-
-If tazamun saved you a headache, consider supporting the work:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-FFDD00?style=flat&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/cc1a2b)
+## ⭐ Support
 
 ⭐ **Star** the repo, **follow** [@cc1a2b](https://github.com/cc1a2b), and
 **share** tazamun with anyone who needs private, serverless folder sync.
