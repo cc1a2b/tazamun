@@ -32,23 +32,15 @@ content. No Git, no commits, no merges — just files, of every kind.
 مختلفتين بمجرّد تذكرة دعوة، دون أن يقرأ أيّ خادم مركزي بايتًا واحدًا من محتوى
 ملفّاتك.
 
-`tazamun status` shows every member, how you are connected to each
-(Direct/Relayed + live RTT), and what is currently leased or syncing:
+`tazamun status` grades how you are connected to each member (green/yellow/red
+dot), and shows what is currently leased or syncing. See
+[Connection Health](#-connection-health) for the full panel, `--watch`, and
+`--json`:
 
 ```text
-peer id : 7b3f2a9c1d8e4f60a5b2c7d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80912a3b4
-folder  : /home/hassan/project
-files   : 128 (94371840 bytes)
-
 members (2):
-  9f2c4a7e10  online   Direct   rtt 24 ms
-  3d8b1f60ca  online   Relayed  rtt 118 ms
-
-active leases (1):
-  designs/logo.psd  held by 9f2c4a7e10  expires in 74s
-
-pending pulls (1):
-  src/render/pipeline.rs
+  ● Good   9f2c4a7e10 Direct  24±3ms       Δ0
+  ● Fair   3d8b1f60ca Relayed 118±9ms      Δ1 via euw-1.relay.n0.iroh.link
 ```
 
 ---
@@ -62,6 +54,7 @@ pending pulls (1):
 - [Usage Examples](#-usage-examples)
 - [Command Reference](#-command-reference)
 - [How It Works](#-how-it-works)
+- [Connection Health](#-connection-health)
 - [Internet Acceptance Checklist](#-internet-acceptance-checklist)
 - [Advanced Usage](#-advanced-usage)
 - [Contributing](#-contributing)
