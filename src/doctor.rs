@@ -312,8 +312,13 @@ mod tests {
 
     #[test]
     fn drvfs_section_warns_with_action() {
-        let s = filesystem_section(Path::new("/mnt/e/proj"), MountKind::DrvFs);
-        assert_eq!(s.verdict, Verdict::Warn);
+        // Use a real temp dir so the read-only probe succeeds; the DrvFs mount
+        // kind is injected (the classifier is tested separately). A DrvFs
+        // classification alone must produce a Warn with an action, independent
+        // of the actual filesystem under the probe.
+        let dir = tempfile::tempdir().unwrap();
+        let s = filesystem_section(dir.path(), MountKind::DrvFs);
+        assert_eq!(s.verdict, Verdict::Warn, "{:?}", s.lines);
         assert!(s.action.is_some());
         assert!(s.lines.iter().any(|l| l.contains("WSL /mnt drive")));
     }
