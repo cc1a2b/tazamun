@@ -175,6 +175,18 @@ kernel-maintained, so the final reading is the true peak (GNU time is not
 installed in this WSL image). The pipeline holds 3 × ~4.5 MiB recycled window
 buffers plus in-flight batch copies regardless of file size.
 
+### CI observation (watched, not root-caused)
+
+One `windows-latest` run of the P1 branch failed `delta_edit_transfers_under_
+20_percent` with "delta edit did not sync" after its full 120 s wait; the
+identical code passed Windows on the next run, passes 4-CPU-pinned Linux in
+~1.7 s across repeated runs, and every other suite on the failing runner ran
+at normal speed. Verdict: slow-runner flakiness, not a product defect. Rather
+than papering over it with a bigger timeout, the test now dumps both daemons'
+full `status` (members, leases, pending pulls with progress, per-file version
+vectors) whenever either 120 s wait expires, so any recurrence is directly
+diagnosable from the CI log.
+
 ### Terminal UX decisions
 
 - **Progress is presentation-only.** Pull bars and the publish spinner live in
