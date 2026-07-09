@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod daemon;
+pub mod doctor;
 pub mod guard;
 pub mod ipc;
 pub mod locks;
@@ -69,6 +70,23 @@ pub mod consts {
     pub const IPC_LINE_MAX: usize = 1024 * 1024;
     /// Interval of the blob store's scheduled garbage collection.
     pub const GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// Interval between connection telemetry samples.
+    pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+    /// Interval between re-hole-punch probes for peers stuck on a relay.
+    pub const REPUNCH_INTERVAL: Duration = Duration::from_secs(60);
+    /// Health grading: `Good` requires a Direct path with RTT below this.
+    pub const GRADE_GOOD_MAX_RTT_MS: f64 = 80.0;
+    /// Health grading: `Good` requires RTT jitter (EWMA of |Δrtt|) below this.
+    pub const GRADE_GOOD_MAX_JITTER_MS: f64 = 20.0;
+    /// Health grading: RTT at or above this is `Poor` regardless of path.
+    pub const GRADE_POOR_MIN_RTT_MS: f64 = 300.0;
+    /// Health grading: strictly more path changes than this per minute is
+    /// flapping, i.e. `Poor`.
+    pub const GRADE_POOR_FLAPS_PER_MIN: usize = 3;
+    /// Smoothing factor for jitter and transfer-rate EWMAs.
+    pub const EWMA_ALPHA: f64 = 0.3;
+    /// Reconnect/path events kept for the status panel.
+    pub const EVENT_RING: usize = 5;
     /// Name of the metadata directory inside a session folder.
     pub const META_DIR: &str = ".tazamun";
 }

@@ -4,3 +4,4 @@
 pub mod control;
 pub mod endpoint;
 pub mod membership;
+pub mod telemetry;

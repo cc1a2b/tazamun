@@ -25,6 +25,7 @@ use crate::locks::{Decision, LockTable, LockTimings};
 use crate::net::control::{PeerEvent, PeerHandle, handshake_acceptor, handshake_initiator};
 use crate::net::endpoint::{NetConfig, build_endpoint, path_info};
 use crate::net::membership::{self, MemberCmd, MemberEvent};
+use crate::net::telemetry::{HealthGrade, PeerHealth};
 use crate::proto::{DenyReason, FileRecord, LeaseInfo, Msg};
 use crate::session::{AddrWire, SessionKeys, SessionSecret, Ticket};
 use crate::state::{AppState, RelPath, VersionEntry};
@@ -160,6 +161,12 @@ pub(crate) enum Event {
     Sweep,
     Renew,
     GcTick,
+    TelemetryTick,
+    RepunchTick,
+    PathChanged {
+        id: EndpointId,
+        conn_id: usize,
+    },
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -353,13 +360,18 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             let mut sweep = tokio::time::interval(Duration::from_millis(250));
             let mut renew = tokio::time::interval(renew_every);
             let mut gc = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            let mut telemetry = tokio::time::interval(crate::consts::TELEMETRY_INTERVAL);
+            let mut repunch = tokio::time::interval(crate::consts::REPUNCH_INTERVAL);
             gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            repunch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first immediate ticks are harmless no-ops.
             loop {
                 let ev = tokio::select! {
                     _ = sweep.tick() => Event::Sweep,
                     _ = renew.tick() => Event::Renew,
                     _ = gc.tick() => Event::GcTick,
+                    _ = telemetry.tick() => Event::TelemetryTick,
+                    _ = repunch.tick() => Event::RepunchTick,
                 };
                 if events.send(ev).await.is_err() {
                     break;
@@ -368,6 +380,11 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         })
     };
 
+    let relay_policy = match &cfg.net.relay {
+        crate::net::endpoint::RelayChoice::Default => "default (n0 public relays)".to_string(),
+        crate::net::endpoint::RelayChoice::Custom(url) => format!("custom: {url}"),
+        crate::net::endpoint::RelayChoice::Disabled => "disabled (--no-relay)".to_string(),
+    };
     let me_str = me.to_string();
     let actor = Actor {
         dir,
@@ -388,6 +405,10 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         backoff: BTreeMap::new(),
         pending_pulls: BTreeMap::new(),
         pull_meters: BTreeMap::new(),
+        peer_health: BTreeMap::new(),
+        fast_redial_used: BTreeSet::new(),
+        events_ring: std::collections::VecDeque::new(),
+        event_seq: 0,
         deferred: BTreeMap::new(),
         pending_acquires: BTreeMap::new(),
         pending_unlocks: BTreeMap::new(),
@@ -397,6 +418,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         gc_running: false,
         gc_dirty: false,
         ui: cfg.ui.clone(),
+        relay_policy,
         keys,
         events_tx: events_tx.clone(),
         member_cmds: member_cmds_tx,
@@ -440,6 +462,10 @@ struct Actor {
     backoff: BTreeMap<EndpointId, Duration>,
     pending_pulls: BTreeMap<RelPath, PullJob>,
     pull_meters: BTreeMap<RelPath, std::sync::Arc<Meter>>,
+    peer_health: BTreeMap<EndpointId, PeerHealth>,
+    fast_redial_used: BTreeSet<EndpointId>,
+    events_ring: std::collections::VecDeque<(u64, String)>,
+    event_seq: u64,
     deferred: BTreeMap<RelPath, DeferredApply>,
     pending_acquires: BTreeMap<RelPath, (u64, oneshot::Sender<IpcResponse>)>,
     pending_unlocks: BTreeMap<RelPath, ()>,
@@ -449,6 +475,7 @@ struct Actor {
     gc_running: bool,
     gc_dirty: bool,
     ui: Ui,
+    relay_policy: String,
     keys: SessionKeys,
     events_tx: mpsc::Sender<Event>,
     member_cmds: mpsc::Sender<MemberCmd>,
@@ -534,6 +561,9 @@ impl Actor {
                 Event::Sweep => self.on_sweep(),
                 Event::Renew => self.on_renew_tick(),
                 Event::GcTick => self.start_gc(None),
+                Event::TelemetryTick => self.on_telemetry_tick(),
+                Event::RepunchTick => self.on_repunch_tick(),
+                Event::PathChanged { id, conn_id } => self.on_path_changed(id, conn_id),
                 Event::Shutdown(reply) => {
                     self.graceful_shutdown().await;
                     let _ = reply.send(());
@@ -577,6 +607,7 @@ impl Actor {
         info!(peer = %id.fmt_short(), "peer authenticated");
         self.dialing.remove(&id);
         self.backoff.remove(&id);
+        self.fast_redial_used.remove(&id);
         self.members
             .entry(id)
             .or_insert_with(|| MemberInfo {
@@ -584,6 +615,48 @@ impl Actor {
                 last_seen: Instant::now(),
             })
             .last_seen = Instant::now();
+        // Telemetry: fresh counters + first sample, and a path-event watcher
+        // whose stream ends with the connection (no explicit teardown).
+        let now = Instant::now();
+        let sample = crate::net::endpoint::sample_connection(&handle.conn);
+        let health = self
+            .peer_health
+            .entry(id)
+            .or_insert_with(|| PeerHealth::seen_only(now));
+        health.on_connect(now);
+        health.on_sample(&sample, now);
+        self.push_event(format!(
+            "peer {} connected ({}, rtt {:.0}ms)",
+            id.fmt_short(),
+            sample.conn,
+            sample.rtt_ms
+        ));
+        {
+            let conn = handle.conn.clone();
+            let conn_id = handle.conn_id();
+            let events = self.events_tx.clone();
+            tokio::spawn(async move {
+                use n0_future::StreamExt;
+                let mut path_events = conn.path_events();
+                while let Some(ev) = path_events.next().await {
+                    use iroh::endpoint::PathEvent;
+                    let relevant = matches!(
+                        ev,
+                        PathEvent::Opened { .. }
+                            | PathEvent::Closed { .. }
+                            | PathEvent::Selected { .. }
+                    );
+                    if relevant
+                        && events
+                            .send(Event::PathChanged { id, conn_id })
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
         let index = self.build_index();
         handle.send(index);
         self.peers.insert(id, handle);
@@ -603,6 +676,98 @@ impl Actor {
         tx
     }
 
+    /// Pushes a human-readable reconnect/path event into the status ring.
+    fn push_event(&mut self, text: String) {
+        self.event_seq += 1;
+        self.events_ring.push_back((self.event_seq, text));
+        while self.events_ring.len() > crate::consts::EVENT_RING {
+            self.events_ring.pop_front();
+        }
+    }
+
+    /// Samples every live connection and grades it; logs Direct↔Relayed
+    /// transitions as ring events.
+    fn on_telemetry_tick(&mut self) {
+        let now = Instant::now();
+        let samples: Vec<(EndpointId, crate::net::telemetry::PathSample)> = self
+            .peers
+            .iter()
+            .map(|(id, h)| (*id, crate::net::endpoint::sample_connection(&h.conn)))
+            .collect();
+        for (id, sample) in samples {
+            let health = self
+                .peer_health
+                .entry(id)
+                .or_insert_with(|| PeerHealth::seen_only(now));
+            let before = health.conn;
+            health.on_sample(&sample, now);
+            use crate::net::telemetry::ConnState;
+            match (before, sample.conn) {
+                (ConnState::Relayed, ConnState::Direct) => {
+                    info!(peer = %id.fmt_short(), rtt_ms = sample.rtt_ms, "link upgraded Relayed→Direct");
+                    self.push_event(format!(
+                        "peer {} upgraded Relayed→Direct (rtt {:.0}ms)",
+                        id.fmt_short(),
+                        sample.rtt_ms
+                    ));
+                }
+                (ConnState::Direct, ConnState::Relayed) => {
+                    warn!(peer = %id.fmt_short(), "link downgraded Direct→Relayed");
+                    self.push_event(format!("peer {} downgraded Direct→Relayed", id.fmt_short()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// For peers stuck on a relay, nudge iroh to re-attempt a direct path by
+    /// re-adding the known address; upgrades are observed by the next sample.
+    fn on_repunch_tick(&mut self) {
+        use crate::net::telemetry::ConnState;
+        let relayed: Vec<EndpointId> = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|id| {
+                self.peer_health
+                    .get(id)
+                    .is_some_and(|h| h.conn == ConnState::Relayed)
+            })
+            .collect();
+        for id in relayed {
+            if let Some(addr) = self.known_member_addr(&id) {
+                let endpoint = self.endpoint.clone();
+                debug!(peer = %id.fmt_short(), "re-hole-punch probe (currently relayed)");
+                tokio::spawn(async move {
+                    for t in addr.addrs {
+                        if let iroh::TransportAddr::Ip(sock) = t {
+                            endpoint.add_external_addr(sock).await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// A path opened/closed/switched on a live connection.
+    fn on_path_changed(&mut self, id: EndpointId, conn_id: usize) {
+        if self.peers.get(&id).map(|h| h.conn_id()) != Some(conn_id) {
+            return; // stale event from a replaced connection
+        }
+        let now = Instant::now();
+        if let Some(h) = self.peer_health.get_mut(&id) {
+            h.on_path_change(now);
+        }
+        // Re-sample immediately so the new selected path is reflected without
+        // waiting for the next tick.
+        if let Some(handle) = self.peers.get(&id) {
+            let sample = crate::net::endpoint::sample_connection(&handle.conn);
+            if let Some(h) = self.peer_health.get_mut(&id) {
+                h.on_sample(&sample, now);
+            }
+        }
+    }
+
     fn on_peer_gone(&mut self, id: EndpointId, conn_id: usize) {
         let current = self.peers.get(&id).map(|h| h.conn_id());
         if current != Some(conn_id) {
@@ -614,18 +779,37 @@ impl Actor {
         self.peer_index.remove(&id);
         self.index_received.remove(&id);
         info!(peer = %id.fmt_short(), "peer disconnected");
+        let now = Instant::now();
+        if let Some(h) = self.peer_health.get_mut(&id) {
+            h.on_disconnect(now);
+        }
+        self.push_event(format!("peer {} disconnected", id.fmt_short()));
         let aborted = self.locks.on_peer_down(&id.to_string());
         for rel in aborted {
             self.broadcast(Msg::LockRelease { path: rel.clone() });
             if let Some((_, reply)) = self.pending_acquires.remove(&rel) {
-                let _ = reply.send(IpcResponse::err(
+                let diag = self.peer_diag(&id, now, "voter", Some(false));
+                let _ = reply.send(self.lock_error(
                     "voter_lost",
-                    "a peer disconnected while voting on the lease",
+                    format!(
+                        "peer {} disconnected while voting on the lease",
+                        id.fmt_short()
+                    ),
+                    "REACHABILITY",
+                    vec![diag],
+                    "the peer whose grant was required went offline — retry once it reconnects",
                 ));
             }
         }
         if self.members.contains_key(&id) || self.known_member_addr(&id).is_some() {
-            self.schedule_redial(id);
+            // Fast path for transient blips: one immediate redial before the
+            // exponential backoff curve takes over.
+            if self.fast_redial_used.insert(id) {
+                debug!(peer = %id.fmt_short(), "immediate redial after path loss");
+                self.dial(id);
+            } else {
+                self.schedule_redial(id);
+            }
         }
     }
 
@@ -641,13 +825,20 @@ impl Actor {
                     self.state.known_members.insert(id.to_string(), wire);
                     self.persist();
                 }
+                let now = Instant::now();
                 self.members.insert(
                     id,
                     MemberInfo {
                         addr,
-                        last_seen: Instant::now(),
+                        last_seen: now,
                     },
                 );
+                // Control connection is authoritative for liveness: a presence
+                // beacon only refreshes last_seen for the health snapshot.
+                self.peer_health
+                    .entry(id)
+                    .or_insert_with(|| PeerHealth::seen_only(now))
+                    .on_presence(now);
                 if !self.peers.contains_key(&id)
                     && !self.dialing.contains(&id)
                     && !self.redial_scheduled.contains(&id)
@@ -912,13 +1103,22 @@ impl Actor {
                 if self.locks.on_deny(&rel) {
                     self.broadcast(Msg::LockRelease { path: rel.clone() });
                     if let Some((_, waiter)) = self.pending_acquires.remove(&rel) {
+                        let now = Instant::now();
+                        let voter = self.peer_diag(&from, now, "voter", Some(true));
                         let response = match reason {
-                            DenyReason::Held { by } => {
-                                IpcResponse::err("lease_held", format!("lease is held by {by}"))
-                            }
-                            DenyReason::TieLost => IpcResponse::err(
+                            DenyReason::Held { by } => self.lock_error(
+                                "lease_held",
+                                format!("lease is held by {by}"),
+                                "LEASE",
+                                vec![voter],
+                                "another peer already holds this lease; wait for it to unlock",
+                            ),
+                            DenyReason::TieLost => self.lock_error(
                                 "tie_lost",
                                 "a concurrent request won the tie-break",
+                                "LEASE",
+                                vec![voter],
+                                "another node requested the same path first; retry in a moment",
                             ),
                         };
                         let _ = waiter.send(response);
@@ -1591,34 +1791,179 @@ impl Actor {
             }
             IpcRequest::Restore { path, n } => self.handle_restore(path, n, reply),
             IpcRequest::Gc => self.start_gc(Some(reply)),
+            IpcRequest::Doctor => {
+                let _ = reply.send(IpcResponse::ok(self.doctor_json()));
+            }
         }
     }
 
+    /// The daemon's live contribution to `tazamun doctor`: identity, bound
+    /// sockets, relay policy, home-relay status, and per-peer connectivity
+    /// (grade, conn, RTT, path changes, time-to-direct) from telemetry.
+    fn doctor_json(&self) -> serde_json::Value {
+        let now = Instant::now();
+        let addr = self.endpoint.addr();
+        let relay = addr.addrs.iter().find_map(|t| match t {
+            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        });
+        let bound: Vec<String> = self
+            .endpoint
+            .bound_sockets()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let peers: Vec<serde_json::Value> = self
+            .peers
+            .keys()
+            .map(|id| {
+                let h = self.peer_health.get(id);
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "grade": h.map(|h| h.grade(now).to_string()).unwrap_or_else(|| "Offline".into()),
+                    "conn": h.map(|h| h.conn.to_string()).unwrap_or_else(|| "None".into()),
+                    "rtt_ms": h.map(|h| h.rtt_ms).unwrap_or(0.0),
+                    "path_changes": h.map(|h| h.path_changes).unwrap_or(0),
+                    "time_to_direct_ms": h.and_then(|h| h.time_to_direct).map(|d| d.as_millis() as u64),
+                    "relay_url": h.and_then(|h| h.relay_url.clone()),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "id": self.me.to_string(),
+            "home_relay": relay,
+            "bound_sockets": bound,
+            "relay_policy": self.relay_policy,
+            "known_members": self.state.known_members.len(),
+            "connected_peers": self.peers.len(),
+            "peers": peers,
+        })
+    }
+
+    /// A per-peer diagnosis row: identity, health grade, connection, and role
+    /// in the pending decision.
+    fn peer_diag(
+        &self,
+        id: &EndpointId,
+        now: Instant,
+        role: &str,
+        answered: Option<bool>,
+    ) -> serde_json::Value {
+        let health = self.peer_health.get(id);
+        let grade = health.map(|h| h.grade(now)).unwrap_or(HealthGrade::Offline);
+        let (conn, rtt) = match health {
+            Some(h) => (h.conn.to_string(), h.rtt_ms),
+            None => ("None".to_string(), 0.0),
+        };
+        serde_json::json!({
+            "id": id.to_string(),
+            "grade": grade.to_string(),
+            "conn": conn,
+            "rtt_ms": rtt,
+            "role": role,
+            "answered": answered,
+        })
+    }
+
+    /// Wraps a lock-failure error with a network-terms diagnosis payload:
+    /// which precondition blocked it, the peers consulted with their grades,
+    /// and an actionable hint.
+    fn lock_error(
+        &self,
+        code: &str,
+        message: impl Into<String>,
+        precondition: &str,
+        peers: Vec<serde_json::Value>,
+        hint: &str,
+    ) -> IpcResponse {
+        let mut resp = IpcResponse::err(code, message);
+        resp.data = Some(serde_json::json!({
+            "diagnosis": {
+                "precondition": precondition,
+                "peers": peers,
+                "hint": hint,
+            }
+        }));
+        resp
+    }
+
+    /// Checks REACHABILITY and FRESHNESS, returning a diagnosed error when
+    /// either fails. `None` means both hold and the acquire may proceed.
     fn strict_edit_guard(&self, rel: &RelPath) -> Option<IpcResponse> {
+        let now = Instant::now();
         if self.peers.is_empty() {
-            return Some(IpcResponse::err(
+            // Name the members we know about but cannot currently reach, so the
+            // user sees who they are waiting on.
+            let mut known: BTreeSet<EndpointId> = self.peer_health.keys().copied().collect();
+            known.extend(
+                self.state
+                    .known_members
+                    .keys()
+                    .filter_map(|k| k.parse::<EndpointId>().ok()),
+            );
+            known.remove(&self.me);
+            let peers: Vec<serde_json::Value> = known
+                .iter()
+                .map(|id| self.peer_diag(id, now, "offline", Some(false)))
+                .collect();
+            let message = if known.is_empty() {
+                "strict mode: no authenticated peer is connected, so edits are refused".to_string()
+            } else {
+                let names: Vec<String> =
+                    known.iter().map(|id| id.fmt_short().to_string()).collect();
+                format!(
+                    "strict mode: no peer is currently reachable (last known: {})",
+                    names.join(", ")
+                )
+            };
+            return Some(self.lock_error(
                 "strict_offline",
-                "strict mode: no authenticated peer is connected, so edits are refused",
+                message,
+                "REACHABILITY",
+                peers,
+                "wait for at least one peer to reconnect (check `tazamun status`)",
             ));
         }
         for id in self.peers.keys() {
             if !self.index_received.contains(id) {
-                return Some(IpcResponse::err(
+                let peers = self
+                    .peers
+                    .keys()
+                    .map(|p| {
+                        let answered = self.index_received.contains(p);
+                        self.peer_diag(p, now, "syncing", Some(answered))
+                    })
+                    .collect();
+                return Some(self.lock_error(
                     "syncing",
                     "still exchanging indexes with a peer; retry in a moment",
+                    "FRESHNESS",
+                    peers,
+                    "index exchange is still in progress; retry shortly",
                 ));
             }
         }
         if self.pending_pulls.contains_key(rel) || self.deferred.contains_key(rel) {
-            return Some(IpcResponse::err(
+            let peers = self
+                .peers
+                .keys()
+                .map(|p| self.peer_diag(p, now, "voter", None))
+                .collect();
+            return Some(self.lock_error(
                 "not_fresh",
                 "a newer version of this path is still being pulled",
+                "FRESHNESS",
+                peers,
+                "let the in-flight pull finish, then retry",
             ));
         }
         if self.busy.contains(rel) {
-            return Some(IpcResponse::err(
+            return Some(self.lock_error(
                 "busy",
                 "an operation on this path is in progress; retry in a moment",
+                "FRESHNESS",
+                vec![],
+                "an operation on this path is in progress; retry shortly",
             ));
         }
         let local_vv = self
@@ -1635,9 +1980,12 @@ impl Actor {
                 match vclock::compare(&local_vv, &theirs.vv) {
                     Causality::Equal | Causality::After => {}
                     Causality::Before | Causality::Concurrent => {
-                        return Some(IpcResponse::err(
+                        return Some(self.lock_error(
                             "not_fresh",
                             format!("peer {} advertises a newer version", id.fmt_short()),
+                            "FRESHNESS",
+                            vec![self.peer_diag(id, now, "ahead", None)],
+                            "this peer has a newer version; wait for it to sync in, then retry",
                         ));
                     }
                 }
@@ -1659,9 +2007,18 @@ impl Actor {
             return;
         }
         if let Some(holder) = self.locks.holder(&rel) {
-            let _ = reply.send(IpcResponse::err(
+            let now = Instant::now();
+            let holder_peer = holder
+                .parse::<EndpointId>()
+                .ok()
+                .map(|id| vec![self.peer_diag(&id, now, "holder", None)])
+                .unwrap_or_default();
+            let _ = reply.send(self.lock_error(
                 "lease_held",
                 format!("lease is held by {holder}"),
+                "LEASE",
+                holder_peer,
+                "wait for the current holder to unlock, or for its lease TTL to expire",
             ));
             return;
         }
@@ -1706,12 +2063,38 @@ impl Actor {
         if !matches_waiter {
             return;
         }
+        let now = Instant::now();
+        // Name the voters who never answered, with their current conn state.
+        let peers: Vec<serde_json::Value> = match self.locks.pending_votes(&rel) {
+            Some((needed, granted)) => needed
+                .iter()
+                .filter_map(|id_str| id_str.parse::<EndpointId>().ok())
+                .map(|id| {
+                    let answered = granted.contains(&id.to_string());
+                    self.peer_diag(&id, now, "voter", Some(answered))
+                })
+                .collect(),
+            None => vec![],
+        };
+        let unanswered: Vec<String> = peers
+            .iter()
+            .filter(|p| p["answered"].as_bool() == Some(false))
+            .filter_map(|p| p["id"].as_str().map(|s| s.chars().take(10).collect()))
+            .collect();
         self.locks.on_deny(&rel);
         self.broadcast(Msg::LockRelease { path: rel.clone() });
         if let Some((_, reply)) = self.pending_acquires.remove(&rel) {
-            let _ = reply.send(IpcResponse::err(
+            let msg = if unanswered.is_empty() {
+                "not every peer answered the lock request in time".to_string()
+            } else {
+                format!("no answer in time from: {}", unanswered.join(", "))
+            };
+            let _ = reply.send(self.lock_error(
                 "timeout",
-                "not every peer answered the lock request in time",
+                msg,
+                "REACHABILITY",
+                peers,
+                "a consulted peer did not respond — check its link in `tazamun status`",
             ));
         }
     }
@@ -1926,12 +2309,26 @@ impl Actor {
                 // authenticated peer whose Index we have processed, so it can
                 // participate as a lease voter.
                 let synced = connected.is_some() && self.index_received.contains(&id);
+                let health = self.peer_health.get(&id);
+                let grade = health.map(|h| h.grade(now)).unwrap_or(HealthGrade::Offline);
                 serde_json::json!({
                     "id": id.to_string(),
                     "online": online,
                     "synced": synced,
                     "conn": conn,
                     "rtt_ms": rtt_ms,
+                    "grade": grade.to_string(),
+                    "rtt_jitter_ms": health.map(|h| h.rtt_jitter_ms).unwrap_or(0.0),
+                    "path_changes": health.map(|h| h.path_changes).unwrap_or(0),
+                    "flaps_per_min": health.map(|h| h.flaps_last_minute(now)).unwrap_or(0),
+                    "relay_url": health.and_then(|h| h.relay_url.clone()),
+                    "rate_tx_bps": health.map(|h| h.rate_tx).unwrap_or(0.0),
+                    "rate_rx_bps": health.map(|h| h.rate_rx).unwrap_or(0.0),
+                    "bytes_tx": health.map(|h| h.bytes_tx).unwrap_or(0),
+                    "bytes_rx": health.map(|h| h.bytes_rx).unwrap_or(0),
+                    "time_to_direct_ms": health
+                        .and_then(|h| h.time_to_direct)
+                        .map(|d| d.as_millis() as u64),
                 })
             })
             .collect();
@@ -1981,12 +2378,19 @@ impl Actor {
                 })
             })
             .collect();
+        let events: Vec<serde_json::Value> = self
+            .events_ring
+            .iter()
+            .map(|(seq, text)| serde_json::json!({ "seq": seq, "text": text }))
+            .collect();
         serde_json::json!({
+            "schema": 1,
             "id": self.me.to_string(),
             "dir": self.dir.display().to_string(),
             "members": members,
             "leases": leases,
             "pending_pulls": pending_pulls,
+            "events": events,
             "file_count": live_files.len(),
             "total_bytes": live_files.iter().map(|(_, r)| r.size).sum::<u64>(),
             "files": files_json,
@@ -2013,6 +2417,19 @@ impl Actor {
                     "timeout",
                     "not every peer answered the lock request in time",
                 ));
+            }
+        }
+        // Presence-gap discrepancy: a live control connection keeps a peer
+        // authoritatively online even when presence beacons lapse (control is
+        // the source of truth). Note it at debug so the divergence is visible.
+        for id in self.peers.keys() {
+            if let Some(h) = self.peer_health.get(id)
+                && now.duration_since(h.last_seen) > crate::consts::ONLINE_WINDOW
+            {
+                debug!(
+                    peer = %id.fmt_short(),
+                    "presence beacons lapsed but control connection is live; staying online"
+                );
             }
         }
     }

@@ -101,3 +101,39 @@ pub fn path_info(conn: &Connection) -> Option<(ConnKind, Duration)> {
     };
     Some((kind, selected.rtt()))
 }
+
+/// Takes one telemetry reading from a live connection: selected-path state,
+/// RTT, the relay URL when relayed, and cumulative UDP byte counters.
+pub fn sample_connection(conn: &Connection) -> crate::net::telemetry::PathSample {
+    use crate::net::telemetry::{ConnState, PathSample};
+    use iroh::TransportAddr;
+
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected()).or_else(|| {
+        let mut iter = paths.iter();
+        iter.next()
+    });
+    let (state, rtt_ms, relay_url) = match selected {
+        Some(p) => {
+            let state = if p.is_relay() {
+                ConnState::Relayed
+            } else {
+                ConnState::Direct
+            };
+            let relay = match p.remote_addr() {
+                TransportAddr::Relay(url) => Some(url.to_string()),
+                _ => None,
+            };
+            (state, p.rtt().as_secs_f64() * 1000.0, relay)
+        }
+        None => (ConnState::None, 0.0, None),
+    };
+    let stats = conn.stats();
+    PathSample {
+        conn: state,
+        rtt_ms,
+        relay_url,
+        bytes_tx: stats.udp_tx.bytes,
+        bytes_rx: stats.udp_rx.bytes,
+    }
+}

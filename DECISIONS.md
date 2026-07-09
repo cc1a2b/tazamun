@@ -94,6 +94,44 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Phase 2 — connection health & observability
+
+- **Zero new dependencies.** Telemetry, grading, the status panel, `--watch`,
+  `doctor`, and JSON output are all built on the existing `indicatif`/`console`
+  stack from P1 plus `serde_json`. No crate was added.
+- **No new wire messages.** Lock explainability is derived entirely from
+  existing grants/denies plus local telemetry; the control protocol
+  (`proto::Msg`) is unchanged, so P2 is fully wire-compatible with P1 peers.
+  Had a wire change been needed it would have been an append-only postcard
+  enum variant — none was.
+- **Telemetry is a pure module** (`net/telemetry.rs`): samples in, grade out,
+  `now` injected, no I/O — exhaustively unit-tested over synthetic sample
+  matrices (all four grades, exact threshold boundaries, jitter/rate EWMAs,
+  time-to-direct). The daemon actor owns every `PeerHealth` and feeds it from
+  `endpoint::sample_connection` on a 2 s tick and on path events; no shared
+  locks, same message-passing pattern as the rest of the actor.
+- **Grade thresholds live in one place** (`consts`): Good = Direct & RTT < 80 ms
+  & jitter < 20 ms; Poor = flaps > 3/min or RTT ≥ 300 ms or a presence gap on a
+  live connection; Offline = no connection and silence past `ONLINE_WINDOW`;
+  Fair = everything else. Chosen as human-legible round numbers for a
+  first-cut; they are data, easy to retune.
+- **Control connection is authoritative for liveness.** A peer missing presence
+  beacons but holding a live control connection stays online; the divergence is
+  logged at debug. Presence only refreshes `last_seen` for the snapshot.
+- **`status --json` is a stable contract (schema = 1).** The integration suite
+  asserts the required top-level and per-member keys so the schema can't drift
+  silently; any addition must bump `schema` and is documented in the README.
+- **Reconnect polish.** On path loss the daemon does one immediate redial
+  before entering the jittered exponential backoff (fast-path for transient
+  blips); peers stuck on a relay get a 60 s re-hole-punch probe
+  (`add_external_addr` of the known direct addresses), and Direct↔Relayed
+  transitions are logged and pushed to the status event ring.
+- **`doctor` never opens its own endpoint.** It reads the running daemon's live
+  view over IPC (labelled "from daemon") and adds only local, side-effect-free
+  probes (mount classification, a temp-file read-only probe, IPC path). The
+  mount classifier is injected so the WSL `/mnt` warning is unit-tested without
+  a real `/mnt`. Exit code encodes the worst verdict (0/1/2).
+
 ## Phase 1 — performance & terminal UX
 
 ### New dependencies
