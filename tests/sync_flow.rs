@@ -131,16 +131,12 @@ async fn delta_edit_transfers_under_20_percent() {
         got.is_some_and(|d| d.len() == want.len() && blake3::hash(&d) == blake3::hash(want))
     };
     // On timeout, dump both nodes' full state so CI failures are diagnosable.
-    let dump = |label: &'static str, a: &TestNode, b: &TestNode, want_len: usize| {
-        let a = a.status();
-        let b_status = b.status();
+    async fn dump(label: &str, a: &TestNode, b: &TestNode, want_len: usize) {
+        eprintln!("--- {label}: A status ---\n{}", a.status().await);
+        eprintln!("--- {label}: B status ---\n{}", b.status().await);
         let b_len = b.read_file("big.bin").map(|d| d.len());
-        async move {
-            eprintln!("--- {label}: A status ---\n{}", a.await);
-            eprintln!("--- {label}: B status ---\n{}", b_status.await);
-            eprintln!("--- {label}: B big.bin len {b_len:?}, want {want_len}");
-        }
-    };
+        eprintln!("--- {label}: B big.bin len {b_len:?}, want {want_len}");
+    }
     let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await;
     if !ok {
         dump("initial sync timeout", &a, &b, data.len()).await;
