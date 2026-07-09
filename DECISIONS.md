@@ -224,6 +224,17 @@ kernel-maintained, so the final reading is the true peak (GNU time is not
 installed in this WSL image). The pipeline holds 3 × ~4.5 MiB recycled window
 buffers plus in-flight batch copies regardless of file size.
 
+### CI heavy-test headroom (Windows)
+
+The 32 MiB `delta_edit_transfers_under_20_percent` test recurs as a slow-runner
+flake **only** on GitHub's shared `windows-latest` instances: it passes every
+run on Linux/macOS and on 4-CPU-pinned Linux in ~5 s, and passed the P2 PR
+Windows job, but a pathologically slow Windows instance occasionally exceeds
+the sync wait (once at 132 s total). Its two convergence budgets were raised
+120 s → 180 s so the test stops being a coin-flip on the worst runners.
+`wait_until` returns as soon as the file matches, so the larger budget costs
+nothing on healthy runners.
+
 ### CI observation (watched, not root-caused)
 
 One `windows-latest` run of the P1 branch failed `delta_edit_transfers_under_

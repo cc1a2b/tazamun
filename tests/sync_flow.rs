@@ -137,7 +137,7 @@ async fn delta_edit_transfers_under_20_percent() {
         let b_len = b.read_file("big.bin").map(|d| d.len());
         eprintln!("--- {label}: B big.bin len {b_len:?}, want {want_len}");
     }
-    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await;
+    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(180)).await;
     if !ok {
         dump("initial sync timeout", &a, &b, data.len()).await;
     }
@@ -155,7 +155,7 @@ async fn delta_edit_transfers_under_20_percent() {
     a.write_file("big.bin", &data);
     a.unlock_ok("big.bin").await;
 
-    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(120)).await;
+    let ok = wait_until(|| async { big_synced(&b, &data) }, Duration::from_secs(180)).await;
     if !ok {
         dump("delta edit timeout", &a, &b, data.len()).await;
     }
