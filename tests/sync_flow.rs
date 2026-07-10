@@ -6,6 +6,25 @@ use std::time::Duration;
 
 use common::{TestNode, WAIT, assert_converged, pseudo_random, wait_until};
 
+/// Strict checkout applies to the genesis importer too: the moment an imported
+/// file is published, the *importer's own copy* goes read-only — not only after
+/// a restart's enforce_all or the first lock/unlock cycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn genesis_import_leaves_importer_copy_read_only() {
+    let dir = TestNode::init_dir();
+    std::fs::write(dir.path().join("seed.txt"), b"genesis").unwrap();
+    let a = TestNode::start(dir).await;
+    assert!(
+        wait_until(|| async { a.file_count().await == 1 }, WAIT).await,
+        "genesis import did not finish"
+    );
+    assert!(
+        wait_until(|| async { a.is_readonly("seed.txt") }, WAIT).await,
+        "the importer's genesis copy must be read-only after publish"
+    );
+    a.handle.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_sync_converges_bidirectional() {
     // A starts with genesis files created before its first start.

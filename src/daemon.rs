@@ -1710,6 +1710,15 @@ impl Actor {
                 info!(path = %rel, "published local edit");
             }
             drop(p.tags);
+            // Strict checkout applies to the importer too: an imported
+            // (genesis) file has no lease, so it goes read-only the moment its
+            // publish lands — not only after a restart's enforce_all. Edit
+            // stays writable (lease held); Unlock is handled in finish_unlock.
+            if matches!(cause, PublishCause::Import)
+                && let Err(e) = guard::set_readonly(&rel.to_fs_path(&self.dir))
+            {
+                warn!(path = %rel, "could not apply read-only after import: {e}");
+            }
         }
         if let PublishCause::Unlock(reply) = cause {
             self.unbusy(&rel);
