@@ -30,8 +30,29 @@ pub struct Cli {
     /// Verbose logging (-v: debug).
     #[arg(short, long, global = true, action = ArgAction::Count)]
     pub verbose: u8,
+    #[command(flatten)]
+    pub net: NetFlags,
     #[command(subcommand)]
     pub cmd: Cmd,
+}
+
+/// Network preference flags shared by `init`, `join`, and `start`.
+/// At `init`/`join` these are persisted into `state.json`; at `start` they are
+/// per-run overrides on top of the persisted config.
+#[derive(Debug, Default, clap::Args)]
+pub struct NetFlags {
+    /// Use a self-hosted relay instead of the public ones.
+    #[arg(long, conflicts_with = "no_relay", global = true)]
+    pub relay: Option<String>,
+    /// Disable relays entirely (LAN / manually routed setups).
+    #[arg(long, global = true)]
+    pub no_relay: bool,
+    /// Disable LAN mDNS discovery (enabled by default).
+    #[arg(long, global = true)]
+    pub no_lan: bool,
+    /// Closed-network mode: no relays and no external discovery of any kind.
+    #[arg(long, global = true)]
+    pub airgap: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,17 +61,14 @@ pub enum Cmd {
     Init,
     /// Join an existing session from an invite ticket.
     Join { ticket: String },
-    /// Run the sync daemon in the foreground.
-    Start {
-        /// Use a self-hosted relay instead of the public ones.
-        #[arg(long, conflicts_with = "no_relay")]
-        relay: Option<String>,
-        /// Disable relays entirely (LAN / manually routed setups).
-        #[arg(long)]
-        no_relay: bool,
-        /// Enable local mDNS discovery.
-        #[arg(long)]
-        lan: bool,
+    /// Run the sync daemon in the foreground. Network preferences come from
+    /// `state.json`; the global `--relay/--no-relay/--no-lan/--airgap` flags
+    /// override them for this run only.
+    Start,
+    /// Show or change persisted per-session network preferences.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
     },
     /// Show members, connection health, leases and transfers.
     Status {
@@ -85,6 +103,15 @@ pub enum Cmd {
     Gc,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ConfigCmd {
+    /// Print the persisted network preferences.
+    Show,
+    /// Change a persisted preference (`relay <default|none|URL>`,
+    /// `lan <on|off>`, `airgap <on|off>`). Takes effect on next `start`.
+    Set { key: String, value: String },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -105,14 +132,20 @@ pub enum CliError {
 pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
     let dir = std::path::absolute(&cli.dir).map_err(crate::state::StateError::Io)?;
     let verbose = cli.verbose > 0;
+    let net = cli.net;
     match cli.cmd {
-        Cmd::Init => init(&dir),
-        Cmd::Join { ticket } => join(&dir, &ticket),
-        Cmd::Start {
-            relay,
-            no_relay,
-            lan,
-        } => start(&dir, relay, no_relay, lan, ui).await,
+        Cmd::Init => {
+            init(&dir)?;
+            persist_net_flags(&dir, &net)?;
+            Ok(())
+        }
+        Cmd::Join { ticket } => {
+            join(&dir, &ticket)?;
+            persist_net_flags(&dir, &net)?;
+            Ok(())
+        }
+        Cmd::Start => start(&dir, &net, ui).await,
+        Cmd::Config { cmd } => handle_config_cli(&dir, cmd),
         Cmd::Status { watch, json } => handle_status_cli(&dir, watch, json).await,
         Cmd::Doctor { json } => handle_doctor_cli(&dir, json).await,
         Cmd::Invite { qr } => {
@@ -366,29 +399,63 @@ pub fn join(dir: &Path, ticket: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn start(
-    dir: &Path,
-    relay: Option<String>,
-    no_relay: bool,
-    lan: bool,
-    ui: Ui,
-) -> Result<(), CliError> {
-    let relay_choice = match (relay, no_relay) {
-        (Some(url), _) => {
-            RelayChoice::Custom(url.parse().map_err(|e: iroh::RelayUrlParseError| {
-                CliError::Refused(format!("invalid relay url: {e}"))
-            })?)
+/// Folds per-run [`NetFlags`] onto the persisted [`SessionConfig`] (flag >
+/// config > default) into the runtime [`NetConfig`].
+fn resolve_net_config(
+    saved: &crate::state::SessionConfig,
+    flags: &NetFlags,
+) -> Result<NetConfig, CliError> {
+    let airgap = flags.airgap || saved.airgap;
+    let relay = if airgap {
+        RelayChoice::Disabled
+    } else {
+        match (&flags.relay, flags.no_relay) {
+            (Some(url), _) => RelayChoice::parse(url).map_err(CliError::Refused)?,
+            (None, true) => RelayChoice::Disabled,
+            (None, false) => RelayChoice::parse(&saved.relay).map_err(CliError::Refused)?,
         }
-        (None, true) => RelayChoice::Disabled,
-        (None, false) => RelayChoice::Default,
     };
+    // LAN is on by default and always on in airgap; --no-lan turns it off.
+    let lan = airgap || (saved.lan && !flags.no_lan);
+    Ok(NetConfig {
+        relay,
+        lan,
+        airgap,
+        test_bind: None,
+        test_relay: None,
+    })
+}
+
+/// Persists explicit network flags into the session config (used by
+/// `init`/`join`). Absent flags leave the existing/default value untouched.
+fn persist_net_flags(dir: &Path, flags: &NetFlags) -> Result<(), CliError> {
+    if flags.relay.is_none() && !flags.no_relay && !flags.no_lan && !flags.airgap {
+        return Ok(());
+    }
+    let mut state = AppState::load(dir)?;
+    if let Some(url) = &flags.relay {
+        let choice = RelayChoice::parse(url).map_err(CliError::Refused)?;
+        state.config.relay = choice.to_config_string();
+    } else if flags.no_relay {
+        state.config.relay = "none".to_string();
+    }
+    if flags.no_lan {
+        state.config.lan = false;
+    }
+    if flags.airgap {
+        state.config.airgap = true;
+    }
+    state.save(dir)?;
+    Ok(())
+}
+
+async fn start(dir: &Path, flags: &NetFlags, ui: Ui) -> Result<(), CliError> {
+    let saved = AppState::load(dir)?.config;
+    let net = resolve_net_config(&saved, flags)?;
+    let airgap = net.airgap;
     let cfg = DaemonConfig {
         dir: dir.to_path_buf(),
-        net: NetConfig {
-            relay: relay_choice,
-            lan,
-            test_bind: None,
-        },
+        net,
         timings: LockTimings::default(),
         ui,
     };
@@ -396,6 +463,9 @@ async fn start(
     println!("tazamun daemon running");
     println!("  folder : {}", dir.display());
     println!("  peer id: {}", handle.id());
+    if airgap {
+        println!("  mode   : AIRGAP — no relays, no external discovery, LAN only");
+    }
     println!("\nPress Ctrl-C to stop. Use `tazamun status` from another shell.");
     match tokio::signal::ctrl_c().await {
         Ok(()) => {
@@ -408,6 +478,56 @@ async fn start(
     handle.shutdown().await;
     println!("Stopped cleanly.");
     Ok(())
+}
+
+/// `config show|set` — reads/writes the persisted per-session preferences.
+fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
+    let mut state = AppState::load(dir)?;
+    match cmd {
+        ConfigCmd::Show => {
+            println!("network preferences (folder: {})", dir.display());
+            println!("  relay  : {}", state.config.relay);
+            println!("  lan    : {}", if state.config.lan { "on" } else { "off" });
+            println!(
+                "  airgap : {}",
+                if state.config.airgap { "on" } else { "off" }
+            );
+            println!("\n(per-run flags override these; changes apply on next `tazamun start`)");
+            Ok(())
+        }
+        ConfigCmd::Set { key, value } => {
+            match key.as_str() {
+                "relay" => {
+                    // Validate before persisting.
+                    let choice = RelayChoice::parse(&value).map_err(CliError::Refused)?;
+                    state.config.relay = choice.to_config_string();
+                }
+                "lan" => {
+                    state.config.lan = parse_on_off(&value)?;
+                }
+                "airgap" => {
+                    state.config.airgap = parse_on_off(&value)?;
+                }
+                other => {
+                    return Err(CliError::Refused(format!(
+                        "unknown config key {other:?} (valid: relay, lan, airgap)"
+                    )));
+                }
+            }
+            state.save(dir)?;
+            println!("✔ config set {key} = {value}");
+            println!("(applies on next `tazamun start`)");
+            Ok(())
+        }
+    }
+}
+
+fn parse_on_off(value: &str) -> Result<bool, CliError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(CliError::Refused(format!("expected on/off, got {other:?}"))),
+    }
 }
 
 /// `status`: one-shot table, live `--watch` panel, or `--json` snapshot.
@@ -514,11 +634,15 @@ fn render_status(data: &serde_json::Value, out: &mut String) {
         } else {
             format!("{rtt:.0}±{jitter:.0}ms")
         };
-        let relay = m["relay_url"]
-            .as_str()
-            .and_then(relay_host)
-            .map(|h| format!(" via {h}"))
-            .unwrap_or_default();
+        // Path origin: relay hostname when relayed, "via LAN" for a direct
+        // link to a local-network peer (mDNS discovery).
+        let relay = if let Some(h) = m["relay_url"].as_str().and_then(relay_host) {
+            format!(" via {h}")
+        } else if m["via_lan"].as_bool() == Some(true) {
+            " via LAN".to_string()
+        } else {
+            String::new()
+        };
         let rate_rx = m["rate_rx_bps"].as_f64().unwrap_or(0.0) / 1_000_000.0;
         let rate_tx = m["rate_tx_bps"].as_f64().unwrap_or(0.0) / 1_000_000.0;
         let rates = if rate_rx > 0.05 || rate_tx > 0.05 {
@@ -623,16 +747,44 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
         }
     }
 
-    // (b) relay: policy/home relay from daemon; disabled-by-flag is OK.
+    // Airgap banner (from daemon): list the closed-network guarantees.
+    if daemon.as_ref().and_then(|d| d["mode"].as_str()) == Some("airgap") {
+        let mut s = Section::from_ok("mode  [from daemon]");
+        s.lines
+            .push("mode               : AIRGAP (closed network)".into());
+        s.lines
+            .push("guarantees         : no relays · no DNS/pkarr discovery · LAN mDNS only".into());
+        s.lines
+            .push("egress             : nothing is contacted outside the local network".into());
+        sections.push(s);
+    }
+
+    // (b) relay: policy from daemon; disabled-by-flag is OK. When a custom
+    // relay is configured, probe IT via the daemon's live relay handshake
+    // (relay_status), not the defaults.
     let policy = daemon
         .as_ref()
         .and_then(|d| d["relay_policy"].as_str())
         .unwrap_or("unknown (daemon not running)")
         .to_string();
     let home = daemon.as_ref().and_then(|d| d["home_relay"].as_str());
-    // We do not open a fresh endpoint here; the daemon's home-relay presence is
-    // the reachability signal, so no separate probe unless disabled.
-    let relay_probe = home.map(|_| Ok(0u128));
+    // The daemon's actual relay handshake result is the reachability probe:
+    // Ok when the configured relay is connected, Err when it is not.
+    let relay_probe: Option<Result<u128, String>> = daemon
+        .as_ref()
+        .and_then(|d| d["relay_status"].as_array())
+        .and_then(|st| st.first())
+        .map(|r| {
+            if r["connected"].as_bool() == Some(true) {
+                Ok(0u128)
+            } else {
+                Err(format!(
+                    "relay {} did not complete a connection",
+                    r["url"].as_str().unwrap_or("?")
+                ))
+            }
+        })
+        .or_else(|| home.map(|_| Ok(0u128)));
     sections.push(relay_section(&policy, home, relay_probe));
 
     // (c) NAT / hole-punch (from daemon telemetry).
@@ -658,8 +810,13 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
                         String::new()
                     }
                 });
+            let lan = if p["via_lan"].as_bool() == Some(true) {
+                " via LAN"
+            } else {
+                ""
+            };
             s.lines.push(format!(
-                "peer {id}      : {conn} ({grade}, {rtt:.0}ms{ttd})"
+                "peer {id}      : {conn}{lan} ({grade}, {rtt:.0}ms{ttd})"
             ));
             if conn == "Relayed" {
                 s.verdict = s.verdict.max_with(Verdict::Warn);
@@ -787,4 +944,92 @@ fn print_versions(data: &serde_json::Value) {
         );
     }
     println!("\nrestore with: tazamun restore {path} <N> (requires a held lease)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::endpoint::RelayChoice;
+    use crate::state::SessionConfig;
+
+    fn flags(relay: Option<&str>, no_relay: bool, no_lan: bool, airgap: bool) -> NetFlags {
+        NetFlags {
+            relay: relay.map(String::from),
+            no_relay,
+            no_lan,
+            airgap,
+        }
+    }
+
+    #[test]
+    fn precedence_flag_beats_config_beats_default() {
+        // Default config, no flags → n0 default relay, LAN on, not airgap.
+        let saved = SessionConfig::default();
+        let n = resolve_net_config(&saved, &flags(None, false, false, false)).unwrap();
+        assert!(matches!(n.relay, RelayChoice::Default));
+        assert!(n.lan && !n.airgap);
+
+        // Persisted custom relay + LAN off is honored when no flags override.
+        let saved = SessionConfig {
+            relay: "https://saved.example./".into(),
+            lan: false,
+            airgap: false,
+        };
+        let n = resolve_net_config(&saved, &flags(None, false, false, false)).unwrap();
+        assert!(matches!(n.relay, RelayChoice::Custom(_)));
+        assert!(!n.lan);
+
+        // A per-run --no-relay flag overrides the persisted custom relay.
+        let n = resolve_net_config(&saved, &flags(None, true, false, false)).unwrap();
+        assert!(matches!(n.relay, RelayChoice::Disabled));
+
+        // A per-run --relay URL overrides both.
+        let n = resolve_net_config(
+            &saved,
+            &flags(Some("https://run.example./"), false, false, false),
+        )
+        .unwrap();
+        match n.relay {
+            RelayChoice::Custom(u) => assert!(u.to_string().contains("run.example")),
+            other => panic!("expected run.example, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn airgap_forces_relay_off_and_lan_on() {
+        // Airgap via flag: relay disabled, LAN on, even if config said otherwise.
+        let saved = SessionConfig {
+            relay: "https://x.example./".into(),
+            lan: false,
+            airgap: false,
+        };
+        let n = resolve_net_config(&saved, &flags(None, false, true, true)).unwrap();
+        assert!(matches!(n.relay, RelayChoice::Disabled));
+        assert!(n.lan, "airgap keeps LAN on even with --no-lan");
+        assert!(n.airgap);
+
+        // Airgap via persisted config, no flags.
+        let saved = SessionConfig {
+            relay: "default".into(),
+            lan: true,
+            airgap: true,
+        };
+        let n = resolve_net_config(&saved, &flags(None, false, false, false)).unwrap();
+        assert!(matches!(n.relay, RelayChoice::Disabled));
+        assert!(n.airgap && n.lan);
+    }
+
+    #[test]
+    fn no_lan_flag_disables_lan_when_not_airgap() {
+        let saved = SessionConfig::default();
+        let n = resolve_net_config(&saved, &flags(None, false, true, false)).unwrap();
+        assert!(!n.lan);
+        assert!(!n.airgap);
+    }
+
+    #[test]
+    fn invalid_relay_flag_is_rejected() {
+        let saved = SessionConfig::default();
+        assert!(resolve_net_config(&saved, &flags(Some("garbage"), false, false, false)).is_err());
+    }
 }

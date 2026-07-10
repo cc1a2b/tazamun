@@ -419,6 +419,8 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         gc_dirty: false,
         ui: cfg.ui.clone(),
         relay_policy,
+        airgap: cfg.net.airgap,
+        lan_enabled: cfg.net.lan,
         keys,
         events_tx: events_tx.clone(),
         member_cmds: member_cmds_tx,
@@ -476,6 +478,8 @@ struct Actor {
     gc_dirty: bool,
     ui: Ui,
     relay_policy: String,
+    airgap: bool,
+    lan_enabled: bool,
     keys: SessionKeys,
     events_tx: mpsc::Sender<Event>,
     member_cmds: mpsc::Sender<MemberCmd>,
@@ -1826,14 +1830,33 @@ impl Actor {
                     "path_changes": h.map(|h| h.path_changes).unwrap_or(0),
                     "time_to_direct_ms": h.and_then(|h| h.time_to_direct).map(|d| d.as_millis() as u64),
                     "relay_url": h.and_then(|h| h.relay_url.clone()),
+                    "via_lan": h.is_some_and(|h| h.on_lan),
+                })
+            })
+            .collect();
+        // Live home-relay connection status — the daemon's actual relay
+        // handshake result, which doctor uses as its custom-relay probe.
+        use iroh::Watcher;
+        let relay_status: Vec<serde_json::Value> = self
+            .endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "url": r.url().to_string(),
+                    "connected": r.is_connected(),
                 })
             })
             .collect();
         serde_json::json!({
             "id": self.me.to_string(),
+            "mode": if self.airgap { "airgap" } else { "normal" },
             "home_relay": relay,
+            "relay_status": relay_status,
             "bound_sockets": bound,
             "relay_policy": self.relay_policy,
+            "lan_discovery": self.lan_enabled,
             "known_members": self.state.known_members.len(),
             "connected_peers": self.peers.len(),
             "peers": peers,
@@ -2322,6 +2345,7 @@ impl Actor {
                     "path_changes": health.map(|h| h.path_changes).unwrap_or(0),
                     "flaps_per_min": health.map(|h| h.flaps_last_minute(now)).unwrap_or(0),
                     "relay_url": health.and_then(|h| h.relay_url.clone()),
+                    "via_lan": health.is_some_and(|h| h.on_lan),
                     "rate_tx_bps": health.map(|h| h.rate_tx).unwrap_or(0.0),
                     "rate_rx_bps": health.map(|h| h.rate_rx).unwrap_or(0.0),
                     "bytes_tx": health.map(|h| h.bytes_tx).unwrap_or(0),

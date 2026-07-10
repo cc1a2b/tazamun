@@ -1,0 +1,29 @@
+# iroh-relay server configuration (templated: ${VARS} are filled by
+# entrypoint.sh from the environment before the relay starts).
+#
+# This runs a full relay with QUIC address discovery (the STUN-equivalent that
+# helps peers learn their public address for hole-punching) and automatic TLS
+# via Let's Encrypt.
+
+# Serve the relay protocol.
+enable_relay = true
+
+# HTTP listener — used for the ACME http-01 challenge and captive-portal check.
+http_bind_addr = "[::]:80"
+
+# QUIC address discovery on UDP 7842 (helps NAT hole-punching succeed).
+enable_quic_addr_discovery = true
+
+# Prometheus metrics (localhost-only by default in the compose file's network).
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+
+[tls]
+# Built-in ACME: the relay obtains and renews its own certificate.
+cert_mode = "LetsEncrypt"
+# Set to false only while testing (uses the Let's Encrypt staging CA).
+prod_tls = true
+hostname = ["${TZM_RELAY_DOMAIN}"]
+https_bind_addr = "[::]:443"
+# Directory where issued certs are cached (mounted as a named volume).
+cert_dir = "/data/certs"

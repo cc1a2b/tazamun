@@ -34,7 +34,9 @@ pub fn test_net() -> NetConfig {
     NetConfig {
         relay: RelayChoice::Disabled,
         lan: false,
+        airgap: false,
         test_bind: Some(TEST_BIND.parse::<SocketAddr>().expect("valid bind addr")),
+        test_relay: None,
     }
 }
 
@@ -70,9 +72,14 @@ impl TestNode {
 
     /// Starts a daemon over an already prepared session folder.
     pub async fn start(dir: tempfile::TempDir) -> TestNode {
+        Self::start_with(dir, test_net()).await
+    }
+
+    /// Starts a daemon with a specific [`NetConfig`] (relay/airgap tests).
+    pub async fn start_with(dir: tempfile::TempDir, net: NetConfig) -> TestNode {
         let handle = spawn(DaemonConfig {
             dir: dir.path().to_path_buf(),
-            net: test_net(),
+            net,
             timings: test_timings(),
             ui: tazamun::ui::progress::Ui::disabled(),
         })

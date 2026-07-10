@@ -61,6 +61,41 @@ pub struct VersionEntry {
     pub size: u64,
 }
 
+/// Persisted, per-session network preferences (flags at runtime override).
+///
+/// Older state files without a `config` block deserialize with defaults, so
+/// upgrading in place needs no migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Relay policy: `"default"`, `"none"`, or a relay URL string.
+    #[serde(default = "default_relay")]
+    pub relay: String,
+    /// Whether LAN mDNS discovery is enabled (on by default).
+    #[serde(default = "default_true")]
+    pub lan: bool,
+    /// Airgap mode: relays off + all external discovery off + LAN only.
+    #[serde(default)]
+    pub airgap: bool,
+}
+
+fn default_relay() -> String {
+    "default".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            relay: default_relay(),
+            lan: true,
+            airgap: false,
+        }
+    }
+}
+
 /// The whole persisted application state for one session folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
@@ -69,6 +104,8 @@ pub struct AppState {
     pub iroh_secret_key: String,
     pub session_secret: String,
     pub lamport: u64,
+    #[serde(default)]
+    pub config: SessionConfig,
     pub files: BTreeMap<RelPath, FileRecord>,
     pub known_members: BTreeMap<String, AddrWire>,
     pub history: BTreeMap<RelPath, Vec<VersionEntry>>,
@@ -98,6 +135,7 @@ impl AppState {
             iroh_secret_key: iroh_secret_key_hex,
             session_secret: session_secret_hex,
             lamport: 0,
+            config: SessionConfig::default(),
             files: BTreeMap::new(),
             known_members: BTreeMap::new(),
             history: BTreeMap::new(),
@@ -244,5 +282,51 @@ mod tests {
             AppState::load(dir.path()),
             Err(StateError::NotInitialized)
         ));
+    }
+
+    #[test]
+    fn config_defaults_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = AppState::new(encode_hex32(&[1u8; 32]), encode_hex32(&[2u8; 32]));
+        // Defaults: relay default, LAN on, airgap off.
+        assert_eq!(st.config.relay, "default");
+        assert!(st.config.lan);
+        assert!(!st.config.airgap);
+        st.config.relay = "https://relay.example.com./".to_string();
+        st.config.lan = false;
+        st.config.airgap = true;
+        st.save(dir.path()).unwrap();
+        let back = AppState::load(dir.path()).unwrap();
+        assert_eq!(back.config.relay, "https://relay.example.com./");
+        assert!(!back.config.lan);
+        assert!(back.config.airgap);
+    }
+
+    #[test]
+    fn old_state_without_config_gets_defaults() {
+        // A state.json written before P3 has no "config" key; it must load with
+        // the default config (in-place upgrade, no migration).
+        let dir = tempfile::tempdir().unwrap();
+        create_meta_dirs(dir.path()).unwrap();
+        let json = serde_json::json!({
+            "version": 1,
+            "mode": "strict",
+            "iroh_secret_key": encode_hex32(&[3u8; 32]),
+            "session_secret": encode_hex32(&[4u8; 32]),
+            "lamport": 5,
+            "files": {},
+            "known_members": {},
+            "history": {},
+        });
+        std::fs::write(
+            AppState::state_path(dir.path()),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+        let st = AppState::load(dir.path()).unwrap();
+        assert_eq!(st.lamport, 5);
+        assert_eq!(st.config.relay, "default");
+        assert!(st.config.lan);
+        assert!(!st.config.airgap);
     }
 }

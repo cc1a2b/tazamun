@@ -254,3 +254,129 @@ summary: OK
 (not an error), the hole-punched **Direct** link is reported under
 connectivity, and the process exits `0` (all sections OK). Identifiers and
 paths above are redacted; the run is otherwise verbatim.
+
+---
+
+# P3 addendum — sovereignty (self-hosted relay, LAN, airgap)
+
+Three scenarios driven by the Phase 3 release binary, each with its own driver
+script under `~/tazamun-smoke-p3/`. Every assertion passed; transcripts are
+verbatim (peer ids abbreviated). Together they exercise the two automatable
+sovereignty guarantees end-to-end on real infrastructure, plus the client half
+of the self-hosted-relay path against a genuine relay.
+
+## LAN rendezvous — meet over mDNS from a zero-address ticket
+
+Node A `init`s and hands B a ticket carrying **only the session secret** (the
+`init`-time ticket has no live addresses — the daemon is not running yet). Both
+start with `--no-relay`, so with no relay and no address in the ticket the only
+way to meet is local mDNS discovery.
+
+```text
+=== STEP 1 — A: init (ticket carries NO live addresses) ===
+PASS: A initialized, secret-only ticket (113 chars)
+=== STEP 2 — A: start --no-relay (LAN discovery on by default) ===
+PASS: A daemon answering IPC
+=== STEP 3 — B: join the address-less ticket, start --no-relay ===
+PASS: B joined (no addresses known)
+PASS: B daemon answering IPC
+=== STEP 4 — they must meet over mDNS alone (no ticket addresses) ===
+PASS: peers discovered each other via LAN mDNS
+=== STEP 5 — status shows the peer as reached via LAN ===
+----- A status -----
+members (1):
+  ● Good   ca40b82acc Direct  0±0ms        Δ0 via LAN
+
+active leases (0):
+PASS: A tags the peer 'via LAN'
+=== STEP 6 — a lease + edit round-trips over the LAN-only link ===
+PASS: A locked lan.txt
+PASS: A unlocked lan.txt
+PASS: lan.txt synced to B over the LAN link
+PASS: byte-exact copy on B
+=== RESULT ===
+LAN RENDEZVOUS SMOKE PASSED
+```
+
+The proof-of-secret handshake still gates the connection (`peer authenticated`
+in both logs), so only a genuine session member is ever dialed — mDNS supplies
+the address, the secret supplies the trust. The **via LAN** tag on the status
+row is the observable signal that the peer was reached over a private-network
+Direct path rather than a relay. On a CI runner without multicast this scenario
+self-skips (STEP 4 fails fast with the "no multicast" note) rather than hanging.
+
+## Airgap — closed network, egress sweep with `ss`
+
+A single `--airgap` daemon; `doctor` states the closed-network guarantees, then
+`ss` enumerates every socket the daemon owns and asserts none reaches a public
+address.
+
+```text
+=== STEP 1 — A: init + start --airgap ===
+PASS: airgap daemon answering IPC (pid 29373)
+=== STEP 2 — doctor reports a closed network ===
+PASS: doctor: mode = AIRGAP (closed network)
+PASS: doctor: guarantees = no relays / no DNS-pkarr / LAN only
+PASS: doctor: relays not used
+=== STEP 3 — let the endpoint settle, then sweep its sockets with ss ===
+----- ss -tunap for pid 29373 -----
+  udp 0.0.0.0:53539 -> peer 0.0.0.0:*
+  udp 0.0.0.0:5353 -> peer 0.0.0.0:*
+  udp [::]:55930 -> peer [::]:*
+  udp *:5353 -> peer *:*
+PASS: ss egress sweep: 0 sockets reach a public address
+=== STEP 4 — corroborate: no established TCP to any host at all ===
+PASS: no established outbound TCP (relays + pkarr truly off)
+=== RESULT ===
+AIRGAP EGRESS SMOKE PASSED
+```
+
+The only sockets are the endpoint's own wildcard UDP binds plus the mDNS group
+on **:5353** — i.e. local discovery is the one thing still listening, and there
+is no relay/pkarr traffic and no established outbound TCP at all. `doctor`'s
+`AIRGAP (closed network)` section makes the guarantee legible at a glance.
+
+## Self-hosted relay — client path against a real relay
+
+The forced *Relayed peer path* needs two peers whose only route is the relay; on
+a single host loopback is always directly reachable, so that assertion is the
+two-machine procedure below. What one host **can** prove — and this run does,
+against a genuine relay — is the full client wiring: the official
+`n0computer/iroh-relay` image in `--dev` (plain-HTTP) mode stands in for the
+[`deploy/relay/`](deploy/relay) HTTPS kit, the client persists it via `config`,
+and the endpoint adopts it as its home relay with `doctor` probing it reachable.
+
+```text
+=== STEP 1 — bring up a real iroh-relay (dev/HTTP) in Docker ===
+PASS: relay listening on http://localhost:3340
+=== STEP 2 — persist the self-hosted relay, then start the daemon ===
+PASS: config set relay http://localhost:3340
+PASS: config show reflects the self-hosted relay
+PASS: daemon answering IPC (pid 31479)
+=== STEP 3 — the endpoint adopts the self-hosted relay as its home relay ===
+----- doctor relay section -----
+     policy             : custom: http://localhost:3340/
+     home relay         : http://localhost:3340/
+     reachability       : reachable (relay link up)
+
+PASS: endpoint adopted the self-hosted relay as its home relay
+PASS: doctor probe: relay link up (reachable)
+=== RESULT ===
+SELF-HOSTED RELAY CLIENT SMOKE PASSED
+```
+
+The daemon's `iroh` debug log shows the mechanism end-to-end: `net_report`
+selects the relay (`home is now relay http://localhost:3340/, was None`), the
+relay actor dials it by websocket (`ws://localhost:3340/relay`, TCP to
+`127.0.0.1:3340`), and the keepalive ping/pong round-trips at ~100 µs. Any peer
+that later cannot hole-punch would fall back through exactly this link.
+
+**Two-machine step (Relayed peer path + hostname).** Run the
+[`deploy/relay/`](deploy/relay) kit on a public host, then on two machines on
+**different** networks: `tazamun config set relay https://relay.example.com` on
+both, `init`/`invite`/`join`/`start`, and confirm `tazamun status` shows the
+peer as **Relayed** with the relay hostname and a real RTT (the same fields the
+automated `relayed_sample_surfaces_conn_and_hostname` unit test asserts over the
+telemetry pipeline). This is the standard two-network setup from the *Internet
+Acceptance Checklist*, pinned to a self-hosted relay. It is a manual step
+because a single host cannot force the relay path — see `DECISIONS.md`.

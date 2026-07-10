@@ -29,7 +29,7 @@ fn main() {
     // Progress bars exist only for the foreground daemon; every other command
     // (and every non-TTY invocation) runs with presentation disabled.
     let ui = match &cli.cmd {
-        Cmd::Start { .. } => Ui::detect(),
+        Cmd::Start => Ui::detect(),
         _ => Ui::disabled(),
     };
     init_tracing(cli.verbose, &ui);

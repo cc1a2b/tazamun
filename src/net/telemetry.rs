@@ -59,6 +59,9 @@ pub struct PathSample {
     pub conn: ConnState,
     pub rtt_ms: f64,
     pub relay_url: Option<String>,
+    /// The selected path is a direct link to a local-network address (the
+    /// observable signal of a peer reached via LAN discovery).
+    pub on_lan: bool,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
 }
@@ -77,6 +80,9 @@ pub struct PeerHealth {
     /// Last proof of life from any source (control traffic or presence).
     pub last_seen: Instant,
     pub relay_url: Option<String>,
+    /// Whether the current path is a direct LAN link (reached via local
+    /// discovery / a private address).
+    pub on_lan: bool,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     /// EWMA transfer rates in bytes/second.
@@ -101,6 +107,7 @@ impl PeerHealth {
             recent_changes: Vec::new(),
             last_seen: now,
             relay_url: None,
+            on_lan: false,
             bytes_tx: 0,
             bytes_rx: 0,
             rate_tx: 0.0,
@@ -151,6 +158,7 @@ impl PeerHealth {
         self.conn = s.conn;
         self.rtt_ms = s.rtt_ms;
         self.relay_url = s.relay_url.clone();
+        self.on_lan = s.on_lan;
         self.bytes_tx = s.bytes_tx;
         self.bytes_rx = s.bytes_rx;
         self.prev_rtt = Some(s.rtt_ms);
@@ -169,6 +177,7 @@ impl PeerHealth {
     pub fn on_disconnect(&mut self, now: Instant) {
         self.conn = ConnState::None;
         self.relay_url = None;
+        self.on_lan = false;
         self.connected_at = None;
         self.rate_tx = 0.0;
         self.rate_rx = 0.0;
@@ -238,6 +247,7 @@ mod tests {
                 ConnState::Relayed => Some("https://relay.example.com./".into()),
                 _ => None,
             },
+            on_lan: false,
             bytes_tx: 0,
             bytes_rx: 0,
         }

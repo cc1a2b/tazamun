@@ -96,6 +96,65 @@ file whenever a dependency is added or a load-bearing design decision is made.
 
 ## Phase 3 — sovereignty (self-hosted relay, LAN, airgap)
 
+### Test strategy for the three sovereignty modes
+
+- **LAN rendezvous is proven automatically** (`tests/sovereignty.rs`): two
+  daemons with LAN discovery on, relays off, and a **secret-only invite ticket
+  (zero bootstrap addresses)** find each other purely over mDNS and complete a
+  lease/edit/sync. It auto-skips (with a logged reason, never a flake) if the
+  runner lacks multicast.
+- **Airgap is proven automatically**: a pure `relay_mode_for(cfg)` helper lets
+  the test assert `airgap → relay_map().is_empty()` (zero external relay URLs)
+  vs. the default config's non-empty map, and a live airgap endpoint binds with
+  no home relay; the daemon's `doctor` snapshot reports `mode=airgap` with an
+  empty relay-status list. The SMOKE run adds an `ss` egress sweep for
+  belt-and-braces.
+- **The relay path is proven in SMOKE, not in-process — deliberately.** Two
+  facts make an automated forced-relay-path test impractical on a single host:
+  (1) loopback is always directly reachable, so any IP transport that reaches
+  the relay *also* enables direct hole-punching, and clearing the IP transport
+  (`clear_ip_transports`) severs the relay connection too; (2) `iroh
+  test_utils::run_relay_server()` serves a **self-signed** TLS cert that
+  production endpoints correctly reject — trusting it needs a test-utils-gated
+  insecure-verify flag we will not add to shipping code. So the automated tests
+  prove the *telemetry pipeline* (a relayed `PathSample` yields conn=Relayed +
+  the relay hostname + a non-Offline grade — the exact `status --json` fields),
+  and the forced relay path (`status` shows `Relayed` + hostname against a real
+  localhost relay) is a SMOKE section. `iroh` with the `test-utils` feature is a
+  **dev-dependency only**; the edition-2024 resolver keeps it out of the release
+  binary.
+
+### iroh-relay 1.0.2 — server facts (from crate sources)
+
+- **Binary:** the crate ships a `iroh-relay` binary (behind the `server`
+  feature) driven by a **TOML config file** (`--config-path`). Key fields:
+  `enable_relay` (bool), `http_bind_addr`, `enable_quic_addr_discovery` (the
+  QUIC address-discovery / STUN-equivalent service), `enable_metrics`,
+  `metrics_bind_addr`, and a `[tls]` section.
+- **TLS:** `[tls].cert_mode` is one of `Manual`, `LetsEncrypt`, or `Reloading`.
+  **`LetsEncrypt` gives built-in ACME** (with `prod_tls` prod/staging toggle),
+  so a self-hosted relay obtains and renews its own certificate — no reverse
+  proxy required. `Manual` reads `manual_cert_path`/`manual_key_path`.
+  `[tls].hostname` is the ACME domain; `https_bind_addr` and `quic_bind_addr`
+  default off `http_bind_addr`.
+- **Default ports:** HTTP `80`, HTTPS `443`, QUIC address-discovery `7842`,
+  metrics `9090`. The relay speaks HTTPS (relay protocol + captive-portal) and,
+  when address discovery is on, QUIC on 7842.
+- **Client relay policy** is set with `RelayMode`: `Default` (n0 prod map),
+  `Custom(RelayMap)`, or `Disabled`. `Endpoint::relay_map()` returns the live
+  `RelayMap`, which exposes `is_empty()`/`len()`/`urls()`/`contains()` — the
+  concrete hook for the airgap "zero external relay URLs" assertion.
+- **Local discovery** is the already-present `iroh-mdns-address-lookup` crate
+  (v0.4), added to the endpoint via `.address_lookup(MdnsAddressLookup::
+  builder())`. It publishes/resolves endpoint addresses over mDNS on the LAN
+  with no external network. So **no new client dependency** is needed for any
+  of relay/LAN/airgap.
+- **Airgap construction:** `presets::Minimal` (sets only the crypto provider —
+  no `DnsAddressLookup`/`PkarrPublisher`) + `RelayMode::Disabled` (empty relay
+  map) + only the mDNS address-lookup. This contacts nothing off the LAN; the
+  test asserts `endpoint.relay_map().is_empty()` and the SMOKE run adds an `ss`
+  egress sweep.
+
 - **One authorized history rewrite (Phase 3, step 0).** Two operator web-edit
   commits carried off-policy identities — `1b9553b` as `cc1a2b
   <cc1a2bb@gmail.com>`, and a later one as `Hussain Alsharman

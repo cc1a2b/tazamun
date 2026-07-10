@@ -1,0 +1,48 @@
+# Self-hosted tazamun/iroh relay with automatic HTTPS.
+#
+# One `docker compose up -d` on a VPS with a public domain yields an
+# HTTPS relay whose TLS certificate is obtained and renewed automatically by
+# the relay's built-in Let's Encrypt ACME (cert_mode = "LetsEncrypt"). No
+# reverse proxy is required.
+#
+# Set your domain and ACME contact in a sibling `.env` file (see .env.example),
+# then: `docker compose up -d`. Point tazamun at it with:
+#   tazamun config set relay https://relay.example.com
+#
+# See ./README.md for the DNS + open-ports checklist and the upgrade procedure.
+
+services:
+  relay:
+    # The relay binary ships in the iroh-relay crate. This image is built from
+    # ./Dockerfile, which compiles `iroh-relay` (pinned to the iroh 1.x line
+    # this project uses) with the `server` feature.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tazamun-relay:1.x
+    container_name: tazamun-relay
+    restart: unless-stopped
+    # Host networking so ACME (port 80), the relay HTTPS endpoint (443), and
+    # QUIC address discovery (UDP 7842) are all reachable on the public IP.
+    network_mode: host
+    environment:
+      # Consumed by config.toml via envsubst at container start.
+      - TZM_RELAY_DOMAIN=${TZM_RELAY_DOMAIN:?set TZM_RELAY_DOMAIN in .env}
+      - TZM_ACME_CONTACT=${TZM_ACME_CONTACT:?set TZM_ACME_CONTACT in .env}
+    volumes:
+      # Persist issued certificates across restarts/upgrades so ACME is not
+      # re-run needlessly (Let's Encrypt rate limits apply).
+      - relay-certs:/data/certs
+      - ./config.toml:/etc/tazamun-relay/config.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/entrypoint.sh"]
+    healthcheck:
+      # The relay serves an HTTPS endpoint on 443 once TLS is provisioned.
+      test: ["CMD", "sh", "-c", "curl -fsS https://${TZM_RELAY_DOMAIN}/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  relay-certs:

@@ -15,9 +15,10 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [x] Live path-telemetry panel
   - [x] `doctor` NAT report
   - [x] Reconnect polish
-- [ ] **P3 — Relay & LAN**
-  - [ ] Self-hosted relay guide (docker compose)
-  - [ ] LAN mDNS auto-fallback mode
+- [x] **P3 — Relay & LAN**
+  - [x] Self-hosted relay kit (one-command docker compose + auto TLS)
+  - [x] LAN mDNS discovery on by default (secured, `via LAN` status tag)
+  - [x] Airgap / closed-network mode + persistent per-session net config
 - [ ] **P4 — Lease ergonomics**
   - [ ] Opt-in auto-lock-on-first-write
   - [ ] Lock waitlist notifications
