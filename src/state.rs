@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,22 @@ pub struct SessionConfig {
     /// Airgap mode: relays off + all external discovery off + LAN only.
     #[serde(default)]
     pub airgap: bool,
+    /// Lease time-to-live in milliseconds (this node's leases; carried on the
+    /// wire so peers honor the holder's choice). Clamped to
+    /// `[MIN_LEASE_TTL, MAX_LEASE_TTL]` on use.
+    #[serde(default = "default_lease_ttl_ms")]
+    pub lease_ttl_ms: u64,
+    /// Lock-acquire timeout in milliseconds. Clamped to
+    /// `[MIN_ACQUIRE_TIMEOUT, MAX_ACQUIRE_TIMEOUT]` on use.
+    #[serde(default = "default_acquire_timeout_ms")]
+    pub acquire_timeout_ms: u64,
+    /// Auto-lock-on-first-write: when on, a write to an un-leased path attempts
+    /// a standard acquire instead of an immediate violation. Off by default.
+    #[serde(default)]
+    pub autolock: bool,
+    /// How long a lock-waitlist entry lives before timing out, in milliseconds.
+    #[serde(default = "default_wait_timeout_ms")]
+    pub wait_timeout_ms: u64,
 }
 
 fn default_relay() -> String {
@@ -86,13 +103,57 @@ fn default_true() -> bool {
     true
 }
 
+fn default_lease_ttl_ms() -> u64 {
+    crate::consts::LEASE_TTL.as_millis() as u64
+}
+
+fn default_acquire_timeout_ms() -> u64 {
+    crate::consts::ACQUIRE_TIMEOUT.as_millis() as u64
+}
+
+fn default_wait_timeout_ms() -> u64 {
+    crate::consts::WAIT_TIMEOUT.as_millis() as u64
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             relay: default_relay(),
             lan: true,
             airgap: false,
+            lease_ttl_ms: default_lease_ttl_ms(),
+            acquire_timeout_ms: default_acquire_timeout_ms(),
+            autolock: false,
+            wait_timeout_ms: default_wait_timeout_ms(),
         }
+    }
+}
+
+impl SessionConfig {
+    /// Effective lease TTL, clamped to `[MIN_LEASE_TTL, MAX_LEASE_TTL]`.
+    pub fn lease_ttl(&self) -> Duration {
+        Duration::from_millis(self.lease_ttl_ms)
+            .clamp(crate::consts::MIN_LEASE_TTL, crate::consts::MAX_LEASE_TTL)
+    }
+
+    /// Effective lease renew interval — always `ttl / 3`, never configured
+    /// directly, so a holder renews comfortably before expiry.
+    pub fn lease_renew(&self) -> Duration {
+        self.lease_ttl() / 3
+    }
+
+    /// Effective acquire timeout, clamped to
+    /// `[MIN_ACQUIRE_TIMEOUT, MAX_ACQUIRE_TIMEOUT]`.
+    pub fn acquire_timeout(&self) -> Duration {
+        Duration::from_millis(self.acquire_timeout_ms).clamp(
+            crate::consts::MIN_ACQUIRE_TIMEOUT,
+            crate::consts::MAX_ACQUIRE_TIMEOUT,
+        )
+    }
+
+    /// Effective waitlist entry lifetime.
+    pub fn wait_timeout(&self) -> Duration {
+        Duration::from_millis(self.wait_timeout_ms)
     }
 }
 

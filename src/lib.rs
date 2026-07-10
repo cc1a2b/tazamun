@@ -43,12 +43,37 @@ pub mod consts {
     pub const INLINE_MANIFEST_MAX: usize = 256;
     /// Maximum number of chunk fetches in flight during a pull.
     pub const FETCH_CONCURRENCY: usize = 16;
-    /// Production lease time-to-live.
+    /// Default lease time-to-live (overridable per session via config).
     pub const LEASE_TTL: Duration = Duration::from_secs(90);
-    /// Production lease renew interval.
+    /// Default lease renew interval. The effective renew is always `ttl / 3`
+    /// (derived, never configured directly); this is the default's third.
     pub const LEASE_RENEW: Duration = Duration::from_secs(30);
-    /// Production lock-acquire timeout.
+    /// Default lock-acquire timeout (overridable per session via config).
     pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(8);
+    /// Lower bound for a configured / wire-supplied lease TTL. A TTL below this
+    /// (including a hostile `ttl_ms = 0`) is clamped up to it so a lease is
+    /// never effectively instantaneous.
+    pub const MIN_LEASE_TTL: Duration = Duration::from_secs(10);
+    /// Upper bound for a configured / wire-supplied lease TTL, so a malicious or
+    /// misconfigured peer cannot park an effectively-infinite lease.
+    pub const MAX_LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// Lower bound for the configured lock-acquire timeout.
+    pub const MIN_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Upper bound for the configured lock-acquire timeout.
+    pub const MAX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Autolock: how long a lease acquired by auto-lock-on-first-write is held
+    /// after the last write before it auto-releases. Each write resets it.
+    pub const AUTOLOCK_IDLE_RELEASE: Duration = Duration::from_secs(60);
+    /// Default lifetime of a lock-waitlist entry before it gives up and reports
+    /// a timeout (overridable per session via `wait_timeout`).
+    pub const WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+    /// Control-plane protocol minor version. The `CTL_ALPN` major stays `/1`;
+    /// this documents append-only wire additions. Bumped to 2 in P4 for the
+    /// `LockInterest` / `LockFreed` waitlist messages (appended after `Bye`, so
+    /// every prior variant keeps its postcard discriminant). Within the v0.1
+    /// dev line all nodes share one build, so an older node never receives a
+    /// newer variant; the const is the forward-compat marker.
+    pub const PROTOCOL_MINOR: u16 = 2;
     /// Whole-handshake deadline for the control-plane proof exchange.
     pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
     /// Interval between encrypted presence beacons on the gossip topic.

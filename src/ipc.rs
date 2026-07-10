@@ -31,6 +31,11 @@ pub enum IpcRequest {
     Lock {
         path: String,
     },
+    /// Register interest in a currently-held path so the daemon announces
+    /// `LockInterest` to the holder and the requester is fast-woken on release.
+    LockWait {
+        path: String,
+    },
     Unlock {
         path: String,
     },

@@ -131,11 +131,66 @@ file whenever a dependency is added or a load-bearing design decision is made.
      light push run: <url> <wall-time>
      full PR run (linux): <url> <wall-time>   (windows): <url> <wall-time> -->
 
-### Configurable lease timings
+### Configurable lease timings (consensus-safe)
 
-### Autolock (auto-lock-on-first-write)
+- Per-session `state.json` config: `lease_ttl_ms` (default 90s, clamped
+  `[10s, 24h]`), `acquire_timeout_ms` (default 8s, clamped `[2s, 60s]`),
+  `wait_timeout_ms` (default 10m). The renew interval is **derived** as `ttl/3`,
+  never configured directly, so a holder always renews well before expiry.
+- **Consistency rule (the subtle part):** TTL is **lease-scoped**, not global.
+  The holder's configured TTL rides the wire (`ttl_ms` in
+  `LockReq`/`LockRenew`, `expires_in_ms` in `Index` leases) and governs each
+  lease; a receiver honors the wire value, clamped defensively to the absolute
+  `[MIN_LEASE_TTL, MAX_LEASE_TTL]` range (`locks::ttl_from_ms`). This replaced
+  the old "cap at 10× local TTL" rule, which made a receiver's clamp depend on
+  its own config — nodes with different configs could then disagree on an
+  effective TTL. With an absolute clamp, **nodes may run different configs
+  without protocol divergence**, and a hostile `ttl_ms = 0` or a huge value is
+  bounded identically on every node.
+- `humantime = "2.3"` (new client dep — justified: parses `90s`/`15m`/`2h` for
+  `config set` and formats effective values for `config show`; tiny, no
+  proc-macros, no transitive surface of note).
+- `tazamun locks` lists active leases (holder, age, expiry countdown) from the
+  **same** `status` IPC snapshot, so the two never disagree. Lease `age` needed
+  a locally-observed acquire instant, so `LockState::Held` gained a `since`
+  field (preserved across same-holder renewals, reset on a holder change).
 
-### Lock waitlist
+### Autolock (auto-lock-on-first-write, opt-in)
+
+- `config autolock on` (default **off**). On a watcher write to an *un-leased,
+  free* path: (1) the un-leased bytes are preserved in `conflicts/` first
+  (async, off the actor — Golden Invariant even if the acquire fails), then (2)
+  the **standard** three-precondition acquire runs. On success the edited bytes
+  (already on disk) are published and the lease is kept with a 60s idle-release
+  timer (each write resets it); on any precondition failure the normal violation
+  path completes (indexed version restored read-only / new file removed) with an
+  `autolock could not acquire: <precondition>` hint — the bytes stay safe in
+  `conflicts/`.
+- **Invariant:** a losing simultaneous write on two nodes never silently
+  overwrites — exactly one node ends holding+published, the other ends
+  quarantined+restored+diagnosed. Convenience never outranks the Golden
+  Invariant. A path held by another node, or an un-leased *delete*, is never
+  autolocked (normal violation path).
+- Autolock reuses the existing acquire machinery with a throwaway reply channel
+  (`autolock_pending` tracks the in-flight acquire; the grant/deny/timeout/sweep
+  handlers finish it), so there is no second lease code path to keep in sync.
+
+### Lock waitlist & notifications
+
+- Wire minor bumped to `PROTOCOL_MINOR = 2`: `LockInterest` and `LockFreed`
+  appended **after `Bye`** so every prior variant keeps its postcard
+  discriminant (append-only compat). The `CTL_ALPN` major stays `/1`; within the
+  v0.1 dev line all nodes share one build, so an older node never receives a
+  newer variant.
+- `tazamun lock --wait` (or a TTY prompt) registers interest via a `LockWait`
+  IPC: the daemon records the wait, tells the holder with `LockInterest`, and
+  shows the waiter in `status`/`locks`. On release/expiry the freeing node
+  broadcasts `LockFreed`; the waiting CLI re-attempts the **full** acquire
+  (preconditions re-checked fresh each round), so **first-come is not
+  guaranteed** — ties resolve by the existing `(lamport, id)` rule. The retry is
+  a bounded 2s poll ceiling fast-forwarded by `LockFreed`; entries expire after
+  `wait_timeout` (default 10m) with a clear message. Waiting emits a terminal
+  bell + line on acquire and a daemon log/event on each transition.
 
 ## Phase 3 — sovereignty (self-hosted relay, LAN, airgap)
 

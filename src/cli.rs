@@ -91,8 +91,15 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// List active leases: holder, age, and expiry countdown.
+    Locks,
     /// Acquire an exclusive lease and make the file writable.
-    Lock { path: String },
+    Lock {
+        path: String,
+        /// If the path is already held, wait for it to free and auto-acquire.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Publish pending edits and release the lease.
     Unlock { path: String },
     /// List kept historical versions of a path.
@@ -107,8 +114,10 @@ pub enum Cmd {
 pub enum ConfigCmd {
     /// Print the persisted network preferences.
     Show,
-    /// Change a persisted preference (`relay <default|none|URL>`,
-    /// `lan <on|off>`, `airgap <on|off>`). Takes effect on next `start`.
+    /// Change a persisted preference. Keys: `relay <default|none|URL>`,
+    /// `lan <on|off>`, `airgap <on|off>`, `lease-ttl <90s|15m|2h>`,
+    /// `acquire-timeout <8s>`, `autolock <on|off>`, `wait-timeout <10m>`.
+    /// Takes effect on next `start`.
     Set { key: String, value: String },
 }
 
@@ -161,7 +170,8 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Cmd::Lock { path } => handle_lock_cli(&dir, &path, verbose).await,
+        Cmd::Locks => handle_locks_cli(&dir).await,
+        Cmd::Lock { path, wait } => handle_lock_cli(&dir, &path, wait, verbose).await,
         Cmd::Unlock { path } => {
             request(&dir, IpcRequest::Unlock { path: path.clone() }).await?;
             println!("✔ {path} synced and read-only again");
@@ -194,11 +204,89 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
 }
 
 /// Acquires a lease, with a pre-acquire advisory for degraded links and a
-/// network-terms diagnosis block on failure.
-async fn handle_lock_cli(dir: &Path, path: &str, verbose: bool) -> Result<(), CliError> {
-    // Pre-acquire advisory (non-blocking): warn if any connected peer that
-    // would be consulted grades Poor. Best-effort — a status hiccup never
-    // stops the lock.
+/// network-terms diagnosis block on failure. With `wait`, a `held` failure
+/// registers interest and re-attempts the full acquire until the path frees or
+/// the configured `wait-timeout` elapses.
+async fn handle_lock_cli(
+    dir: &Path,
+    path: &str,
+    wait: bool,
+    verbose: bool,
+) -> Result<(), CliError> {
+    lock_advisory(dir).await;
+
+    let deadline = if wait {
+        let wt = AppState::load(dir)?.config.wait_timeout();
+        Some(std::time::Instant::now() + wt)
+    } else {
+        None
+    };
+    let mut announced = false;
+    loop {
+        let response = ipc::request(dir, &IpcRequest::Lock { path: path.into() }).await?;
+        if response.ok {
+            let data = response.data.unwrap_or(serde_json::Value::Null);
+            let ttl = data.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            if data.get("already").and_then(|v| v.as_bool()) == Some(true) {
+                println!("✔ {path} — you already hold this lease");
+            } else {
+                if announced {
+                    print!("\x07"); // bell: the wait resolved
+                }
+                println!(
+                    "✔ {path} is now writable (lease TTL {}s, auto-renewed)",
+                    ttl / 1000
+                );
+            }
+            return Ok(());
+        }
+
+        let err = response.error.clone().unwrap_or(crate::ipc::IpcErrorBody {
+            code: "unknown".into(),
+            message: "daemon returned an empty error".into(),
+        });
+
+        // Waitlist: on a `held` refusal, register interest with the daemon and
+        // retry the full acquire (preconditions re-checked fresh each round)
+        // until the deadline. The daemon fast-wakes us on a LockFreed; the poll
+        // interval is only a fallback ceiling.
+        if let Some(deadline) = deadline
+            && err.code == "lease_held"
+            && std::time::Instant::now() < deadline
+        {
+            if !announced {
+                let by = response
+                    .data
+                    .as_ref()
+                    .and_then(|d| d["diagnosis"]["held_by"].as_str())
+                    .map(short)
+                    .unwrap_or_else(|| "another peer".into());
+                // Register interest once; the daemon tells the holder and shows
+                // us in `status`/`locks`. Subsequent rounds just re-attempt.
+                let _ = ipc::request(dir, &IpcRequest::LockWait { path: path.into() }).await;
+                eprintln!(
+                    "… {path} is held by {by}; waiting (auto-acquires when free, Ctrl-C to stop)"
+                );
+                announced = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
+        if announced {
+            eprintln!("✗ gave up waiting for {path} after the wait-timeout");
+        }
+        print_lock_diagnosis(path, &err, response.data.as_ref(), verbose);
+        return Err(CliError::DaemonRefused {
+            code: err.code,
+            message: err.message,
+        });
+    }
+}
+
+/// Best-effort pre-acquire advisory: warn if a peer that would be consulted
+/// grades Poor. A status hiccup never blocks the lock.
+async fn lock_advisory(dir: &Path) {
     if let Ok(status) = ipc::request(dir, &IpcRequest::Status).await
         && status.ok
         && let Some(members) = status.data.as_ref().and_then(|d| d["members"].as_array())
@@ -214,31 +302,44 @@ async fn handle_lock_cli(dir: &Path, path: &str, verbose: bool) -> Result<(), Cl
             }
         }
     }
+}
 
-    let response = ipc::request(dir, &IpcRequest::Lock { path: path.into() }).await?;
-    if response.ok {
-        let data = response.data.unwrap_or(serde_json::Value::Null);
-        let ttl = data.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-        if data.get("already").and_then(|v| v.as_bool()) == Some(true) {
-            println!("✔ {path} — you already hold this lease");
-        } else {
-            println!(
-                "✔ {path} is now writable (lease TTL {}s, auto-renewed)",
-                ttl / 1000
-            );
+/// `locks`: list active leases (holder, age, expiry) from the same IPC snapshot
+/// that `status` uses, so the two never disagree.
+async fn handle_locks_cli(dir: &Path) -> Result<(), CliError> {
+    let data = request(dir, IpcRequest::Status).await?;
+    let leases = data["leases"].as_array().cloned().unwrap_or_default();
+    let waiting = data["waiting"].as_array().cloned().unwrap_or_default();
+    if leases.is_empty() {
+        println!("no active leases");
+    } else {
+        println!("active leases ({}):", leases.len());
+        for l in &leases {
+            let path = l["path"].as_str().unwrap_or("?");
+            let holder = short(l["holder"].as_str().unwrap_or("?"));
+            let mine = l["mine"].as_bool() == Some(true);
+            let age = fmt_ms(l["age_ms"].as_u64().unwrap_or(0));
+            let left = fmt_ms(l["expires_in_ms"].as_u64().unwrap_or(0));
+            let who = if mine { "you".to_string() } else { holder };
+            println!("  {path}  held by {who}  age {age}  expires in {left}");
         }
-        return Ok(());
     }
+    if !waiting.is_empty() {
+        println!("\nwaiting:");
+        for w in &waiting {
+            let path = w["path"].as_str().unwrap_or("?");
+            let behind = short(w["behind"].as_str().unwrap_or("?"));
+            println!("  {path}  (behind {behind})");
+        }
+    }
+    Ok(())
+}
 
-    let err = response.error.clone().unwrap_or(crate::ipc::IpcErrorBody {
-        code: "unknown".into(),
-        message: "daemon returned an empty error".into(),
-    });
-    print_lock_diagnosis(path, &err, response.data.as_ref(), verbose);
-    Err(CliError::DaemonRefused {
-        code: err.code,
-        message: err.message,
-    })
+/// Formats a millisecond duration compactly (e.g. `1m 30s`, `4s`).
+fn fmt_ms(ms: u64) -> String {
+    // Round to whole seconds so the countdown reads cleanly.
+    let secs = ms / 1000;
+    fmt_dur(std::time::Duration::from_secs(secs))
 }
 
 /// Prints the compact lock-failure diagnosis; with `verbose`, a per-peer table.
@@ -453,10 +554,17 @@ async fn start(dir: &Path, flags: &NetFlags, ui: Ui) -> Result<(), CliError> {
     let saved = AppState::load(dir)?.config;
     let net = resolve_net_config(&saved, flags)?;
     let airgap = net.airgap;
+    // Lease timings come from the persisted session config (clamped). TTL is
+    // lease-scoped on the wire, so peers may run different values safely.
+    let timings = LockTimings {
+        ttl: saved.lease_ttl(),
+        renew: saved.lease_renew(),
+        acquire_timeout: saved.acquire_timeout(),
+    };
     let cfg = DaemonConfig {
         dir: dir.to_path_buf(),
         net,
-        timings: LockTimings::default(),
+        timings,
         ui,
     };
     let handle = crate::daemon::spawn(cfg).await?;
@@ -485,14 +593,22 @@ fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
     let mut state = AppState::load(dir)?;
     match cmd {
         ConfigCmd::Show => {
-            println!("network preferences (folder: {})", dir.display());
-            println!("  relay  : {}", state.config.relay);
-            println!("  lan    : {}", if state.config.lan { "on" } else { "off" });
+            let c = &state.config;
+            println!("session preferences (folder: {})", dir.display());
+            println!("  relay           : {}", c.relay);
+            println!("  lan             : {}", on_off(c.lan));
+            println!("  airgap          : {}", on_off(c.airgap));
             println!(
-                "  airgap : {}",
-                if state.config.airgap { "on" } else { "off" }
+                "  lease-ttl       : {} (renew every {})",
+                fmt_dur(c.lease_ttl()),
+                fmt_dur(c.lease_renew())
             );
-            println!("\n(per-run flags override these; changes apply on next `tazamun start`)");
+            println!("  acquire-timeout : {}", fmt_dur(c.acquire_timeout()));
+            println!("  autolock        : {}", on_off(c.autolock));
+            println!("  wait-timeout    : {}", fmt_dur(c.wait_timeout()));
+            println!(
+                "\n(values shown are effective/clamped; per-run flags override network keys; changes apply on next `tazamun start`)"
+            );
             Ok(())
         }
         ConfigCmd::Set { key, value } => {
@@ -508,9 +624,37 @@ fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
                 "airgap" => {
                     state.config.airgap = parse_on_off(&value)?;
                 }
+                "lease-ttl" => {
+                    let d = parse_clamped_dur(
+                        &value,
+                        crate::consts::MIN_LEASE_TTL,
+                        crate::consts::MAX_LEASE_TTL,
+                    )?;
+                    state.config.lease_ttl_ms = d.as_millis() as u64;
+                }
+                "acquire-timeout" => {
+                    let d = parse_clamped_dur(
+                        &value,
+                        crate::consts::MIN_ACQUIRE_TIMEOUT,
+                        crate::consts::MAX_ACQUIRE_TIMEOUT,
+                    )?;
+                    state.config.acquire_timeout_ms = d.as_millis() as u64;
+                }
+                "autolock" => {
+                    state.config.autolock = parse_on_off(&value)?;
+                }
+                "wait-timeout" => {
+                    let d = parse_clamped_dur(
+                        &value,
+                        std::time::Duration::from_secs(10),
+                        crate::consts::MAX_LEASE_TTL,
+                    )?;
+                    state.config.wait_timeout_ms = d.as_millis() as u64;
+                }
                 other => {
                     return Err(CliError::Refused(format!(
-                        "unknown config key {other:?} (valid: relay, lan, airgap)"
+                        "unknown config key {other:?} (valid: relay, lan, airgap, \
+                         lease-ttl, acquire-timeout, autolock, wait-timeout)"
                     )));
                 }
             }
@@ -520,6 +664,39 @@ fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+fn fmt_dur(d: std::time::Duration) -> String {
+    humantime::format_duration(d).to_string()
+}
+
+/// Parses a humantime duration (e.g. `90s`, `15m`, `2h`) and clamps it to
+/// `[min, max]`, printing a note when the input fell outside the range.
+fn parse_clamped_dur(
+    value: &str,
+    min: std::time::Duration,
+    max: std::time::Duration,
+) -> Result<std::time::Duration, CliError> {
+    let raw = humantime::parse_duration(value.trim()).map_err(|e| {
+        CliError::Refused(format!(
+            "invalid duration {value:?}: {e} (use forms like 90s, 15m, 2h)"
+        ))
+    })?;
+    let clamped = raw.clamp(min, max);
+    if clamped != raw {
+        println!(
+            "note: {} is outside [{}, {}]; clamped to {}",
+            fmt_dur(raw),
+            fmt_dur(min),
+            fmt_dur(max),
+            fmt_dur(clamped)
+        );
+    }
+    Ok(clamped)
 }
 
 fn parse_on_off(value: &str) -> Result<bool, CliError> {
@@ -974,6 +1151,7 @@ mod tests {
             relay: "https://saved.example./".into(),
             lan: false,
             airgap: false,
+            ..SessionConfig::default()
         };
         let n = resolve_net_config(&saved, &flags(None, false, false, false)).unwrap();
         assert!(matches!(n.relay, RelayChoice::Custom(_)));
@@ -1002,6 +1180,7 @@ mod tests {
             relay: "https://x.example./".into(),
             lan: false,
             airgap: false,
+            ..SessionConfig::default()
         };
         let n = resolve_net_config(&saved, &flags(None, false, true, true)).unwrap();
         assert!(matches!(n.relay, RelayChoice::Disabled));
@@ -1013,6 +1192,7 @@ mod tests {
             relay: "default".into(),
             lan: true,
             airgap: true,
+            ..SessionConfig::default()
         };
         let n = resolve_net_config(&saved, &flags(None, false, false, false)).unwrap();
         assert!(matches!(n.relay, RelayChoice::Disabled));

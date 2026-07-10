@@ -143,6 +143,13 @@ pub(crate) enum Event {
         result: Result<Staged, TransferError>,
         quarantined: Option<PathBuf>,
     },
+    /// Autolock: the un-leased bytes have been preserved (async), so the
+    /// standard acquire may now begin.
+    AutolockReady {
+        rel: RelPath,
+        quarantined: Option<PathBuf>,
+        new_file: bool,
+    },
     RestoreStaged {
         rel: RelPath,
         entry: VersionEntry,
@@ -412,6 +419,10 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         deferred: BTreeMap::new(),
         pending_acquires: BTreeMap::new(),
         pending_unlocks: BTreeMap::new(),
+        my_waits: BTreeMap::new(),
+        interest: BTreeMap::new(),
+        autolock_idle: BTreeMap::new(),
+        autolock_pending: BTreeMap::new(),
         muted: HashMap::new(),
         busy: BTreeSet::new(),
         recheck: BTreeSet::new(),
@@ -471,6 +482,19 @@ struct Actor {
     deferred: BTreeMap<RelPath, DeferredApply>,
     pending_acquires: BTreeMap<RelPath, (u64, oneshot::Sender<IpcResponse>)>,
     pending_unlocks: BTreeMap<RelPath, ()>,
+    /// Paths this node is waiting for: `path → (holder id, give-up deadline)`.
+    /// Populated by `LockWait`; surfaced in `status`/`locks` and expired by the
+    /// sweep.
+    my_waits: BTreeMap<RelPath, (String, Instant)>,
+    /// Peers that told us (via `LockInterest`) they want a path we hold/know —
+    /// shown as waiters in `status`/`locks`.
+    interest: BTreeMap<RelPath, BTreeSet<String>>,
+    /// Leases acquired by autolock-on-first-write: `path → idle-release
+    /// deadline`. Each write resets it; the sweep releases when it passes.
+    autolock_idle: BTreeMap<RelPath, Instant>,
+    /// Autolock acquires in flight: `path → (preserved-bytes quarantine, was it
+    /// a brand-new file)`. Resolved by the grant/deny/timeout handlers.
+    autolock_pending: BTreeMap<RelPath, (Option<PathBuf>, bool)>,
     muted: HashMap<RelPath, Instant>,
     busy: BTreeSet<RelPath>,
     recheck: BTreeSet<RelPath>,
@@ -536,6 +560,11 @@ impl Actor {
                     result,
                     quarantined,
                 } => self.on_violation_staged(rel, result, quarantined),
+                Event::AutolockReady {
+                    rel,
+                    quarantined,
+                    new_file,
+                } => self.begin_autolock_acquire(rel, quarantined, new_file),
                 Event::RestoreStaged {
                     rel,
                     entry,
@@ -956,7 +985,7 @@ impl Actor {
             .locks
             .held_leases(now)
             .into_iter()
-            .map(|(path, holder, lamport, left)| LeaseInfo {
+            .map(|(path, holder, lamport, left, _age)| LeaseInfo {
                 path,
                 holder,
                 lamport,
@@ -1091,13 +1120,19 @@ impl Actor {
                     if let Err(e) = guard::set_writable(&abs) {
                         warn!(path = %rel, "could not make leased file writable: {e}");
                     }
+                    // We now hold it: drop any waitlist bookkeeping for the path.
+                    self.my_waits.remove(&rel);
+                    self.interest.remove(&rel);
+                    let was_autolock = self.autolock_succeed(&rel);
                     if let Some((_, waiter)) = self.pending_acquires.remove(&rel) {
                         let _ = waiter.send(IpcResponse::ok(serde_json::json!({
                             "locked": rel.as_str(),
                             "ttl_ms": self.timings.ttl.as_millis() as u64,
                         })));
                     }
-                    info!(path = %rel, "lease acquired");
+                    if !was_autolock {
+                        info!(path = %rel, "lease acquired");
+                    }
                 }
             }
             Msg::LockDeny { path, reason } => {
@@ -1106,6 +1141,12 @@ impl Actor {
                 };
                 if self.locks.on_deny(&rel) {
                     self.broadcast(Msg::LockRelease { path: rel.clone() });
+                    if let Some((q, nf)) = self.autolock_pending.remove(&rel) {
+                        // Autolock lost the lease (held elsewhere / tie): revert.
+                        self.pending_acquires.remove(&rel);
+                        self.autolock_fail(&rel, q, nf, "LEASE".to_string());
+                        return;
+                    }
                     if let Some((_, waiter)) = self.pending_acquires.remove(&rel) {
                         let now = Instant::now();
                         let voter = self.peer_diag(&from, now, "voter", Some(true));
@@ -1149,6 +1190,27 @@ impl Actor {
             Msg::Bye => {
                 if let Some(conn_id) = self.peers.get(&from).map(|h| h.conn_id()) {
                     self.on_peer_gone(from, conn_id);
+                }
+            }
+            Msg::LockInterest { path } => {
+                let Ok(rel) = sanitize_rel_path(path.as_str()) else {
+                    return;
+                };
+                self.interest
+                    .entry(rel.clone())
+                    .or_default()
+                    .insert(from_str.clone());
+                debug!(path = %rel, peer = %from.fmt_short(), "peer waitlisted this path");
+            }
+            Msg::LockFreed { path } => {
+                let Ok(rel) = sanitize_rel_path(path.as_str()) else {
+                    return;
+                };
+                self.interest.remove(&rel);
+                // The waiting CLI re-attempts the acquire on its next poll; note
+                // the free so `status` reflects it and logs show the handoff.
+                if self.my_waits.contains_key(&rel) {
+                    self.push_event(format!("{rel} freed — re-attempting lock"));
                 }
             }
         }
@@ -1514,11 +1576,24 @@ impl Actor {
             InspectCause::Watch => match (leased, outcome) {
                 (_, Inspection::Clean) => self.unbusy(&rel),
                 (true, Inspection::Differs) | (true, Inspection::Unindexed) => {
+                    // Each write to an autolock-held lease resets its idle timer.
+                    if let Some(d) = self.autolock_idle.get_mut(&rel) {
+                        *d = Instant::now() + crate::consts::AUTOLOCK_IDLE_RELEASE;
+                    }
                     self.spawn_publish(rel, PublishCause::Edit);
                 }
                 (true, Inspection::MissingIndexed) => {
                     self.commit_tombstone(&rel);
                     self.unbusy(&rel);
+                }
+                // Un-leased write on a *free* path with autolock on: try to
+                // acquire instead of reverting. A path held by someone else, or
+                // an un-leased delete, always takes the normal violation path.
+                (false, Inspection::Differs) if self.autolock_eligible(&rel) => {
+                    self.spawn_autolock(rel, false);
+                }
+                (false, Inspection::Unindexed) if self.autolock_eligible(&rel) => {
+                    self.spawn_autolock(rel, true);
                 }
                 (false, Inspection::Differs) => self.spawn_violation(rel, true),
                 (false, Inspection::MissingIndexed) => self.spawn_violation(rel, false),
@@ -1748,6 +1823,175 @@ impl Actor {
         );
     }
 
+    // ---------------- autolock (opt-in auto-lock-on-first-write) ----------------
+
+    /// Extracts the blocked-precondition label from a diagnosed lock error.
+    fn precondition_of(resp: &IpcResponse) -> String {
+        resp.data
+            .as_ref()
+            .and_then(|d| d["diagnosis"]["precondition"].as_str())
+            .unwrap_or("PRECONDITION")
+            .to_string()
+    }
+
+    /// Autolock applies only when it is enabled and the path is currently free
+    /// (a path held by someone else, or already mid-autolock, is not eligible).
+    fn autolock_eligible(&self, rel: &RelPath) -> bool {
+        self.state.config.autolock
+            && self.locks.holder(rel).is_none()
+            && !self.autolock_pending.contains_key(rel)
+    }
+
+    /// Step 1 of autolock: preserve the un-leased bytes (async, off the actor)
+    /// before touching anything, honoring the Golden Invariant even if the
+    /// acquire later fails.
+    fn spawn_autolock(&mut self, rel: RelPath, new_file: bool) {
+        self.busy.insert(rel.clone());
+        let dir = self.dir.clone();
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let quarantined = match guard::quarantine(&dir, &rel) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    warn!(path = %rel, "autolock: preserving bytes failed: {e}");
+                    None
+                }
+            };
+            let _ = events
+                .send(Event::AutolockReady {
+                    rel,
+                    quarantined,
+                    new_file,
+                })
+                .await;
+        });
+    }
+
+    /// Step 2: the bytes are preserved; begin a standard acquire (all three
+    /// preconditions unchanged). If a precondition already fails, complete the
+    /// violation now with an autolock-specific hint.
+    fn begin_autolock_acquire(
+        &mut self,
+        rel: RelPath,
+        quarantined: Option<PathBuf>,
+        new_file: bool,
+    ) {
+        // A late-arriving remote lease or our own inspection may have changed
+        // things; re-check freshness/reachability.
+        if let Some(err) = self.strict_edit_guard(&rel) {
+            let pre = Self::precondition_of(&err);
+            self.autolock_fail(&rel, quarantined, new_file, pre);
+            return;
+        }
+        let lamport = self.state.lamport + 1;
+        self.state.lamport = lamport;
+        let voters: BTreeSet<String> = self.peers.keys().map(|id| id.to_string()).collect();
+        let now = Instant::now();
+        if self
+            .locks
+            .start_request(&rel, lamport, voters, now)
+            .is_err()
+        {
+            self.autolock_fail(&rel, quarantined, new_file, "LEASE".to_string());
+            return;
+        }
+        self.autolock_pending
+            .insert(rel.clone(), (quarantined, new_file));
+        self.broadcast(Msg::LockReq {
+            path: rel.clone(),
+            lamport,
+            ttl_ms: self.timings.ttl.as_millis() as u64,
+        });
+        // Drive completion through the standard grant/deny/timeout path with a
+        // throwaway reply channel (no CLI is waiting on an autolock acquire).
+        let (tx, _rx) = oneshot::channel();
+        self.pending_acquires.insert(rel.clone(), (lamport, tx));
+        let events = self.events_tx.clone();
+        let timeout = self.timings.acquire_timeout;
+        let r2 = rel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _ = events
+                .send(Event::AcquireTimeout { rel: r2, lamport })
+                .await;
+        });
+    }
+
+    /// Autolock won the lease: the edited bytes are already on disk (and
+    /// preserved in quarantine), so publish them and start the idle-release
+    /// countdown. Returns whether this completed an autolock (so the grant
+    /// handler skips its normal reply bookkeeping).
+    fn autolock_succeed(&mut self, rel: &RelPath) -> bool {
+        let Some((_q, _new_file)) = self.autolock_pending.remove(rel) else {
+            return false;
+        };
+        self.autolock_idle.insert(
+            rel.clone(),
+            Instant::now() + crate::consts::AUTOLOCK_IDLE_RELEASE,
+        );
+        self.push_event(format!("autolock acquired {rel}; publishing"));
+        info!(path = %rel, "autolock acquired lease; publishing the edit");
+        // spawn_publish re-uses the busy flag already set by spawn_autolock.
+        self.spawn_publish(rel.clone(), PublishCause::Edit);
+        true
+    }
+
+    /// Autolock could not acquire (any precondition): the bytes stay in
+    /// quarantine, the indexed version is restored read-only (or a new file is
+    /// removed), and a diagnosis with an autolock hint is logged.
+    fn autolock_fail(
+        &mut self,
+        rel: &RelPath,
+        quarantined: Option<PathBuf>,
+        new_file: bool,
+        precondition: String,
+    ) {
+        self.autolock_pending.remove(rel);
+        let q = quarantined
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        warn!(
+            path = %rel,
+            precondition = %precondition,
+            quarantine = %q,
+            "autolock could not acquire ({precondition}); your bytes are safe in conflicts/"
+        );
+        self.push_event(format!("autolock failed for {rel} ({precondition})"));
+        if new_file {
+            // No indexed version to restore; the bytes are preserved, so drop
+            // the on-disk copy exactly as the new-file violation path does.
+            let abs = rel.to_fs_path(&self.dir);
+            self.mute(rel);
+            if let Err(e) = std::fs::remove_file(&abs)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %rel, "autolock: could not remove un-leased new file: {e}");
+            }
+            self.unbusy(rel);
+        } else {
+            // Restore the indexed version read-only (materialize async), reusing
+            // the violation-staging path but WITHOUT re-quarantining.
+            let Some(record) = self.state.files.get(rel).cloned() else {
+                self.unbusy(rel);
+                return;
+            };
+            let transfer = self.transfer.clone();
+            let events = self.events_tx.clone();
+            let rel2 = rel.clone();
+            tokio::spawn(async move {
+                let result = transfer.materialize(&record.manifest, record.size).await;
+                let _ = events
+                    .send(Event::ViolationStaged {
+                        rel: rel2,
+                        result,
+                        quarantined,
+                    })
+                    .await;
+            });
+        }
+    }
+
     // ---------------- IPC ----------------
 
     fn on_ipc(&mut self, req: IpcRequest, reply: oneshot::Sender<IpcResponse>) {
@@ -1756,6 +2000,7 @@ impl Actor {
                 let _ = reply.send(IpcResponse::ok(self.status_json()));
             }
             IpcRequest::Lock { path } => self.handle_lock(path, reply),
+            IpcRequest::LockWait { path } => self.handle_lock_wait(path, reply),
             IpcRequest::Unlock { path } => self.handle_unlock(path, reply),
             IpcRequest::Invite => {
                 let ticket = Ticket::new(
@@ -2029,20 +2274,29 @@ impl Actor {
             })));
             return;
         }
-        if let Some(holder) = self.locks.holder(&rel) {
+        if let Some(holder) = self.locks.holder(&rel).cloned() {
             let now = Instant::now();
             let holder_peer = holder
                 .parse::<EndpointId>()
                 .ok()
                 .map(|id| vec![self.peer_diag(&id, now, "holder", None)])
                 .unwrap_or_default();
-            let _ = reply.send(self.lock_error(
+            let mut resp = self.lock_error(
                 "lease_held",
                 format!("lease is held by {holder}"),
                 "LEASE",
                 holder_peer,
-                "wait for the current holder to unlock, or for its lease TTL to expire",
-            ));
+                "wait for the current holder to unlock or its TTL to expire, or pass --wait",
+            );
+            if let Some(diag) = resp
+                .data
+                .as_mut()
+                .and_then(|d| d.get_mut("diagnosis"))
+                .and_then(|d| d.as_object_mut())
+            {
+                diag.insert("held_by".into(), serde_json::json!(holder));
+            }
+            let _ = reply.send(resp);
             return;
         }
         if self.pending_acquires.contains_key(&rel) {
@@ -2084,6 +2338,14 @@ impl Actor {
             .get(&rel)
             .is_some_and(|(l, _)| *l == lamport);
         if !matches_waiter {
+            return;
+        }
+        // Autolock acquire timed out (no quorum): revert with REACHABILITY.
+        if let Some((q, nf)) = self.autolock_pending.remove(&rel) {
+            self.pending_acquires.remove(&rel);
+            self.locks.on_deny(&rel);
+            self.broadcast(Msg::LockRelease { path: rel.clone() });
+            self.autolock_fail(&rel, q, nf, "REACHABILITY".to_string());
             return;
         }
         let now = Instant::now();
@@ -2150,15 +2412,72 @@ impl Actor {
         self.pending_unlocks.remove(rel);
         let me = self.me_str.clone();
         self.locks.on_release(rel, &me);
+        self.autolock_idle.remove(rel);
         let abs = rel.to_fs_path(&self.dir);
         if let Err(e) = guard::set_readonly(&abs) {
             warn!(path = %rel, "could not re-apply read-only: {e}");
         }
         self.broadcast(Msg::LockRelease { path: rel.clone() });
+        self.announce_freed(rel);
         info!(path = %rel, "lease released");
         let _ = reply.send(IpcResponse::ok(
             serde_json::json!({ "unlocked": rel.as_str() }),
         ));
+    }
+
+    /// `LockWait`: register interest in a held path so the holder is told and
+    /// this node shows up as a waiter; the CLI re-attempts the acquire.
+    fn handle_lock_wait(&mut self, path: String, reply: oneshot::Sender<IpcResponse>) {
+        let Ok(rel) = sanitize_rel_path(&path) else {
+            let _ = reply.send(IpcResponse::err("bad_path", "invalid relative path"));
+            return;
+        };
+        match self.locks.holder(&rel).cloned() {
+            None => {
+                let _ = reply.send(IpcResponse::ok(
+                    serde_json::json!({ "waiting": false, "reason": "free" }),
+                ));
+            }
+            Some(h) if h == self.me_str => {
+                let _ = reply.send(IpcResponse::ok(
+                    serde_json::json!({ "waiting": false, "reason": "mine" }),
+                ));
+            }
+            Some(holder) => {
+                let deadline = Instant::now() + self.state.config.wait_timeout();
+                self.my_waits
+                    .insert(rel.clone(), (holder.clone(), deadline));
+                self.broadcast(Msg::LockInterest { path: rel.clone() });
+                let short: String = holder.chars().take(10).collect();
+                self.push_event(format!("waiting for {rel} (behind {short})"));
+                let _ = reply.send(IpcResponse::ok(
+                    serde_json::json!({ "waiting": true, "behind": holder }),
+                ));
+            }
+        }
+    }
+
+    /// Broadcasts that a path is now free so any waiter re-attempts its acquire.
+    fn announce_freed(&self, rel: &RelPath) {
+        self.broadcast(Msg::LockFreed { path: rel.clone() });
+    }
+
+    /// Releases a lease we hold with no IPC reply (autolock idle-release and
+    /// other internal releases): frees the table, restores read-only, and tells
+    /// peers + waiters.
+    fn release_own_lease(&mut self, rel: &RelPath) {
+        if !self.locks.is_held_by_me(rel) {
+            return;
+        }
+        let me = self.me_str.clone();
+        self.locks.on_release(rel, &me);
+        self.autolock_idle.remove(rel);
+        if let Err(e) = guard::set_readonly(&rel.to_fs_path(&self.dir)) {
+            warn!(path = %rel, "could not re-apply read-only: {e}");
+        }
+        self.broadcast(Msg::LockRelease { path: rel.clone() });
+        self.announce_freed(rel);
+        info!(path = %rel, "lease released");
     }
 
     fn handle_restore(&mut self, path: String, n: usize, reply: oneshot::Sender<IpcResponse>) {
@@ -2360,13 +2679,28 @@ impl Actor {
             .locks
             .held_leases(now)
             .into_iter()
-            .map(|(path, holder, _, left)| {
+            .map(|(path, holder, _, left, age)| {
+                let waiters: Vec<String> = self
+                    .interest
+                    .get(&path)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
                 serde_json::json!({
                     "path": path.as_str(),
                     "holder": holder,
                     "mine": holder == self.me_str,
                     "expires_in_ms": left.as_millis() as u64,
+                    "age_ms": age.as_millis() as u64,
+                    "waiters": waiters,
                 })
+            })
+            .collect();
+        // Paths this node is itself waiting for (behind another holder).
+        let waiting: Vec<serde_json::Value> = self
+            .my_waits
+            .iter()
+            .map(|(path, (holder, _))| {
+                serde_json::json!({ "path": path.as_str(), "behind": holder })
             })
             .collect();
         let live_files: Vec<(&RelPath, &FileRecord)> = self
@@ -2413,6 +2747,7 @@ impl Actor {
             "dir": self.dir.display().to_string(),
             "members": members,
             "leases": leases,
+            "waiting": waiting,
             "pending_pulls": pending_pulls,
             "events": events,
             "file_count": live_files.len(),
@@ -2425,6 +2760,21 @@ impl Actor {
 
     fn on_sweep(&mut self) {
         let now = Instant::now();
+        // Autolock idle-release: a lease auto-acquired on first write is let go
+        // once it has been idle (no writes) for AUTOLOCK_IDLE_RELEASE.
+        let idle: Vec<RelPath> = self
+            .autolock_idle
+            .iter()
+            .filter(|(rel, deadline)| **deadline <= now && self.locks.is_held_by_me(rel))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        for rel in idle {
+            info!(path = %rel, "autolock lease idle past timeout; releasing");
+            self.push_event(format!("autolock released {rel} (idle)"));
+            self.release_own_lease(&rel);
+        }
+        self.autolock_idle.retain(|_, d| *d > now);
+
         let swept = self.locks.sweep(now);
         for (rel, holder) in swept.expired {
             if holder == self.me_str {
@@ -2433,10 +2783,30 @@ impl Actor {
             } else {
                 info!(path = %rel, holder, "lease expired (holder silent past TTL)");
             }
+            self.autolock_idle.remove(&rel);
+            // Every node observing the expiry announces the path free so waiters
+            // retry promptly (LockRelease is not sent on a silent-holder expiry).
+            self.announce_freed(&rel);
+        }
+        // Expire our own waitlist entries.
+        let expired_waits: Vec<RelPath> = self
+            .my_waits
+            .iter()
+            .filter(|(_, (_, deadline))| *deadline <= now)
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        for rel in expired_waits {
+            self.my_waits.remove(&rel);
+            self.push_event(format!("gave up waiting for {rel} (wait-timeout)"));
         }
         for rel in swept.timed_out {
             self.broadcast(Msg::LockRelease { path: rel.clone() });
-            if let Some((_, reply)) = self.pending_acquires.remove(&rel) {
+            let pending = self.pending_acquires.remove(&rel);
+            if let Some((q, nf)) = self.autolock_pending.remove(&rel) {
+                self.autolock_fail(&rel, q, nf, "REACHABILITY".to_string());
+                continue;
+            }
+            if let Some((_, reply)) = pending {
                 let _ = reply.send(IpcResponse::err(
                     "timeout",
                     "not every peer answered the lock request in time",

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use crate::consts::{ACQUIRE_TIMEOUT, LEASE_RENEW, LEASE_TTL};
+use crate::consts::{ACQUIRE_TIMEOUT, LEASE_RENEW, LEASE_TTL, MAX_LEASE_TTL, MIN_LEASE_TTL};
 use crate::proto::DenyReason;
 use crate::state::RelPath;
 
@@ -46,6 +46,10 @@ pub enum LockState {
         holder: Id,
         lamport: u64,
         expires: Instant,
+        /// When this node first recorded the current holder's lease. Preserved
+        /// across renewals by the same holder; reset when the holder changes.
+        /// Used only for the `age` shown by `tazamun locks`.
+        since: Instant,
     },
 }
 
@@ -105,9 +109,13 @@ impl LockTable {
     }
 
     fn ttl_from_ms(&self, ttl_ms: u64) -> Duration {
-        // Remote-supplied TTLs are honored but capped to 10× ours so a
-        // malicious peer cannot park an effectively-infinite lease.
-        Duration::from_millis(ttl_ms).min(self.timings.ttl * 10)
+        // CONSISTENCY RULE: TTL is lease-scoped — the *holder's* configured TTL
+        // governs each lease and rides the wire, so nodes may run different
+        // local configs without protocol divergence. A receiver honors the wire
+        // value, clamped defensively to an absolute [MIN, MAX] range (not
+        // relative to local config) so a hostile `ttl_ms = 0` cannot make a
+        // lease instantaneous and a huge value cannot park it forever.
+        Duration::from_millis(ttl_ms).clamp(MIN_LEASE_TTL, MAX_LEASE_TTL)
     }
 
     /// Drops an expired `Held` entry before inspecting `path`.
@@ -173,6 +181,7 @@ impl LockTable {
                     holder: self.me.clone(),
                     lamport,
                     expires: now + self.timings.ttl,
+                    since: now,
                 },
             );
             Some(Acquired)
@@ -206,17 +215,20 @@ impl LockTable {
             Some(LockState::Held {
                 holder: h,
                 lamport: held_lamport,
+                since,
                 ..
             }) => {
                 if h == holder {
-                    // Idempotent re-request refreshes the lease.
+                    // Idempotent re-request refreshes the lease (age preserved).
                     let held_lamport = *held_lamport;
+                    let since = *since;
                     self.states.insert(
                         path.clone(),
                         LockState::Held {
                             holder: holder.clone(),
                             lamport: held_lamport.max(lamport),
                             expires: now + ttl,
+                            since,
                         },
                     );
                     Decision::Grant
@@ -237,6 +249,7 @@ impl LockTable {
                             holder: holder.clone(),
                             lamport,
                             expires: now + ttl,
+                            since: now,
                         },
                     );
                     Decision::GrantAndAbortMine
@@ -251,6 +264,7 @@ impl LockTable {
                         holder: holder.clone(),
                         lamport,
                         expires: now + ttl,
+                        since: now,
                     },
                 );
                 Decision::Grant
@@ -312,21 +326,28 @@ impl LockTable {
                         holder: holder.clone(),
                         lamport,
                         expires,
+                        since: now,
                     },
                 );
             }
             Some(LockState::Held {
                 holder: h,
                 lamport: l,
+                since,
                 ..
             }) => {
-                if h == holder || (lamport, holder.as_str()) < (*l, h.as_str()) {
+                let same_holder = h == holder;
+                if same_holder || (lamport, holder.as_str()) < (*l, h.as_str()) {
+                    // Preserve the observed age on a same-holder refresh; reset
+                    // it when a different holder's lower claim takes over.
+                    let since = if same_holder { *since } else { now };
                     self.states.insert(
                         path.clone(),
                         LockState::Held {
                             holder: holder.clone(),
                             lamport,
                             expires,
+                            since,
                         },
                     );
                 }
@@ -403,8 +424,10 @@ impl LockTable {
             .collect()
     }
 
-    /// All currently held leases as `(path, holder, lamport, expires_in)`.
-    pub fn held_leases(&self, now: Instant) -> Vec<(RelPath, Id, u64, Duration)> {
+    /// All currently held leases as `(path, holder, lamport, expires_in, age)`,
+    /// where `age` is how long this node has observed the current holder's
+    /// lease.
+    pub fn held_leases(&self, now: Instant) -> Vec<(RelPath, Id, u64, Duration, Duration)> {
         self.states
             .iter()
             .filter_map(|(p, s)| match s {
@@ -412,11 +435,13 @@ impl LockTable {
                     holder,
                     lamport,
                     expires,
+                    since,
                 } => Some((
                     p.clone(),
                     holder.clone(),
                     *lamport,
                     expires.saturating_duration_since(now),
+                    now.saturating_duration_since(*since),
                 )),
                 _ => None,
             })
@@ -559,12 +584,13 @@ mod tests {
 
     #[test]
     fn ttl_expiry_frees_lease() {
+        // TTL >= MIN_LEASE_TTL so it is honored verbatim (not clamped up).
         let mut t = table(A);
         let now = Instant::now();
-        t.on_remote_request(&p("f"), &B.to_string(), 1, 2_000, now);
-        let swept = t.sweep(now + Duration::from_millis(1_999));
+        t.on_remote_request(&p("f"), &B.to_string(), 1, 12_000, now);
+        let swept = t.sweep(now + Duration::from_millis(11_999));
         assert!(swept.expired.is_empty());
-        let swept = t.sweep(now + Duration::from_millis(2_001));
+        let swept = t.sweep(now + Duration::from_millis(12_001));
         assert_eq!(swept.expired, vec![(p("f"), B.to_string())]);
         // Freed: a new request is granted.
         assert_eq!(
@@ -572,8 +598,8 @@ mod tests {
                 &p("f"),
                 &C.to_string(),
                 2,
-                2_000,
-                now + Duration::from_secs(3)
+                12_000,
+                now + Duration::from_secs(13)
             ),
             Decision::Grant
         );
@@ -583,16 +609,16 @@ mod tests {
     fn idempotent_rerequest_renews() {
         let mut t = table(A);
         let now = Instant::now();
-        t.on_remote_request(&p("f"), &B.to_string(), 1, 2_000, now);
+        t.on_remote_request(&p("f"), &B.to_string(), 1, 12_000, now);
         // Same holder re-requests later: still Grant, expiry pushed out.
         let later = now + Duration::from_millis(1_500);
         assert_eq!(
-            t.on_remote_request(&p("f"), &B.to_string(), 4, 2_000, later),
+            t.on_remote_request(&p("f"), &B.to_string(), 4, 12_000, later),
             Decision::Grant
         );
-        let swept = t.sweep(now + Duration::from_millis(2_500));
+        let swept = t.sweep(now + Duration::from_millis(12_500));
         assert!(swept.expired.is_empty(), "renewed lease must not expire");
-        let swept = t.sweep(later + Duration::from_millis(2_001));
+        let swept = t.sweep(later + Duration::from_millis(12_001));
         assert_eq!(swept.expired.len(), 1);
     }
 

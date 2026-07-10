@@ -115,6 +115,16 @@ pub enum Msg {
         ttl_ms: u64,
     },
     Bye,
+    // ── Protocol minor 2 (P4): waitlist. Appended after `Bye` so every prior
+    // variant keeps its postcard discriminant (append-only wire compat). ──
+    /// "I want this path when you release it" — sent by a waiter to the holder.
+    LockInterest {
+        path: RelPath,
+    },
+    /// "This path is now free" — broadcast on release/expiry so waiters retry.
+    LockFreed {
+        path: RelPath,
+    },
 }
 
 impl Msg {
@@ -132,6 +142,8 @@ impl Msg {
             Msg::LockRelease { .. } => "lock_release",
             Msg::LockRenew { .. } => "lock_renew",
             Msg::Bye => "bye",
+            Msg::LockInterest { .. } => "lock_interest",
+            Msg::LockFreed { .. } => "lock_freed",
         }
     }
 }
