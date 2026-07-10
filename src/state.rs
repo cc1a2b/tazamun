@@ -401,10 +401,11 @@ mod tests {
         use crate::consts::{
             MAX_ACQUIRE_TIMEOUT, MAX_LEASE_TTL, MIN_ACQUIRE_TIMEOUT, MIN_LEASE_TTL,
         };
-        let mut c = SessionConfig::default();
-
         // Below the floor clamps up; above the ceiling clamps down.
-        c.lease_ttl_ms = 1; // 1ms
+        let mut c = SessionConfig {
+            lease_ttl_ms: 1, // 1ms
+            ..SessionConfig::default()
+        };
         assert_eq!(c.lease_ttl(), MIN_LEASE_TTL);
         c.lease_ttl_ms = 48 * 60 * 60 * 1000; // 48h
         assert_eq!(c.lease_ttl(), MAX_LEASE_TTL);
