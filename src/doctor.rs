@@ -268,6 +268,9 @@ pub fn relay_section(
         }
     }
     match probe {
+        // A zero here means "the daemon's relay link is up" (connection/TLS
+        // handshake succeeded) without a separately measured round-trip.
+        Some(Ok(0)) => s = s.line("reachability       : reachable (relay link up)"),
         Some(Ok(ms)) => s = s.line(format!("reachability       : OK ({ms} ms)")),
         Some(Err(e)) => {
             s = s.line(format!("reachability       : FAILED ({e})"));
