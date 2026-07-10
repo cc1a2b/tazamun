@@ -77,6 +77,51 @@ extra steps. No `.unwrap()` / `.expect()` outside tests unless provably
 infallible with a justifying comment. `#![forbid(unsafe_code)]` at the crate
 root — do not remove it.
 
+## CI policy (cost-aware, self-hosted-first)
+
+CI runs on **self-hosted runners** on the maintainer's machine to keep GitHub
+Actions minutes near zero. Two runners are registered on the repo:
+
+- `wsl2-linux` — labels `self-hosted, linux, x64` (a WSL2 service).
+- `host-windows` — labels `self-hosted, windows, x64` (a Windows service).
+
+`.github/workflows/ci.yml` maps events to cost tiers:
+
+| Event | Job | Runner | Scope |
+| --- | --- | --- | --- |
+| `push` (any branch) | `light` | self-hosted linux | fmt + clippy + `cargo test --lib` (unit only) |
+| `pull_request` | `full` (matrix) | self-hosted linux **and** windows | fmt + clippy + `cargo test --all-targets` |
+| `workflow_dispatch` | `macos-full` | **hosted** `macos-14` (billed) | full suite |
+
+- **macOS is not on the PR path.** Trigger `macos-full` manually (Actions → CI →
+  *Run workflow*) before merging a phase that changes **platform-sensitive
+  code** — the file watcher, guard/quarantine, path handling, or IPC. **P4 does
+  not require a macOS run** (it touches none of those); **P5 will.**
+- **`concurrency`** is grouped per ref with `cancel-in-progress: true`, so a new
+  push cancels the superseded run — the main silent minute-burner.
+- **No `actions/cache`** on the self-hosted jobs: the cargo cache lives on the
+  runner's local disk, which is faster and avoids restore/save minutes and
+  cache-eviction flakes. Only the hosted `macos-full` job caches.
+- The self-hosted runners already have the **Rust toolchain** (`rustup` with
+  `clippy` + `rustfmt`) installed on the machine, so the workflow installs no
+  toolchain for them.
+
+### Self-hosted runner security
+
+Self-hosted runners **execute repository workflow code on the maintainer's
+machine**. Because this repo is **private and single-author**, the blast radius
+is limited, but it is hardened regardless:
+
+- **Require approval for all outside collaborators** (Settings → Actions →
+  General) so a workflow never runs from an untrusted change.
+- The default `GITHUB_TOKEN` is **read-only** (`default_workflow_permissions:
+  read`); `release.yml` self-elevates to `contents: write` only when a tag is
+  pushed.
+- Each runner uses a **dedicated `_work` folder** and runs as a service under
+  the maintainer's account — not root/Administrator beyond what the service
+  install needs.
+- Workflows **never `echo` secrets**; there are no secrets in `ci.yml`.
+
 ## Development environment
 
 Keep the source and any session/smoke folders on the **native Linux

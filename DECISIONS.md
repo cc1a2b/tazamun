@@ -94,6 +94,49 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Phase 4 — lease ergonomics + CI cost overhaul
+
+### CI cost overhaul (self-hosted runners)
+
+- **Why:** the account sat at ~90% of the 2,000 free Actions minutes, and the
+  old 3-OS-every-push matrix was the cause (the P3 PR alone burned macOS 9m57s +
+  Ubuntu 20m47s + Windows **46m21s** — one PR ≈ 77 minutes). Windows hosted is
+  the dominant cost.
+- **New model** (`.github/workflows/ci.yml`): `push` → a light self-hosted-Linux
+  job (fmt + clippy + `cargo test --lib`); `pull_request` → the full suite on
+  self-hosted Linux **and** Windows; macOS demoted to a manual
+  `workflow_dispatch` job on hosted `macos-14`, run only before merging a phase
+  that touches watcher/guard/paths/IPC. Per-ref `concurrency` with
+  `cancel-in-progress` kills superseded runs (the silent burner). No
+  `actions/cache` on self-hosted — the cargo cache is local disk.
+- **Projected hosted burn for the rest of v0.1: ≈ 0 minutes**, except explicit
+  `macos-full` dispatches (P4 needs none; P5 will).
+- **Security:** self-hosted runners execute repo code on the maintainer's
+  machine; acceptable because the repo is private and single-author. Hardened
+  anyway: default `GITHUB_TOKEN` already read-only (`release.yml` self-elevates
+  on tags only); require-approval-for-outside-collaborators enabled; dedicated
+  `_work` folders; no secrets in `ci.yml`.
+- **Judgment call (runner registration timing):** runner registration is an
+  interactive step on the maintainer's machine (a per-runner token from the repo
+  UI) that cannot be automated from here. The self-hosted `ci.yml` and its policy
+  docs were committed to `main` ahead of the runners coming online; until both
+  runners show `Idle`, self-hosted jobs queue (they burn no minutes and do not
+  fail). The step-0 verification (one light push + one throwaway PR, wall-times
+  recorded here) and every phase's PR-green merge gate are therefore satisfied
+  once the runners are up — an inherent dependency of the self-hosted design, not
+  a regression. Feature work proceeds in parallel, gated locally by the three
+  gates.
+
+<!-- P4.0d verification (filled once runners are Idle):
+     light push run: <url> <wall-time>
+     full PR run (linux): <url> <wall-time>   (windows): <url> <wall-time> -->
+
+### Configurable lease timings
+
+### Autolock (auto-lock-on-first-write)
+
+### Lock waitlist
+
 ## Phase 3 — sovereignty (self-hosted relay, LAN, airgap)
 
 ### Test strategy for the three sovereignty modes

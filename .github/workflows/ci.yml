@@ -1,43 +1,83 @@
 name: CI
 
+# Cost model (see CONTRIBUTING.md → "CI policy"):
+#   push  → LIGHT job on the self-hosted Linux runner (fmt + clippy + unit
+#           tests). Fast feedback on every branch, zero hosted minutes.
+#   PR    → FULL suite on the self-hosted Linux AND Windows runners.
+#   macOS → NOT on the PR path. It is a manual `workflow_dispatch` job on a
+#           hosted (billed) runner, run before merging a phase that touches
+#           platform-sensitive code (watcher / guard / paths / IPC).
+# Superseded runs are cancelled per-ref (the silent minute-burner). The
+# self-hosted runners keep cargo caches on local disk, so there are no
+# actions/cache restore steps here.
+
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  # ── push → light: fmt + clippy + unit tests (no integration) ──────────────
+  light:
+    if: github.event_name == 'push'
+    name: light (self-hosted linux)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests (lib, no integration)
+        run: cargo test --lib
+
+  # ── pull_request → full suite on both self-hosted OSes ────────────────────
+  full:
+    if: github.event_name == 'pull_request'
+    name: full (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # macOS pinned to a fixed arch (macos-14 = arm64) so the build cache is
-        # never restored across an architecture change in the `macos-latest`
-        # runner pool.
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [linux, windows]
+    runs-on: [self-hosted, "${{ matrix.os }}", x64]
     steps:
       - uses: actions/checkout@v4
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (full suite)
+        run: cargo test --all-targets
 
+  # ── macOS: manual only (hosted, billed) ───────────────────────────────────
+  # Run this before merging a phase that changes watcher/guard/paths/IPC.
+  # Actions → CI → "Run workflow" on the branch. P4 does not require it (no
+  # platform-sensitive files change); P5 will.
+  macos-full:
+    if: github.event_name == 'workflow_dispatch'
+    name: macos-full (hosted macos-14)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v2-rust
-
       - name: Format check
         run: cargo fmt --all --check
-
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
+      - name: Test (full suite)
         run: cargo test --all-targets
