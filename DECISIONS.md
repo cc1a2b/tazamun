@@ -175,6 +175,20 @@ file whenever a dependency is added or a load-bearing design decision is made.
   (`autolock_pending` tracks the in-flight acquire; the grant/deny/timeout/sweep
   handlers finish it), so there is no second lease code path to keep in sync.
 
+### Apply-remote preserves un-leased local edits (Golden-Invariant fix)
+
+The autolock-race SMOKE surfaced a real gap: `apply_remote` swapped in an
+incoming version without checking the on-disk file, so in a tight
+simultaneous-write race the loser's un-leased bytes could be **silently
+overwritten** — their watcher event was swallowed by the apply's own mute before
+the violation/autolock path could quarantine them. Fix: because a synced file is
+read-only (0444), a **writable** file on disk is an un-leased local edit, so
+`apply_remote` now quarantines it (preserve-first) before overwriting or
+deleting. Cheap (a permissions check on the steady-state read-only fast path),
+precise, and it makes the autolock race honor the invariant — verified by the
+integration test asserting *both* written variants stay recoverable and by the
+SMOKE (`from-B` preserved on the loser).
+
 ### Lock waitlist & notifications
 
 - Wire minor bumped to `PROTOCOL_MINOR = 2`: `LockInterest` and `LockFreed`

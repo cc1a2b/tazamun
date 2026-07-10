@@ -261,6 +261,17 @@ impl TestNode {
             .unwrap_or(0)
     }
 
+    /// The bytes of every quarantine copy under `.tazamun/conflicts/`.
+    pub fn conflict_contents(&self) -> Vec<Vec<u8>> {
+        std::fs::read_dir(self.dir.path().join(".tazamun").join("conflicts"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| std::fs::read(e.path()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn delete_file(&self, rel: &str) {
         std::fs::remove_file(self.abs(rel)).expect("remove");
     }

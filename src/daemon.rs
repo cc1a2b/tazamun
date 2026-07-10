@@ -1411,6 +1411,25 @@ impl Actor {
             }
         }
         let abs = rel.to_fs_path(&self.dir);
+        // Golden Invariant: a synced file is read-only (0444), so a *writable*
+        // file on disk carries an un-leased local edit. Preserve those bytes in
+        // quarantine before the incoming version overwrites or deletes them —
+        // this closes the tight race where the local write's watcher event has
+        // not fired yet (or is about to be swallowed by this apply's mute), e.g.
+        // both nodes autolock-writing the same path at once.
+        if std::fs::metadata(&abs)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false)
+        {
+            match guard::quarantine(&self.dir, &rel) {
+                Ok(q) => warn!(
+                    path = %rel,
+                    quarantine = %q.display(),
+                    "preserved an un-leased local edit before applying the remote version"
+                ),
+                Err(e) => warn!(path = %rel, "could not preserve local edit before apply: {e}"),
+            }
+        }
         self.mute(&rel);
         let prev = self.state.files.get(&rel).cloned();
         if let Some(prev) = &prev {

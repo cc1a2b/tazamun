@@ -126,11 +126,19 @@ async fn autolock_race_leaves_one_winner_and_a_quarantine() {
     .await;
     assert!(converged, "the race did not converge to one winner");
 
-    // The losing write was preserved in quarantine, never silently dropped.
-    let quarantines = a.conflict_count() + b.conflict_count();
+    // Golden Invariant: BOTH written variants are recoverable — the winner's on
+    // disk, the loser's in a quarantine. Neither is silently overwritten.
+    let winner = a.read_file("race.txt").unwrap();
+    let mut recoverable: Vec<Vec<u8>> = vec![winner.clone()];
+    recoverable.extend(a.conflict_contents());
+    recoverable.extend(b.conflict_contents());
     assert!(
-        quarantines >= 1,
-        "the losing un-leased write must be quarantined (found {quarantines})"
+        recoverable.iter().any(|v| v.as_slice() == b"from-A"),
+        "from-A must be recoverable"
+    );
+    assert!(
+        recoverable.iter().any(|v| v.as_slice() == b"from-B"),
+        "from-B (the loser) must be preserved, never silently overwritten"
     );
 
     a.handle.shutdown().await;
