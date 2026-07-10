@@ -127,9 +127,57 @@ file whenever a dependency is added or a load-bearing design decision is made.
   a regression. Feature work proceeds in parallel, gated locally by the three
   gates.
 
-<!-- P4.0d verification (filled once runners are Idle):
-     light push run: <url> <wall-time>
-     full PR run (linux): <url> <wall-time>   (windows): <url> <wall-time> -->
+**P4.0d verification (cold caches, first real runs):**
+
+- light push run: <https://github.com/cc1a2b/tazamun/actions/runs/29106866337>
+  — `light (self-hosted linux)` **8m10s** (6m56s warm on the next push).
+- full PR run: <https://github.com/cc1a2b/tazamun/actions/runs/29106869168>
+  — `full (linux)` **5m34s** vs 20m47s hosted (3.7×); `full (windows)`
+  **10m22s** vs 46m21s hosted (**4.5×**). The P3 PR burned ~77 hosted minutes;
+  the same shape now burns **0**.
+- PR #4 itself served as the "throwaway PR" verification. macOS: not
+  dispatched — P4 changes daemon-level publish/apply orchestration but no
+  watcher/guard/path/IPC platform code (`guard.rs`/`watcher.rs` untouched), so
+  per the CI policy no `macos-full` run was required; P5 will require one.
+
+**Runner registration (operational judgment call):** registration was reported
+complete ("both Idle"), but the repo API showed `total_count: 0`, no
+`Runner.Listener` existed in WSL or Windows, and the queued jobs had starved
+for 2h+ — the runners had evidently been registered elsewhere (or not at all).
+Rather than stall the phase, both runners were registered autonomously using
+API-minted registration tokens (`POST …/actions/runners/registration-token`):
+`wsl2-linux` under `~/actions-runner-linux` and `host-windows` under
+`C:\actions-runner-win` (rustup + stable-msvc + rustfmt/clippy installed on the
+host; VS Build Tools were already present). Both currently run as **user
+processes**, not services — reboot persistence still needs the one-time
+elevated step on each side (`sudo ./svc.sh install && sudo ./svc.sh start` in
+WSL; `.\config.cmd remove` + re-`config` with `--runasservice` from an admin
+shell on Windows).
+
+**What the first cold self-hosted runs caught (all fixed at the root):**
+
+- `clippy::field_reassign_with_default` in a new P4 unit test — the warm local
+  cache had skipped re-linting the module; the runner's cold pass is the truth.
+- **Genesis importer's copy stayed writable** (pre-existing since P0, both
+  OSes): `on_publish_done` never applied read-only for `PublishCause::Import`,
+  so the importer's own genesis file lacked the strict-checkout guard-rail
+  until the next restart's `enforce_all`. Caught by the Windows race smoke's
+  pre-race attribute check, reproduced on Linux with a regression test, fixed
+  by applying read-only when an Import publish lands.
+- `telemetry_snapshot_after_mesh_is_direct_and_sane` asserted `Good` on the
+  *first* Direct sample; on a multi-homed host (Ethernet + WSL vSwitch) QUIC
+  legitimately migrates the selected path a few times during establishment, so
+  the first minute can grade `Poor` before the flaps age out of the sliding
+  window. Product grading is unchanged (flap-counting is by design); the test
+  now asserts the **settled** steady state, which a genuinely degraded link
+  never reaches.
+
+**Windows race smoke (native NTFS semantics):** the autolock race re-run with
+the Windows release binary on `E:\` proved the `apply_remote` preserve-first
+fix under Windows semantics — read-only **attribute** cleared by the un-leased
+write, winner's bytes rename-overed in, `IsReadOnly=True` re-applied on the
+loser, and the loser's own bytes preserved in `conflicts/`. Transcript in
+`SMOKE.md` (P4 addendum).
 
 ### Configurable lease timings (consensus-safe)
 

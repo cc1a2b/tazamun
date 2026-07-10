@@ -444,3 +444,66 @@ WAITLIST HANDOFF SMOKE PASSED
 a `waiter` in `status --json`), and the moment A unlocked, B's waiting client
 re-attempted the acquire and won it — `report.md` became writable on B with the
 holder's own 90s TTL.
+
+## TTL consistency — the holder's 15m TTL honored by a 90s-config peer
+
+```text
+=== STEP 1 — A: lease-ttl 15m; B: default 90s ===
+--- A config show (excerpt) ---
+  lease-ttl       : 15m (renew every 5m)
+  acquire-timeout : 8s
+--- B config show (excerpt) ---
+  lease-ttl       : 1m 30s (renew every 30s)
+  acquire-timeout : 8s
+PASS: B synced
+=== STEP 2 — A locks doc.bin with its 15m TTL ===
+✔ doc.bin is now writable (lease TTL 900s, auto-renewed)
+=== STEP 3 — B (90s config) honors the holder's 15m lease ===
+--- B: tazamun locks ---
+active leases (1):
+  doc.bin  held by 7d39bde1ed  age 0s  expires in 14m 59s
+PASS: B shows expiry ≈ 14m — the holder's 15m TTL, not B's 90s default
+=== RESULT ===
+TTL CONSISTENCY SMOKE PASSED
+```
+
+Two nodes with different `lease-ttl` configs agree on the lease: TTL is
+lease-scoped and rides the wire, so B reports A's 15-minute lease even though
+B's own config would only ever mint 90-second leases.
+
+## Autolock race on WINDOWS — native NTFS attribute + rename-over semantics
+
+The same race re-run with the **Windows release binary** on NTFS (`E:\`), both
+force-writes performed Windows-natively (clear `IsReadOnly`, write). This is
+the loser-node proof of the `apply_remote` preserve-first fix under Windows
+semantics:
+
+```text
+=== STEP 1 — A (Windows/NTFS): genesis race.txt, autolock on, start ===
+PASS: A daemon answering on its named pipe
+PASS: live ticket minted
+=== STEP 2 — B: join, autolock on, start; sync the base ===
+PASS: B synced the base version
+PASS: read-only attribute set on both copies (pre-race)
+=== STEP 3 — force-write both at once (clear attr + write, Windows-native) ===
+PASS: both nodes force-wrote an un-leased edit (back-to-back, inside the debounce)
+=== STEP 4 — converge to ONE winner on both nodes ===
+PASS: both nodes converged to a single winner: 'from-A'
+  winner node: A   loser node: B (its bytes: 'from-B')
+=== STEP 5 — LOSER node (B): winner bytes on disk, read-only attr back, bytes preserved ===
+PASS: loser's race.txt now carries the winner's bytes
+PASS: Windows read-only attribute re-applied on the loser (IsReadOnly=True)
+  ----- loser's conflicts/ -----
+  20260710T164347315Z__race.txt = 'from-B'
+PASS: loser's own bytes ('from-B') preserved in quarantine — never silently overwritten
+=== STEP 6 — winner node still holds via autolock (idle timer running) ===
+active leases (1):
+  race.txt  held by you  age 1s  expires in 1m 28s
+=== RESULT ===
+WINDOWS AUTOLOCK RACE SMOKE PASSED (winner='from-A', loser=B preserved)
+```
+
+The pre-race attribute check (`STEP 2`) is itself the live verification of the
+genesis read-only fix this smoke originally caught: the importer's copy now
+carries the read-only attribute the moment its genesis publish lands, on
+Windows exactly as on Linux.

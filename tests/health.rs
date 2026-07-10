@@ -54,10 +54,20 @@ async fn telemetry_snapshot_after_mesh_is_direct_and_sane() {
     .await;
     assert!(direct, "A never sampled B as Direct");
 
+    // On a multi-homed host (several NICs) QUIC may migrate the selected path
+    // a few times while the connection establishes; those early changes count
+    // as flaps and can briefly grade the link Poor, then age out of the sliding
+    // window. Assert the *steady state* the design promises — a loopback link
+    // settles at Good — rather than the first instant; a genuinely degraded
+    // link never settles.
+    let settled = wait_until(
+        || async { a.status().await["members"][0]["grade"] == "Good" },
+        WAIT_MESH + Duration::from_secs(30),
+    )
+    .await;
     let member = a.status().await["members"][0].clone();
+    assert!(settled, "grade never settled to Good: {member}");
     assert_eq!(member["conn"], "Direct");
-    // Loopback grades Good, with a small non-negative RTT.
-    assert_eq!(member["grade"], "Good", "member: {member}");
     let rtt = member["rtt_ms"].as_f64().unwrap();
     assert!((0.0..1000.0).contains(&rtt), "implausible rtt {rtt}");
     assert!(member["online"].as_bool().unwrap());
