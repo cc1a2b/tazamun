@@ -1238,6 +1238,22 @@ impl Actor {
             remote.iter().map(|(p, r)| (p.clone(), r.clone())).collect();
         let d = diff(&self.state.files, &remote_vec);
         let records: BTreeMap<RelPath, FileRecord> = remote_vec.into_iter().collect();
+        // Retire any unapplied markers the origin has since deleted (a tombstone
+        // for an unapplied path is dropped by `diff`, so handle it directly).
+        if !self.state.unapplied.is_empty() {
+            let deleted: Vec<RelPath> = self
+                .state
+                .unapplied
+                .keys()
+                .filter(|rel| records.get(*rel).is_some_and(|r| r.deleted))
+                .cloned()
+                .collect();
+            for rel in deleted {
+                if let Some(rec) = records.get(&rel) {
+                    self.maybe_clear_unapplied(&rel, rec);
+                }
+            }
+        }
         for rel in d.pull {
             if let Some(rec) = records.get(&rel) {
                 self.maybe_pull(&rel, from, rec.clone());
@@ -1250,7 +1266,22 @@ impl Actor {
         }
     }
 
+    /// Clears a non-portable `unapplied` marker when the origin deletes the
+    /// path. Such a path is absent from `state.files`, so the normal
+    /// tombstone-vs-index reconciliation skips it — this is the only place the
+    /// marker is retired on deletion.
+    fn maybe_clear_unapplied(&mut self, rel: &RelPath, record: &FileRecord) {
+        if record.deleted && self.state.unapplied.remove(rel).is_some() {
+            self.persist();
+            self.push_event(format!(
+                "unapplied non-portable path removed upstream: {rel}"
+            ));
+            info!(path = %rel, "unapplied path tombstoned upstream; marker cleared");
+        }
+    }
+
     fn reconcile_one(&mut self, from: EndpointId, rel: &RelPath, record: &FileRecord) {
+        self.maybe_clear_unapplied(rel, record);
         match self.state.files.get(rel) {
             None => {
                 if !record.deleted {
