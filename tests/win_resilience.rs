@@ -81,14 +81,13 @@ fn readonly_file_delete_follows_clear_then_delete_ordering() {
     let target = dir.path().join("ro.bin");
     std::fs::write(&target, b"x").unwrap();
     tazamun::guard::set_readonly(&target).unwrap();
+    assert!(std::fs::metadata(&target).unwrap().permissions().readonly());
 
-    // Windows refuses to delete a read-only file; the documented ordering is
-    // clear-attribute → delete-with-retry, which the sites implement via
-    // set_writable + win_fs::remove_file.
-    assert!(
-        std::fs::remove_file(&target).is_err(),
-        "plain delete of a read-only file must fail on Windows"
-    );
+    // The documented ordering the call sites use — clear the read-only
+    // attribute, then delete with the retry wrapper — removes a read-only file.
+    // (We clear explicitly rather than lean on std's Windows `remove_file`,
+    // whose read-only handling varies by toolchain version; the daemon's delete
+    // sites always `set_writable` first, so this is the contract that matters.)
     tazamun::guard::set_writable(&target).unwrap();
     tazamun::win_fs::remove_file(&target).unwrap();
     assert!(!target.exists());
