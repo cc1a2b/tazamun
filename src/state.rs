@@ -173,6 +173,19 @@ pub struct AppState {
     pub files: BTreeMap<RelPath, FileRecord>,
     pub known_members: BTreeMap<String, AddrWire>,
     pub history: BTreeMap<RelPath, Vec<VersionEntry>>,
+    /// Remote records this node acknowledges but refuses to materialize
+    /// because the path is not representable here (Windows portability rules).
+    /// The sync loop treats them as settled — no re-pull churn — and `status`
+    /// / `doctor` surface them. Never populated on Unix (warn-only there).
+    #[serde(default)]
+    pub unapplied: BTreeMap<RelPath, UnappliedEntry>,
+}
+
+/// One non-materialized remote record plus the human-readable reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnappliedEntry {
+    pub record: FileRecord,
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -203,6 +216,7 @@ impl AppState {
             files: BTreeMap::new(),
             known_members: BTreeMap::new(),
             history: BTreeMap::new(),
+            unapplied: BTreeMap::new(),
         }
     }
 

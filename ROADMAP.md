@@ -36,3 +36,6 @@ below is **out of scope for v0.1** and tracked here for later milestones.
         the `status` JSON schema-1 contract, file & lock table with one-click
         lock/unlock, conflicts browser, version history + restore, invite QR
   - [ ] CLI polish: shell completions, man page
+  - [ ] Portability polish: opt-in name-mangling so Windows nodes can
+        materialize non-portable paths under an escaped name (today they are
+        held as "unapplied" — never guessed, never mangled silently)

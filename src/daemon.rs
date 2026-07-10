@@ -427,6 +427,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         interest: BTreeMap::new(),
         autolock_idle: BTreeMap::new(),
         autolock_pending: BTreeMap::new(),
+        warned_nonportable: BTreeSet::new(),
         muted: HashMap::new(),
         busy: BTreeSet::new(),
         recheck: BTreeSet::new(),
@@ -499,6 +500,9 @@ struct Actor {
     /// Autolock acquires in flight: `path → (preserved-bytes quarantine, was it
     /// a brand-new file)`. Resolved by the grant/deny/timeout handlers.
     autolock_pending: BTreeMap<RelPath, (Option<PathBuf>, bool)>,
+    /// Paths already warned about as Windows-non-portable this run (Unix
+    /// warn-only mode; keeps the log to one line per path).
+    warned_nonportable: BTreeSet<RelPath>,
     muted: HashMap<RelPath, Instant>,
     busy: BTreeSet<RelPath>,
     recheck: BTreeSet<RelPath>,
@@ -1299,13 +1303,70 @@ impl Actor {
 
     // ---------------- pulls ----------------
 
+    /// The portability verdict for a remote path on this node: the pure
+    /// character/device-name rules plus the stateful NTFS case-fold check —
+    /// a path that differs from an already-indexed live path only by case
+    /// would silently overwrite it on a case-insensitive filesystem.
+    fn portability_reason(&self, rel: &RelPath) -> Option<String> {
+        if let Some(reason) = crate::sync::index::portability_violation(rel.as_str()) {
+            return Some(reason);
+        }
+        let folded = rel.as_str().to_lowercase();
+        self.state
+            .files
+            .iter()
+            .find(|(p, r)| !r.deleted && *p != rel && p.as_str().to_lowercase() == folded)
+            .map(|(p, _)| {
+                format!("case-fold collision with already-indexed {p:?} (NTFS is case-insensitive)")
+            })
+    }
+
     fn maybe_pull(&mut self, rel: &RelPath, from: EndpointId, record: FileRecord) {
         if self.locks.is_held_by_me(rel) {
             return;
         }
         if record.deleted {
+            // A tombstone settles an unapplied path too: the record is gone
+            // upstream, so drop the marker.
+            if self.state.unapplied.remove(rel).is_some() {
+                self.persist();
+                info!(path = %rel, "unapplied non-portable path deleted upstream; marker cleared");
+            }
             self.apply_remote(rel.clone(), from, record, None);
             return;
+        }
+        // Portability gate: a path that cannot exist on this filesystem is
+        // acknowledged but never materialized (Windows), or applied with a
+        // loud warning (Unix). The stored record keeps the sync loop settled —
+        // no re-pull churn — and never wedges anything else.
+        if let Some(reason) = self.portability_reason(rel) {
+            if cfg!(windows) {
+                let changed = self
+                    .state
+                    .unapplied
+                    .get(rel)
+                    .is_none_or(|e| e.record.vv != record.vv);
+                if changed {
+                    warn!(
+                        path = %rel,
+                        reason = %reason,
+                        "UNAPPLIED: remote file has a non-portable path; record stored, file NOT materialized"
+                    );
+                    self.push_event(format!("unapplied (non-portable path): {rel}"));
+                    self.state
+                        .unapplied
+                        .insert(rel.clone(), crate::state::UnappliedEntry { record, reason });
+                    self.persist();
+                }
+                return;
+            }
+            if self.warned_nonportable.insert(rel.clone()) {
+                warn!(
+                    path = %rel,
+                    reason = %reason,
+                    "path is not portable to Windows nodes (applied here; Windows members will hold it unapplied)"
+                );
+            }
         }
         if let Some(job) = self.pending_pulls.get_mut(rel) {
             if job.record.manifest == record.manifest && job.record.vv == record.vv {
@@ -2172,6 +2233,7 @@ impl Actor {
             "lan_discovery": self.lan_enabled,
             "known_members": self.state.known_members.len(),
             "connected_peers": self.peers.len(),
+            "unapplied_count": self.state.unapplied.len(),
             "peers": peers,
         })
     }
@@ -2816,6 +2878,12 @@ impl Actor {
             "members": members,
             "leases": leases,
             "waiting": waiting,
+            "unapplied": self
+                .state
+                .unapplied
+                .iter()
+                .map(|(p, e)| serde_json::json!({ "path": p.as_str(), "reason": e.reason }))
+                .collect::<Vec<_>>(),
             "pending_pulls": pending_pulls,
             "events": events,
             "file_count": live_files.len(),

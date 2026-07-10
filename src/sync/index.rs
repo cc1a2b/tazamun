@@ -67,6 +67,51 @@ pub fn sanitize_rel_path(input: &str) -> Result<RelPath, PathError> {
     Ok(RelPath::new_unchecked(input.to_string()))
 }
 
+/// Windows reserved device names — reserved with or without an extension
+/// (`aux`, `aux.txt`, `COM1.log` all name the device).
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Checks whether a (sanitizer-accepted) relative path is representable on a
+/// Windows/NTFS node. Pure and platform-independent: the *decision* about a
+/// violation (refuse to materialize on Windows, warn-only on Unix) belongs to
+/// the caller. Returns a human-readable reason on violation.
+///
+/// Rules: no `< > : " | ? *` or control characters (0x00–0x1F) in any segment;
+/// no reserved device names (`CON PRN AUX NUL COM1–9 LPT1–9`, case-insensitive,
+/// with or without extension); no segment ending in a dot or a space. The
+/// case-fold-collision rule (NTFS is case-insensitive) is stateful and checked
+/// against the live index at apply time, not here.
+pub fn portability_violation(rel: &str) -> Option<String> {
+    for seg in rel.split('/') {
+        for ch in seg.chars() {
+            if matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (ch as u32) < 0x20 {
+                return Some(format!(
+                    "segment {seg:?} contains {ch:?}, invalid in Windows file names"
+                ));
+            }
+        }
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            return Some(format!(
+                "segment {seg:?} ends with a dot or space, which Windows strips"
+            ));
+        }
+        let stem = seg.split('.').next().unwrap_or(seg);
+        if WINDOWS_RESERVED
+            .iter()
+            .any(|r| stem.eq_ignore_ascii_case(r))
+        {
+            return Some(format!(
+                "segment {seg:?} is a reserved Windows device name ({})",
+                stem.to_ascii_uppercase()
+            ));
+        }
+    }
+    None
+}
+
 /// Result of reconciling a remote index against the local one.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Diff {
@@ -194,5 +239,63 @@ mod tests {
         let d = diff(&local, &remote);
         assert!(d.pull.is_empty());
         assert_eq!(d.conflicts, vec![p("f")]);
+    }
+
+    #[test]
+    fn portability_corpus() {
+        // Clean, portable names pass.
+        for ok in [
+            "notes.txt",
+            "a/b/c.bin",
+            "COMMON.md",         // COM prefix but not a device name
+            "aux2.txt",          // AUX2 is not reserved
+            "consommé.txt",      // unicode fine
+            "nulled/console.rs", // device names as *directory content* words
+            "x.con",             // reserved stem rule applies to the stem only
+        ] {
+            assert_eq!(portability_violation(ok), None, "{ok} should be portable");
+        }
+        // Invalid characters.
+        for bad in [
+            "da:ta.bin",
+            "que?stion.txt",
+            "st*ar",
+            "pi|pe",
+            "quo\"te",
+            "lt<.txt",
+            "gt>.txt",
+            "ctl\u{1}.bin",
+        ] {
+            assert!(
+                portability_violation(bad).is_some(),
+                "{bad} must be flagged"
+            );
+        }
+        // Reserved device names, any case, with or without extension, in any
+        // segment position.
+        for bad in [
+            "aux",
+            "AUX.txt",
+            "Con",
+            "com1",
+            "COM9.log",
+            "lpt3.bak",
+            "NUL",
+            "prn.csv",
+            "sub/aux.txt",
+            "CoM2.tar.gz",
+        ] {
+            assert!(
+                portability_violation(bad).is_some(),
+                "{bad} must be flagged as reserved"
+            );
+        }
+        // Trailing dot / space.
+        for bad in ["file.", "dir./x", "name ", "sub/trail. /y"] {
+            assert!(
+                portability_violation(bad).is_some(),
+                "{bad:?} must be flagged for trailing dot/space"
+            );
+        }
     }
 }

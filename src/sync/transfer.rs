@@ -262,14 +262,24 @@ impl Transfer {
         record: &FileRecord,
         meter: Option<Arc<crate::ui::progress::Meter>>,
     ) -> Result<Staged, TransferError> {
-        let conn = endpoint
-            .connect(from, iroh_blobs::ALPN)
-            .await
-            .map_err(|e| TransferError::Fetch(e.to_string()))?;
+        // Connect lazily: an inline manifest whose chunks are all local (or an
+        // empty file) needs no network at all — the pull completes from the
+        // store alone.
+        let mut conn: Option<iroh::endpoint::Connection> = None;
         let mut tags = Vec::new();
-        let refs = self
-            .resolve_manifest(&record.manifest, record.size, Some(&conn), &mut tags)
-            .await?;
+        let refs = if let ManifestRef::Inline(refs) = &record.manifest {
+            refs.clone()
+        } else {
+            let c = endpoint
+                .connect(from.clone(), iroh_blobs::ALPN)
+                .await
+                .map_err(|e| TransferError::Fetch(e.to_string()))?;
+            let refs = self
+                .resolve_manifest(&record.manifest, record.size, Some(&c), &mut tags)
+                .await?;
+            conn = Some(c);
+            refs
+        };
         if let Some(m) = &meter {
             m.set_chunks(refs.len());
         }
@@ -302,13 +312,22 @@ impl Transfer {
         }
         let missing_count = missing.len();
 
+        // Only dial when something actually has to cross the network.
+        if missing_count > 0 && conn.is_none() {
+            conn = Some(
+                endpoint
+                    .connect(from, iroh_blobs::ALPN)
+                    .await
+                    .map_err(|e| TransferError::Fetch(e.to_string()))?,
+            );
+        }
         let mut queue = missing.into_iter();
         let mut inflight = tokio::task::JoinSet::new();
         loop {
             while inflight.len() < FETCH_CONCURRENCY {
                 let Some(h) = queue.next() else { break };
+                let Some(conn) = conn.clone() else { break };
                 let store = self.store.clone();
-                let conn = conn.clone();
                 inflight.spawn(async move {
                     store
                         .remote()

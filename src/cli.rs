@@ -856,6 +856,17 @@ fn render_status(data: &serde_json::Value, out: &mut String) {
             l["expires_in_ms"].as_u64().unwrap_or(0) / 1000
         );
     }
+    let unapplied = data["unapplied"].as_array().cloned().unwrap_or_default();
+    if !unapplied.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nunapplied — non-portable paths ({}):",
+            unapplied.len()
+        );
+        for u in &unapplied {
+            let _ = writeln!(out, "  ⚠ {}  ({})", s(&u["path"]), s(&u["reason"]));
+        }
+    }
     let pulls = data["pending_pulls"]
         .as_array()
         .cloned()
@@ -922,6 +933,23 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
             s.action = Some("run `tazamun start` and re-run `tazamun doctor`".into());
             sections.push(s);
         }
+    }
+
+    // Portability (from daemon): count of remote records held unapplied
+    // because their paths cannot exist on this filesystem.
+    if let Some(n) = daemon
+        .as_ref()
+        .and_then(|d| d["unapplied_count"].as_u64())
+        .filter(|n| *n > 0)
+    {
+        let mut s = Section::from_warn("portability  [from daemon]");
+        s.lines.push(format!(
+            "unapplied paths    : {n} remote file(s) held back (non-portable names)"
+        ));
+        s.action = Some(
+            "run `tazamun status` for the list; rename on the origin node to sync them".into(),
+        );
+        sections.push(s);
     }
 
     // Airgap banner (from daemon): list the closed-network guarantees.
