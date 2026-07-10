@@ -94,6 +94,51 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Phase 5 — Windows hardening, background service, signing groundwork
+
+### Runner persistence (housekeeping, judgment call)
+
+Both self-hosted runners were converted from ad-hoc user processes to
+persistent, auto-starting form — with one deliberate deviation from the
+"Windows service" letter of the plan:
+
+- **WSL (`wsl2-linux`)**: a **systemd user unit**
+  (`~/.config/systemd/user/actions-runner-tazamun.service`, `Restart=on-failure`,
+  `WantedBy=default.target`), enabled and verified `active`. The system-level
+  `svc.sh install` path needs sudo, which requires a password interactively;
+  the user unit needs none and is a first-class systemd service
+  (`systemctl --user is-active` = the required verification).
+  `loginctl enable-linger` is denied without sudo, so boot persistence comes
+  from the Windows side instead (below).
+- **Windows (`host-windows`)**: **not** `--runasservice`, deliberately. The
+  runner service would default to `NT AUTHORITY\NETWORK SERVICE`, whose profile
+  cannot see the user's rustup/cargo (and user-profile ACLs block it), so every
+  CI job would fail at `cargo`; running the service as the user account instead
+  requires the account password, which an autonomous session must not handle.
+  Equivalent persistence with the working environment intact: two **logon
+  Scheduled Tasks** under the user account (`RunLevel Limited`, created
+  non-elevated via the `Register-ScheduledTask` cmdlets) — `actions-runner-win`
+  starts the Windows runner (cargo pinned on PATH by a wrapper cmd), and
+  `actions-runner-wsl-boot` boots the kali-linux distro and starts the WSL
+  runner unit, covering the missing linger. Both verified `Ready`; the boot
+  task test-fired with `LastTaskResult=0`. Incidental finding that de-risks the
+  P5 service feature: logon-trigger task creation works **without elevation**
+  for the current user via the cmdlets (the string-parsing `schtasks.exe` form
+  is mangled only when invoked across WSL interop — not relevant to native
+  use).
+
+### Test-count baseline reconciliation (P3 "102" vs P4 baseline "98")
+
+The P3 closing report stated "102 tests passing"; the P4 section then used 98
+as the P3-end baseline. The cause is prosaic: **the 102 was a summation error
+in the P3 report prose**, not lost tests. The recorded P3-end gate output sums
+to 75 (lib) + 6 + 5 + 4 + 4 + 4 (integration binaries) = **98**; no test file
+was removed between the runs, and git history contains no state where the
+suite summed to 102. (The LAN-rendezvous test self-skips on runners without
+multicast, but it reports `ok` either way, so skipping never changes the
+count.) Corrected ledger: P3-end = 98, P4-end = 110 (+6 lib unit, +5
+`lease_ergonomics`, +1 `sync_flow` genesis regression).
+
 ## Phase 4 — lease ergonomics + CI cost overhaul
 
 ### CI cost overhaul (self-hosted runners)
