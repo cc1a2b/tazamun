@@ -596,6 +596,62 @@ lock race, not by who asked first. Waiting gives up after `wait-timeout`
 </details>
 
 <details>
+<summary><b>Running as a service</b></summary>
+
+One command pins a per-folder background daemon to the OS-native autostart
+facility (one folder = one instance; repeat installs are idempotent):
+
+```bash
+tazamun service install      # start at login and keep running
+tazamun service status       # platform state + IPC liveness + last log lines
+tazamun service uninstall    # stop and remove
+```
+
+- **Linux:** a systemd **user** unit (`~/.config/systemd/user/tazamun-<id>.service`,
+  `Restart=on-failure`), enabled and started immediately. For the service to
+  keep running while you are logged out, enable lingering once:
+  `loginctl enable-linger $USER`.
+- **macOS:** a LaunchAgent (`~/Library/LaunchAgents/io.tazamun.<id>.plist`,
+  RunAtLoad + KeepAlive-on-failure), bootstrapped into your GUI session;
+  launchd's own stdout/err land in `.tazamun/logs/`.
+- **Windows:** a logon Scheduled Task (limited privileges, hidden window).
+  Start it immediately with `schtasks /Run /TN tazamun-<id>`; the hidden
+  PowerShell host exists only to suppress the console flash at logon.
+
+A service daemon (any daemon without a terminal) also writes
+`.tazamun/logs/daemon.log`, size-rotated at 5 MiB keeping 3 generations —
+that's what `service status` tails. Starting `tazamun start` manually while
+the service runs (or vice versa) refuses cleanly with
+"a daemon is already running for this folder".
+
+</details>
+
+<details>
+<summary><b>Windows notes</b></summary>
+
+- **Long paths:** tazamun works past the legacy 260-character `MAX_PATH` out
+  of the box — every filesystem call uses `\\?\` extended-length paths, and
+  the binary carries a `longPathAware` manifest. `tazamun doctor` reports the
+  system-wide `LongPathsEnabled` registry switch: enabling it (the exact
+  PowerShell command is in the doctor output) lets *other* programs — editors,
+  Explorer — handle your deep session paths too.
+- **Locked files:** antivirus scanners and editors briefly hold files open;
+  Windows refuses renames/deletes during that window. tazamun retries such
+  operations automatically (exponential backoff, ≤ 3.5 s) before reporting an
+  error, so transient handle contention self-heals.
+- **Non-portable names:** files created on Linux/macOS with names Windows
+  cannot represent — `< > : " | ? *`, control characters, reserved device
+  names (`CON`, `AUX`, `COM1`…), trailing dots/spaces, or names differing only
+  by case from an existing file — are **held back** on Windows nodes:
+  acknowledged, listed under "unapplied" in `tazamun status` (and counted by
+  `doctor`), but never materialized and never renamed silently. Rename them on
+  the originating node to sync them.
+- **Logs:** service-mode daemons write `.tazamun\logs\daemon.log` (5 MiB × 3
+  rotation).
+
+</details>
+
+<details>
 <summary><b>Invite by QR</b></summary>
 
 Hand a phone-to-laptop invite across the room without copy-pasting: render the

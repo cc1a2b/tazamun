@@ -127,6 +127,79 @@ persistent, auto-starting form — with one deliberate deviation from the
   is mangled only when invoked across WSL interop — not relevant to native
   use).
 
+### Long paths (P5.1)
+
+- `embed-manifest 1.5.0` (build-dependency, Windows target only): embeds the
+  `longPathAware` manifest. It only helps when the OS `LongPathsEnabled`
+  registry switch is on, so it is never relied on alone: `win_fs::to_extended`
+  converts absolute paths to `\\?\` extended-length form at two choke-points —
+  `RelPath::to_fs_path` and `AppState::meta_dir` — which every
+  guard/transfer/quarantine/versions/state path funnels through, plus the
+  watcher root (added to the event-strip candidates alongside the macOS
+  canonical form). `\\?\` works regardless of the registry. The iroh-blobs
+  store root inherits the extended form via `meta_dir`; the Windows CI suite
+  runs the whole data plane through it (watched: no breakage).
+- The >300-char cycle test caught a real cross-platform bug: **quarantine file
+  names embedded the whole percent-encoded rel path**, blowing the 255-byte
+  per-component limit (ext4 and NTFS), so deep-path quarantines failed — and
+  the violation restore would then have destroyed the un-preserved bytes.
+  Fixes: bounded quarantine names (readable 180-byte prefix + 16-hex BLAKE3 of
+  the exact rel), and both violation and autolock reverts now **skip the
+  restore entirely when preservation failed** (Golden Invariant per-component
+  of tidiness).
+
+### Windows file-op resilience (P5.2)
+
+- Bounded retry for contended ops: 6 attempts, 50 ms→1.6 s doubling, ±20%
+  deterministic jitter (attempt-derived, no RNG — provably ≤ 3.5 s total),
+  `debug!` per retry, original error surfaced last. Codes: 32
+  (ERROR_SHARING_VIOLATION) and 5 (the set-attributes race; a genuine ACL
+  denial costs one bounded cycle). Applied at guard set-attributes, all
+  rename-overs (a consuming-safe `TempPath::persist` wrapper that re-drives
+  the temp file returned inside the error), tombstone/new-file deletes, and
+  the publish chunker's open. The retry sleeps are `std::thread::sleep` on the
+  calling task — worst case 3.15 s on the actor during an apply — accepted:
+  contention is rare, bounded, and an async retry ladder would spread the
+  ordering guarantees across await points.
+- Read-only ordering rule (Windows refuses deleting/renaming over RO files):
+  clear-attribute → mutate-with-retry → re-apply where the survivor is
+  guarded. The new-file violation and autolock reverts were missing the clear
+  step (pre-existing) — fixed with regression coverage.
+
+### Path portability (P5.3)
+
+- The pure validator lives in `sync::index` next to the sanitizer; the daemon
+  adds the stateful NTFS case-fold check against live indexed paths. Windows
+  holds violating records in a persisted `unapplied` map — acknowledged, never
+  materialized, never re-pulled (settled), never name-mangled (mangling is
+  ROADMAP-listed future polish); Unix is warn-only, once per path per run.
+  Locking an unapplied path on Windows is refused by FRESHNESS (the record is
+  known from peers but not applied locally) — intended.
+- `pull_stage` now connects lazily: inline manifests whose chunks are all
+  local (and empty files) complete from the store without dialing — a real
+  dedup/empty-file win that also lets the control-plane-only test harness
+  inject records end to end.
+
+### Background service + logging (P5.4)
+
+- Scheduled Task instead of a Windows service for the product too: services
+  need elevation + a stored account password and run outside the user
+  environment; a logon task (`/RL LIMITED`) runs as the user with no secrets
+  (validated non-elevated during P5.0 runner work). Tradeoff documented: a
+  hidden `powershell.exe` host wraps the exe purely to suppress the logon
+  console flash.
+- Log rotation is a ~40-line in-crate rotator (`service::RotatingLog`) rather
+  than `tracing-appender`: the external appenders rotate by **time**, the
+  requirement is by **size** (5 MiB, keep 3), and a dependency for rename
+  logic this small is not worth the surface. Non-TTY daemons tee tracing into
+  `.tazamun/logs/daemon.log`; interactive daemons and one-shot commands never
+  touch it.
+- systemd collision semantics: a service `start` against an already-running
+  manual daemon exits with the clean "already running" error; the unit bounds
+  flapping with `StartLimitBurst=3` per 60 s rather than treating
+  already-running as success (which would leave systemd claiming an active
+  service it does not own).
+
 ### Test-count baseline reconciliation (P3 "102" vs P4 baseline "98")
 
 The P3 closing report stated "102 tests passing"; the P4 section then used 98
