@@ -55,10 +55,11 @@ fn extended_form(s: &str) -> Option<String> {
         return Some(format!(r"\\?\{backslashed}"));
     }
     // UNC: `\\server\share\…` → `\\?\UNC\server\share\…`.
-    if let Some(rest) = backslashed.strip_prefix(r"\\") {
-        if !rest.is_empty() && !rest.starts_with('\\') {
-            return Some(format!(r"\\?\UNC\{rest}"));
-        }
+    if let Some(rest) = backslashed.strip_prefix(r"\\")
+        && !rest.is_empty()
+        && !rest.starts_with('\\')
+    {
+        return Some(format!(r"\\?\UNC\{rest}"));
     }
     // Relative or non-Windows-style (e.g. `/tmp/x`): no conversion.
     None
