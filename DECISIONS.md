@@ -94,6 +94,22 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Phase 3 — sovereignty (self-hosted relay, LAN, airgap)
+
+- **One authorized history rewrite (Phase 3, step 0).** Two operator web-edit
+  commits carried off-policy identities — `1b9553b` as `cc1a2b
+  <cc1a2bb@gmail.com>`, and a later one as `Hussain Alsharman
+  <101569980+cc1a2b@users.noreply.github.com>` (name variant). With the
+  operator's explicit authorization, `git-filter-repo --mailmap` folded both
+  into the single canonical identity `cc1a2b
+  <101569980+cc1a2b@users.noreply.github.com>`; `main` was force-pushed and the
+  merged phase branches were deleted from the remote. `git log --all
+  --format='%an %ae %cn %ce' | sort -u` now yields exactly one line, and the
+  clean-repo gates pass over the rewritten history. **Consequence:** every
+  commit SHA quoted in the Phase 0–2 closing reports is pre-rewrite and now
+  historical; the equivalent post-rewrite commits carry the same messages and
+  content under new SHAs.
+
 ## Phase 2 — connection health & observability
 
 - **Test harness retries explicitly-transient lock states.** The 32 MiB delta

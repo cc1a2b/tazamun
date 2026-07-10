@@ -30,6 +30,8 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [ ] `cargo-fuzz` targets (frame decoder, ticket parser, manifest parser)
   - [ ] Handshake replay tests
   - [ ] Threat model document
-- [ ] **P7 — Mobile companion**
-  - [ ] FFI bindings from the lib crate (Swift / Kotlin, mirroring iroh's own
-        binding path)
+- [ ] **P7 — User surface**
+  - [ ] Local web dashboard served by the daemon: live members & health from
+        the `status` JSON schema-1 contract, file & lock table with one-click
+        lock/unlock, conflicts browser, version history + restore, invite QR
+  - [ ] CLI polish: shell completions, man page
