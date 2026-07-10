@@ -238,11 +238,12 @@ Commands:
   init                 Initialize this folder as a new sync session and print an invite
   join   <TICKET>      Join an existing session from an invite ticket
   start                Run the sync daemon in the foreground
-  config <show|set>    Show or change persisted per-session network preferences
+  config <show|set>    Show or change persisted per-session preferences
   status               Show members, connections (Direct/Relayed/via LAN + RTT), leases, pulls
   invite               Print a fresh invite ticket carrying live addresses
   doctor               One-shot NAT & environment health report
-  lock   <PATH>        Acquire an exclusive lease and make the file writable
+  locks                List active leases: holder, age, expiry countdown
+  lock   <PATH> [--wait]   Acquire an exclusive lease and make the file writable
   unlock <PATH>        Publish pending edits and release the lease
   versions <PATH>      List kept historical versions of a path
   restore  <PATH> <N>  Restore version N of a path (requires a held lease)
@@ -515,6 +516,82 @@ tazamun config set airgap on           # or persist it
 `tazamun doctor` reports `mode: airgap` with an empty relay status so you can
 confirm the closed-network guarantee at a glance. Airgap forces relays off and
 LAN on regardless of the other flags, so a single option is all you need.
+
+</details>
+
+<details>
+<summary><b>Configuration reference (<code>tazamun config</code>)</b></summary>
+
+Every session stores its preferences in `state.json`. `tazamun config show`
+prints the effective (clamped) values; `tazamun config set <key> <value>`
+changes one and applies it on the next `start`.
+
+| Key | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `relay` | `default` · `none` · an `https://…` URL | `default` | Relay policy (public relays, none, or your own). |
+| `lan` | `on` · `off` | `on` | LAN mDNS discovery. |
+| `airgap` | `on` · `off` | `off` | Closed network: no relays, no external discovery. |
+| `lease-ttl` | duration `10s`–`24h` | `90s` | How long a lease you take lasts before it must renew. |
+| `acquire-timeout` | duration `2s`–`60s` | `8s` | How long a lock request waits for every peer to answer. |
+| `autolock` | `on` · `off` | `off` | Auto-lock-on-first-write (see below). |
+| `wait-timeout` | duration | `10m` | How long `lock --wait` keeps waiting. |
+
+Durations use humantime forms (`90s`, `15m`, `2h`). Out-of-range values are
+clamped with a note. **`lease-ttl` is lease-scoped**: the value *you* set rides
+the wire and governs the leases *you* take, so peers can run different TTLs
+without disagreeing — a receiver honors the holder's TTL (clamped to
+`[10s, 24h]` defensively). The renew interval is always `ttl/3`, derived.
+
+```bash
+tazamun config show
+tazamun config set lease-ttl 15m
+tazamun config set autolock on
+```
+
+</details>
+
+<details>
+<summary><b>Autolock (auto-lock-on-first-write)</b></summary>
+
+Off by default. With `tazamun config set autolock on`, editing an un-leased
+file **tries to take the lease for you** instead of rejecting the edit:
+
+1. Your bytes are copied to `conflicts/` first — always, before anything else.
+2. The normal three-precondition acquire runs (reachability, freshness, no
+   active lease).
+3. **On success** the edit publishes and the lease is held with a 60-second
+   idle timer (each further edit resets it, then it auto-releases).
+4. **On failure** (a peer holds it, you're offline, or you're not fresh) the
+   file reverts to the synced version read-only and you get an
+   `autolock could not acquire: <precondition>` note — your bytes are safe in
+   `conflicts/`.
+
+**Honest tradeoffs.** Autolock trades explicitness for convenience: two people
+editing the same file at the same moment still resolve to exactly one winner —
+the other's edit becomes a **quarantine**, never a silent overwrite. It does
+**not** relax strict mode: with zero connected peers every edit is still
+refused (there is no one to coordinate with). Leave it off if you prefer to
+lock deliberately; turn it on for solo-ish workflows where locking is friction.
+
+</details>
+
+<details>
+<summary><b>Waiting for a busy file (<code>lock --wait</code>)</b></summary>
+
+If a path is already held, `tazamun lock <path> --wait` registers your interest
+and auto-acquires the moment it frees (or when the holder's lease expires),
+then rings the terminal bell:
+
+```bash
+tazamun lock report.md --wait
+# … report.md is held by 7cff24643f; waiting (auto-acquires when free, Ctrl-C to stop)
+```
+
+The holder — and anyone running `tazamun status` / `tazamun locks` — sees you
+listed as a waiter. **First-come is not guaranteed:** if several nodes wait,
+the winner is decided by the same deterministic `(lamport, id)` rule as any
+lock race, not by who asked first. Waiting gives up after `wait-timeout`
+(default 10m).
 
 </details>
 

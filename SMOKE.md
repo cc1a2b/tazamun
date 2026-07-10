@@ -380,3 +380,130 @@ automated `relayed_sample_surfaces_conn_and_hostname` unit test asserts over the
 telemetry pipeline). This is the standard two-network setup from the *Internet
 Acceptance Checklist*, pinned to a self-hosted relay. It is a manual step
 because a single host cannot force the relay path — see `DECISIONS.md`.
+
+---
+
+# P4 addendum — lease ergonomics (autolock race, waitlist handoff)
+
+Two scenarios driven by the Phase 4 release binary (scripts under
+`~/tazamun-smoke-p4/`). Transcripts are verbatim (peer ids abbreviated); every
+assertion passed.
+
+## Autolock race — one winner, the loser's bytes preserved
+
+Both nodes turn autolock on and force-write the same un-leased file at the same
+moment. Exactly one edit is published; the other is quarantined — never
+silently overwritten.
+
+```text
+=== STEP 1 — A: genesis race.txt, autolock on, start ===
+PASS: A up with autolock, live ticket minted
+=== STEP 2 — B: join, autolock on, start; sync the base ===
+PASS: B synced the base version
+=== STEP 3 — both force-write race.txt at once (un-leased) ===
+PASS: both nodes force-wrote an un-leased edit
+=== STEP 4 — converge to ONE winner on both nodes ===
+PASS: both nodes converged to a single winner: 'from-A'
+=== STEP 5 — the loser's bytes are preserved in quarantine ===
+  A conflicts: 1   B conflicts: 1
+  quarantined: 20260710T134343730Z__race.txt = 'from-A'
+  quarantined: 20260710T134343737Z__race.txt = 'from-B'
+PASS: the losing write is quarantined (nothing silently overwritten)
+=== RESULT ===
+AUTOLOCK RACE SMOKE PASSED (winner='from-A')
+```
+
+Both nodes converge to `from-A`, and **both written variants remain
+recoverable**: the winner on disk, and each node's own pre-edit bytes in
+`conflicts/` (`from-A` on A, `from-B` on B). This exercised — and the fix for —
+a real Golden-Invariant gap the smoke surfaced: a remote apply used to overwrite
+the on-disk file without checking for an un-indexed local edit, so in the tight
+simultaneous-write race the loser's bytes could be lost (their watcher event was
+swallowed by the apply's mute). Since a synced file is read-only, `apply_remote`
+now treats a *writable* file as an un-leased edit and quarantines it before
+applying the incoming version.
+
+## Waitlist handoff — A holds, B waits, B auto-acquires
+
+```text
+=== STEP 2 — A takes the lease ===
+PASS: A holds the lease
+=== STEP 3 — B waits for it (lock --wait, backgrounded) ===
+PASS: B is waiting: … report.md is held by 341bbdc079; waiting (auto-acquires when free, Ctrl-C to stop)
+=== STEP 4 — the holder lists B as a waiter ===
+  A sees "waiters":["5cd638ad34975362f041d1249a85c6d82dee9cf4c93b4b21ac70f0c6db83abec"]
+PASS: holder lists B as a waiter
+=== STEP 5 — A unlocks; B auto-acquires ===
+PASS: B's --wait resolved (auto-acquired)
+PASS: B acquired: ✔ report.md is now writable (lease TTL 90s, auto-renewed)
+=== RESULT ===
+WAITLIST HANDOFF SMOKE PASSED
+```
+
+`tazamun lock report.md --wait` registered B's interest (the holder listed it as
+a `waiter` in `status --json`), and the moment A unlocked, B's waiting client
+re-attempted the acquire and won it — `report.md` became writable on B with the
+holder's own 90s TTL.
+
+## TTL consistency — the holder's 15m TTL honored by a 90s-config peer
+
+```text
+=== STEP 1 — A: lease-ttl 15m; B: default 90s ===
+--- A config show (excerpt) ---
+  lease-ttl       : 15m (renew every 5m)
+  acquire-timeout : 8s
+--- B config show (excerpt) ---
+  lease-ttl       : 1m 30s (renew every 30s)
+  acquire-timeout : 8s
+PASS: B synced
+=== STEP 2 — A locks doc.bin with its 15m TTL ===
+✔ doc.bin is now writable (lease TTL 900s, auto-renewed)
+=== STEP 3 — B (90s config) honors the holder's 15m lease ===
+--- B: tazamun locks ---
+active leases (1):
+  doc.bin  held by 7d39bde1ed  age 0s  expires in 14m 59s
+PASS: B shows expiry ≈ 14m — the holder's 15m TTL, not B's 90s default
+=== RESULT ===
+TTL CONSISTENCY SMOKE PASSED
+```
+
+Two nodes with different `lease-ttl` configs agree on the lease: TTL is
+lease-scoped and rides the wire, so B reports A's 15-minute lease even though
+B's own config would only ever mint 90-second leases.
+
+## Autolock race on WINDOWS — native NTFS attribute + rename-over semantics
+
+The same race re-run with the **Windows release binary** on NTFS (`E:\`), both
+force-writes performed Windows-natively (clear `IsReadOnly`, write). This is
+the loser-node proof of the `apply_remote` preserve-first fix under Windows
+semantics:
+
+```text
+=== STEP 1 — A (Windows/NTFS): genesis race.txt, autolock on, start ===
+PASS: A daemon answering on its named pipe
+PASS: live ticket minted
+=== STEP 2 — B: join, autolock on, start; sync the base ===
+PASS: B synced the base version
+PASS: read-only attribute set on both copies (pre-race)
+=== STEP 3 — force-write both at once (clear attr + write, Windows-native) ===
+PASS: both nodes force-wrote an un-leased edit (back-to-back, inside the debounce)
+=== STEP 4 — converge to ONE winner on both nodes ===
+PASS: both nodes converged to a single winner: 'from-A'
+  winner node: A   loser node: B (its bytes: 'from-B')
+=== STEP 5 — LOSER node (B): winner bytes on disk, read-only attr back, bytes preserved ===
+PASS: loser's race.txt now carries the winner's bytes
+PASS: Windows read-only attribute re-applied on the loser (IsReadOnly=True)
+  ----- loser's conflicts/ -----
+  20260710T164347315Z__race.txt = 'from-B'
+PASS: loser's own bytes ('from-B') preserved in quarantine — never silently overwritten
+=== STEP 6 — winner node still holds via autolock (idle timer running) ===
+active leases (1):
+  race.txt  held by you  age 1s  expires in 1m 28s
+=== RESULT ===
+WINDOWS AUTOLOCK RACE SMOKE PASSED (winner='from-A', loser=B preserved)
+```
+
+The pre-race attribute check (`STEP 2`) is itself the live verification of the
+genesis read-only fix this smoke originally caught: the importer's copy now
+carries the read-only attribute the moment its genesis publish lands, on
+Windows exactly as on Linux.

@@ -19,10 +19,10 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [x] Self-hosted relay kit (one-command docker compose + auto TLS)
   - [x] LAN mDNS discovery on by default (secured, `via LAN` status tag)
   - [x] Airgap / closed-network mode + persistent per-session net config
-- [ ] **P4 — Lease ergonomics**
-  - [ ] Opt-in auto-lock-on-first-write
-  - [ ] Lock waitlist notifications
-  - [ ] Configurable TTL
+- [x] **P4 — Lease ergonomics**
+  - [x] Opt-in auto-lock-on-first-write (preserve-first; 60s idle auto-release)
+  - [x] Lock waitlist notifications (`lock --wait`, LockInterest/LockFreed)
+  - [x] Configurable TTL (lease-scoped on the wire; `locks` command; humantime config)
 - [ ] **P5 — Windows & service**
   - [ ] Windows hardening (long paths, read-only attribute edges)
   - [ ] Background service (systemd / launchd / Task Scheduler)

@@ -77,10 +77,20 @@ impl TestNode {
 
     /// Starts a daemon with a specific [`NetConfig`] (relay/airgap tests).
     pub async fn start_with(dir: tempfile::TempDir, net: NetConfig) -> TestNode {
+        Self::start_with_timings(dir, net, test_timings()).await
+    }
+
+    /// Starts a daemon with explicit lease timings (lease-ergonomics tests that
+    /// need a long TTL or a specific acquire window).
+    pub async fn start_with_timings(
+        dir: tempfile::TempDir,
+        net: NetConfig,
+        timings: LockTimings,
+    ) -> TestNode {
         let handle = spawn(DaemonConfig {
             dir: dir.path().to_path_buf(),
             net,
-            timings: test_timings(),
+            timings,
             ui: tazamun::ui::progress::Ui::disabled(),
         })
         .await
@@ -219,6 +229,49 @@ impl TestNode {
         std::fs::read(self.abs(rel)).ok()
     }
 
+    /// Force a write to a possibly read-only synced file — an un-leased edit,
+    /// as if a user bypassed the lease. Clears the read-only bit first so the
+    /// OS permits the write; the watcher then sees a real change.
+    pub fn force_write(&self, rel: &str, data: &[u8]) {
+        let p = self.abs(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        if let Ok(meta) = std::fs::metadata(&p) {
+            let mut perms = meta.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o644);
+            }
+            #[cfg(not(unix))]
+            {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+            }
+            let _ = std::fs::set_permissions(&p, perms);
+        }
+        std::fs::write(&p, data).expect("force write");
+    }
+
+    /// Count quarantine copies preserved under `.tazamun/conflicts/`.
+    pub fn conflict_count(&self) -> usize {
+        std::fs::read_dir(self.dir.path().join(".tazamun").join("conflicts"))
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    /// The bytes of every quarantine copy under `.tazamun/conflicts/`.
+    pub fn conflict_contents(&self) -> Vec<Vec<u8>> {
+        std::fs::read_dir(self.dir.path().join(".tazamun").join("conflicts"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| std::fs::read(e.path()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn delete_file(&self, rel: &str) {
         std::fs::remove_file(self.abs(rel)).expect("remove");
     }
@@ -235,6 +288,14 @@ impl TestNode {
 }
 
 /// Total byte size of every file under `path`, recursively.
+/// Enables (or disables) autolock in a session folder's persisted config
+/// before its daemon starts (the daemon reads config at spawn).
+pub fn set_autolock(dir: &Path, on: bool) {
+    let mut st = tazamun::state::AppState::load(dir).expect("load state");
+    st.config.autolock = on;
+    st.save(dir).expect("save state");
+}
+
 pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = std::fs::read_dir(path) {

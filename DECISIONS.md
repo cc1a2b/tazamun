@@ -127,15 +127,132 @@ file whenever a dependency is added or a load-bearing design decision is made.
   a regression. Feature work proceeds in parallel, gated locally by the three
   gates.
 
-<!-- P4.0d verification (filled once runners are Idle):
-     light push run: <url> <wall-time>
-     full PR run (linux): <url> <wall-time>   (windows): <url> <wall-time> -->
+**P4.0d verification (cold caches, first real runs):**
 
-### Configurable lease timings
+- light push run: <https://github.com/cc1a2b/tazamun/actions/runs/29106866337>
+  — `light (self-hosted linux)` **8m10s** (6m56s warm on the next push).
+- full PR run: <https://github.com/cc1a2b/tazamun/actions/runs/29106869168>
+  — `full (linux)` **5m34s** vs 20m47s hosted (3.7×); `full (windows)`
+  **10m22s** vs 46m21s hosted (**4.5×**). The P3 PR burned ~77 hosted minutes;
+  the same shape now burns **0**.
+- PR #4 itself served as the "throwaway PR" verification. macOS: not
+  dispatched — P4 changes daemon-level publish/apply orchestration but no
+  watcher/guard/path/IPC platform code (`guard.rs`/`watcher.rs` untouched), so
+  per the CI policy no `macos-full` run was required; P5 will require one.
 
-### Autolock (auto-lock-on-first-write)
+**Runner registration (operational judgment call):** registration was reported
+complete ("both Idle"), but the repo API showed `total_count: 0`, no
+`Runner.Listener` existed in WSL or Windows, and the queued jobs had starved
+for 2h+ — the runners had evidently been registered elsewhere (or not at all).
+Rather than stall the phase, both runners were registered autonomously using
+API-minted registration tokens (`POST …/actions/runners/registration-token`):
+`wsl2-linux` under `~/actions-runner-linux` and `host-windows` under
+`C:\actions-runner-win` (rustup + stable-msvc + rustfmt/clippy installed on the
+host; VS Build Tools were already present). Both currently run as **user
+processes**, not services — reboot persistence still needs the one-time
+elevated step on each side (`sudo ./svc.sh install && sudo ./svc.sh start` in
+WSL; `.\config.cmd remove` + re-`config` with `--runasservice` from an admin
+shell on Windows).
 
-### Lock waitlist
+**What the first cold self-hosted runs caught (all fixed at the root):**
+
+- `clippy::field_reassign_with_default` in a new P4 unit test — the warm local
+  cache had skipped re-linting the module; the runner's cold pass is the truth.
+- **Genesis importer's copy stayed writable** (pre-existing since P0, both
+  OSes): `on_publish_done` never applied read-only for `PublishCause::Import`,
+  so the importer's own genesis file lacked the strict-checkout guard-rail
+  until the next restart's `enforce_all`. Caught by the Windows race smoke's
+  pre-race attribute check, reproduced on Linux with a regression test, fixed
+  by applying read-only when an Import publish lands.
+- `telemetry_snapshot_after_mesh_is_direct_and_sane` asserted `Good` on the
+  *first* Direct sample; on a multi-homed host (Ethernet + WSL vSwitch) QUIC
+  legitimately migrates the selected path a few times during establishment, so
+  the first minute can grade `Poor` before the flaps age out of the sliding
+  window. Product grading is unchanged (flap-counting is by design); the test
+  now asserts the **settled** steady state, which a genuinely degraded link
+  never reaches.
+
+**Windows race smoke (native NTFS semantics):** the autolock race re-run with
+the Windows release binary on `E:\` proved the `apply_remote` preserve-first
+fix under Windows semantics — read-only **attribute** cleared by the un-leased
+write, winner's bytes rename-overed in, `IsReadOnly=True` re-applied on the
+loser, and the loser's own bytes preserved in `conflicts/`. Transcript in
+`SMOKE.md` (P4 addendum).
+
+### Configurable lease timings (consensus-safe)
+
+- Per-session `state.json` config: `lease_ttl_ms` (default 90s, clamped
+  `[10s, 24h]`), `acquire_timeout_ms` (default 8s, clamped `[2s, 60s]`),
+  `wait_timeout_ms` (default 10m). The renew interval is **derived** as `ttl/3`,
+  never configured directly, so a holder always renews well before expiry.
+- **Consistency rule (the subtle part):** TTL is **lease-scoped**, not global.
+  The holder's configured TTL rides the wire (`ttl_ms` in
+  `LockReq`/`LockRenew`, `expires_in_ms` in `Index` leases) and governs each
+  lease; a receiver honors the wire value, clamped defensively to the absolute
+  `[MIN_LEASE_TTL, MAX_LEASE_TTL]` range (`locks::ttl_from_ms`). This replaced
+  the old "cap at 10× local TTL" rule, which made a receiver's clamp depend on
+  its own config — nodes with different configs could then disagree on an
+  effective TTL. With an absolute clamp, **nodes may run different configs
+  without protocol divergence**, and a hostile `ttl_ms = 0` or a huge value is
+  bounded identically on every node.
+- `humantime = "2.3"` (new client dep — justified: parses `90s`/`15m`/`2h` for
+  `config set` and formats effective values for `config show`; tiny, no
+  proc-macros, no transitive surface of note).
+- `tazamun locks` lists active leases (holder, age, expiry countdown) from the
+  **same** `status` IPC snapshot, so the two never disagree. Lease `age` needed
+  a locally-observed acquire instant, so `LockState::Held` gained a `since`
+  field (preserved across same-holder renewals, reset on a holder change).
+
+### Autolock (auto-lock-on-first-write, opt-in)
+
+- `config autolock on` (default **off**). On a watcher write to an *un-leased,
+  free* path: (1) the un-leased bytes are preserved in `conflicts/` first
+  (async, off the actor — Golden Invariant even if the acquire fails), then (2)
+  the **standard** three-precondition acquire runs. On success the edited bytes
+  (already on disk) are published and the lease is kept with a 60s idle-release
+  timer (each write resets it); on any precondition failure the normal violation
+  path completes (indexed version restored read-only / new file removed) with an
+  `autolock could not acquire: <precondition>` hint — the bytes stay safe in
+  `conflicts/`.
+- **Invariant:** a losing simultaneous write on two nodes never silently
+  overwrites — exactly one node ends holding+published, the other ends
+  quarantined+restored+diagnosed. Convenience never outranks the Golden
+  Invariant. A path held by another node, or an un-leased *delete*, is never
+  autolocked (normal violation path).
+- Autolock reuses the existing acquire machinery with a throwaway reply channel
+  (`autolock_pending` tracks the in-flight acquire; the grant/deny/timeout/sweep
+  handlers finish it), so there is no second lease code path to keep in sync.
+
+### Apply-remote preserves un-leased local edits (Golden-Invariant fix)
+
+The autolock-race SMOKE surfaced a real gap: `apply_remote` swapped in an
+incoming version without checking the on-disk file, so in a tight
+simultaneous-write race the loser's un-leased bytes could be **silently
+overwritten** — their watcher event was swallowed by the apply's own mute before
+the violation/autolock path could quarantine them. Fix: because a synced file is
+read-only (0444), a **writable** file on disk is an un-leased local edit, so
+`apply_remote` now quarantines it (preserve-first) before overwriting or
+deleting. Cheap (a permissions check on the steady-state read-only fast path),
+precise, and it makes the autolock race honor the invariant — verified by the
+integration test asserting *both* written variants stay recoverable and by the
+SMOKE (`from-B` preserved on the loser).
+
+### Lock waitlist & notifications
+
+- Wire minor bumped to `PROTOCOL_MINOR = 2`: `LockInterest` and `LockFreed`
+  appended **after `Bye`** so every prior variant keeps its postcard
+  discriminant (append-only compat). The `CTL_ALPN` major stays `/1`; within the
+  v0.1 dev line all nodes share one build, so an older node never receives a
+  newer variant.
+- `tazamun lock --wait` (or a TTY prompt) registers interest via a `LockWait`
+  IPC: the daemon records the wait, tells the holder with `LockInterest`, and
+  shows the waiter in `status`/`locks`. On release/expiry the freeing node
+  broadcasts `LockFreed`; the waiting CLI re-attempts the **full** acquire
+  (preconditions re-checked fresh each round), so **first-come is not
+  guaranteed** — ties resolve by the existing `(lamport, id)` rule. The retry is
+  a bounded 2s poll ceiling fast-forwarded by `LockFreed`; entries expire after
+  `wait_timeout` (default 10m) with a clear message. Waiting emits a terminal
+  bell + line on acquire and a daemon log/event on each transition.
 
 ## Phase 3 — sovereignty (self-hosted relay, LAN, airgap)
 

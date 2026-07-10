@@ -31,6 +31,16 @@ and pending pulls complete before any lease can be granted (freshness enforces
 this). Competing requests resolve on the total order `(lamport, endpoint-id)` —
 every node computes the same winner.
 
+**Lease-TTL consistency (nodes may run different configs):** the lease TTL is
+**lease-scoped, never global**. The holder's configured TTL travels on the wire
+(`ttl_ms` in `LockReq`/`LockRenew`, `expires_in_ms` in `Index` leases) and
+governs each lease; a receiver honors the wire value, clamped defensively to the
+absolute `[MIN_LEASE_TTL, MAX_LEASE_TTL]` band in `locks::ttl_from_ms`. Because
+the clamp is absolute — not relative to the receiver's own config — two nodes
+with different `lease-ttl` settings never disagree about a lease's lifetime, and
+a hostile `ttl_ms = 0` or an enormous value is bounded identically everywhere.
+Do **not** reintroduce any TTL rule that depends on the *receiver's* config.
+
 ## Module map
 
 | File | Invariant it owns |
@@ -43,7 +53,7 @@ every node computes the same winner.
 | `src/sync/index.rs` | `sanitize_rel_path` (the only untrusted-path gate) + `diff` (no I/O) |
 | `src/sync/chunker.rs` | FastCDC — deterministic cut function; parallel hash pipeline (`chunk_file`) |
 | `src/sync/transfer.rs` | iroh-blobs store; publish / pull-stage / materialize / GC-protect |
-| `src/locks.rs` | pure lease state machine (injected clock, zero I/O) + orchestration types |
+| `src/locks.rs` | pure lease state machine (injected clock, zero I/O); lease-scoped TTL clamp (`ttl_from_ms`), `since`/age tracking |
 | `src/guard.rs` | read-only enforcement + quarantine (never deletes) |
 | `src/versions.rs` | history push/list/entry over `AppState` |
 | `src/watcher.rs` | debounced FS events, ignores `.tazamun`, mute set for own writes |
@@ -54,7 +64,7 @@ every node computes the same winner.
 | `src/doctor.rs` | `doctor` sections + verdicts; injectable mount classifier (zero state I/O) |
 | `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
 | `src/ipc.rs` | local socket / named pipe, one JSON line per request |
-| `src/daemon.rs` | the single state-owning actor; **all** mutation happens here |
+| `src/daemon.rs` | the single state-owning actor; **all** mutation happens here; autolock flow + waitlist (`my_waits`/`interest`) live here |
 | `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config` command, flag→config→default precedence |
 | `deploy/relay/` | self-contained self-hosted iroh-relay kit (Docker Compose + ACME TLS); not part of the crate build |
 
