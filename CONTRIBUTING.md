@@ -36,7 +36,7 @@ every node computes the same winner.
 | File | Invariant it owns |
 | --- | --- |
 | `src/lib.rs` | `consts` — every tuning constant lives here |
-| `src/state.rs` | atomic `state.json` persistence; `RelPath` newtype; 0600/0700 modes |
+| `src/state.rs` | atomic `state.json` persistence; `RelPath` newtype; 0600/0700 modes; `SessionConfig` (relay/lan/airgap) with defaulting in-place upgrade |
 | `src/session.rs` | HKDF key derivation, `tzm1…` ticket encode/decode; zeroize-on-drop |
 | `src/proto.rs` | control framing (`u32` len + postcard, reject 0 / > 4 MiB) + `Msg` |
 | `src/sync/vclock.rs` | pure version-vector algebra (no I/O) |
@@ -47,7 +47,7 @@ every node computes the same winner.
 | `src/guard.rs` | read-only enforcement + quarantine (never deletes) |
 | `src/versions.rs` | history push/list/entry over `AppState` |
 | `src/watcher.rs` | debounced FS events, ignores `.tazamun`, mute set for own writes |
-| `src/net/endpoint.rs` | iroh Endpoint build (N0 preset default) + `path_info` |
+| `src/net/endpoint.rs` | iroh Endpoint build (N0 default; Minimal for airgap/relay-test) + `RelayChoice` + pure `relay_mode_for` + LAN mDNS + `is_lan_addr` + `path_info` |
 | `src/net/control.rs` | mutual proof-of-secret handshake + `PeerHandle` reader/writer |
 | `src/net/membership.rs` | encrypted presence gossip + mesh dialer |
 | `src/net/telemetry.rs` | pure per-peer health sampling + grade function (zero I/O) |
@@ -55,7 +55,8 @@ every node computes the same winner.
 | `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
 | `src/ipc.rs` | local socket / named pipe, one JSON line per request |
 | `src/daemon.rs` | the single state-owning actor; **all** mutation happens here |
-| `src/cli.rs` / `src/main.rs` | clap surface + thin binary |
+| `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config` command, flag→config→default precedence |
+| `deploy/relay/` | self-contained self-hosted iroh-relay kit (Docker Compose + ACME TLS); not part of the crate build |
 
 **Architecture rule:** `AppState`, `LockTable`, and the member table are only
 ever mutated inside the daemon actor task (message passing, no shared-state

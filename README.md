@@ -106,8 +106,11 @@ members (2):
   (never deleted) and the indexed version is restored, with a loud warning.
 - **Self-healing membership:** a full mesh of authenticated control
   connections with exponential-backoff redial.
-- **Self-hostable or serverless:** bring your own relay with `--relay`, or run
-  fully relay-free on a LAN with `--no-relay --lan`.
+- **Sovereign by choice:** bring your own relay with `--relay` (a one-command
+  Docker relay ships in [`deploy/relay/`](deploy/relay)), find same-LAN members
+  over mDNS with no external network, or run fully closed with `--airgap` — no
+  relays and no external discovery of any kind. Every preference persists per
+  session via `tazamun config`.
 
 </details>
 
@@ -183,10 +186,18 @@ tazamun join tzm1qy…
 tazamun start
 
 # Run relay-free on a local network with mDNS discovery
-tazamun start --no-relay --lan
+tazamun start --no-relay
 
 # Route through your own self-hosted relay instead of the public ones
 tazamun start --relay https://relay.example.com
+
+# Fully closed network: no relays, no external discovery — LAN only
+tazamun start --airgap
+
+# Persist network preferences (applied on the next start)
+tazamun config show
+tazamun config set relay https://relay.example.com
+tazamun config set airgap on
 
 # See who is connected, how (Direct/Relayed), and what is locked
 tazamun status
@@ -226,24 +237,34 @@ Usage: tazamun [OPTIONS] <COMMAND>
 Commands:
   init                 Initialize this folder as a new sync session and print an invite
   join   <TICKET>      Join an existing session from an invite ticket
-  start  [--relay URL] [--no-relay] [--lan]
-                       Run the sync daemon in the foreground
-  status               Show members, connections (Direct/Relayed + RTT), leases, pulls
+  start                Run the sync daemon in the foreground
+  config <show|set>    Show or change persisted per-session network preferences
+  status               Show members, connections (Direct/Relayed/via LAN + RTT), leases, pulls
   invite               Print a fresh invite ticket carrying live addresses
+  doctor               One-shot NAT & environment health report
   lock   <PATH>        Acquire an exclusive lease and make the file writable
   unlock <PATH>        Publish pending edits and release the lease
   versions <PATH>      List kept historical versions of a path
   restore  <PATH> <N>  Restore version N of a path (requires a held lease)
-  gc                   Refresh the unreferenced-blob protection set
+  gc                   Delete unreferenced blobs from the local store
 
 Options:
       --dir <PATH>     Session folder (defaults to the current directory)
   -v, --verbose        Verbose logging (-v: debug; RUST_LOG is respected)
+      --relay <URL>    Use a self-hosted relay instead of the public ones (this run)
+      --no-relay       Disable relays entirely — LAN / manually routed setups
+      --no-lan         Disable LAN mDNS discovery (enabled by default)
+      --airgap         Closed-network mode: no relays, no external discovery at all
   -h, --help           Print help
   -V, --version        Print version
 
 Exit codes: 0 success · 1 runtime error · 2 usage error
 ```
+
+The four network options are **global** (they work on any subcommand). On
+`start` they override the persisted preferences for that run only; the durable
+setting lives in `state.json` and is managed with `tazamun config`. Precedence
+is always **flag → persisted config → default**.
 
 ---
 
@@ -427,25 +448,73 @@ internet round-trip (not just localhost):
 <details>
 <summary><b>Self-hosted relay</b></summary>
 
-Replace the public relay map with your own relay server:
+A relay never sees your file contents (everything on it is end-to-end
+encrypted) — it only forwards packets when two peers cannot hole-punch a direct
+path. Running your own keeps even that fallback traffic on infrastructure you
+control.
+
+**Stand one up.** [`deploy/relay/`](deploy/relay) is a complete, self-contained
+kit: point a DNS record at your host, set one variable, and bring up an HTTPS
+relay with automatic Let's Encrypt TLS:
 
 ```bash
-tazamun start --relay https://relay.mycompany.com
+cd deploy/relay
+cp .env.example .env          # set TZM_RELAY_DOMAIN=relay.mycompany.com
+docker compose up -d          # ACME provisions the cert on first request
 ```
 
-All peers in the session should use the same relay for the fallback path.
-Direct hole-punched connections still bypass it whenever possible.
+Open TCP **80** and **443** (ACME + relay) and UDP **7842** (QUIC address
+discovery). See [`deploy/relay/README.md`](deploy/relay/README.md) for the DNS
+and firewall checklist, resource footprint, and upgrade steps.
+
+**Point clients at it.** Every member of the session should use the same relay:
+
+```bash
+tazamun config set relay https://relay.mycompany.com   # persist it
+tazamun start                                          # …or --relay for one run
+```
+
+Direct hole-punched connections still bypass the relay whenever possible;
+`tazamun status` tags any peer still on the fallback path as **Relayed**, and
+`tazamun doctor` probes the configured relay for reachability.
 
 </details>
 
 <details>
-<summary><b>LAN-only / air-gapped</b></summary>
+<summary><b>Same-LAN discovery (mDNS)</b></summary>
 
-Disable relays and use local mDNS discovery — nothing leaves the local network:
+LAN discovery is **on by default**. Members on the same local network find each
+other over mDNS with no relay and no external lookup — a ticket carrying only
+the session secret is enough, no addresses required. The proof-of-secret
+handshake still applies, so only genuine session members are ever dialed.
+`tazamun status` tags a locally-reached peer **via LAN**.
+
+To run entirely relay-free on a trusted network (still using mDNS to meet):
 
 ```bash
-tazamun start --no-relay --lan
+tazamun start --no-relay
 ```
+
+Turn LAN discovery off with `--no-lan` (or `tazamun config set lan off`).
+
+</details>
+
+<details>
+<summary><b>Closed networks (airgap)</b></summary>
+
+`--airgap` is the sovereign extreme: **relays disabled, every form of external
+address discovery disabled, LAN discovery the only way peers meet.** The
+endpoint contacts nothing off the local network — suitable for airgapped labs,
+regulated environments, and offline events.
+
+```bash
+tazamun start --airgap                 # one run
+tazamun config set airgap on           # or persist it
+```
+
+`tazamun doctor` reports `mode: airgap` with an empty relay status so you can
+confirm the closed-network guarantee at a glance. Airgap forces relays off and
+LAN on regardless of the other flags, so a single option is all you need.
 
 </details>
 

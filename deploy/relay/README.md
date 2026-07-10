@@ -20,6 +20,28 @@ The relay compiles the `iroh-relay` binary, obtains a Let's Encrypt certificate
 automatically (built-in ACME — no reverse proxy), and starts serving. First
 start takes a few minutes to build and provision TLS.
 
+> **Skip the build.** To avoid compiling from source, point the compose
+> `image:` at the official prebuilt `n0computer/iroh-relay` (matched to the
+> `DECISIONS.md` pin) and drop the `build:` block — the config, ports, and ACME
+> setup are identical.
+
+## Local test drive (no domain, no TLS)
+
+To verify the client wiring before you provision a public host, run the same
+relay in localhost dev mode (plain HTTP, no certificate) and point one node at
+it:
+
+```bash
+docker run --rm --network host n0computer/iroh-relay --dev   # serves :3340
+tazamun config set relay http://localhost:3340
+tazamun start &                       # in the session folder
+tazamun doctor                        # relay section → home relay + "reachable"
+```
+
+`tazamun doctor` should report the relay as the home relay and the link
+reachable. (Two nodes on one host still connect **Direct** over loopback, so the
+`Relayed` peer path only appears across two real networks — see `SMOKE.md`.)
+
 ## DNS + open-ports checklist
 
 Before `docker compose up -d`:
