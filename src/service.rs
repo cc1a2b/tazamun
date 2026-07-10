@@ -62,7 +62,7 @@ pub fn systemd_unit(exe: &Path, dir: &Path) -> String {
          StartLimitBurst=3\n\
          \n\
          [Service]\n\
-         ExecStart=\"{exe}\" start --dir \"{dir}\"\n\
+         ExecStart=\"{exe}\" start --dir \"{dir}\" --log-file\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -158,6 +158,7 @@ pub fn launch_agent_plist(label: &str, exe: &Path, dir: &Path, logs: &Path) -> S
         <string>start</string>
         <string>--dir</string>
         <string>{dir}</string>
+        <string>--log-file</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -276,23 +277,66 @@ pub fn platform_status(dir: &Path) -> Result<String, ServiceError> {
 // elevation or stored password. The action goes through a hidden PowerShell
 // host — tradeoff: a brief hidden powershell.exe wrapper process exists purely
 // to suppress the console window a bare exe would flash at logon.
+//
+// The task is created with the `ScheduledTasks` PowerShell cmdlets, NOT
+// `schtasks.exe`: the latter's `/Create /SC ONLOGON` returns ERROR_ACCESS_DENIED
+// for a non-elevated user, while `Register-ScheduledTask -RunLevel Limited`
+// succeeds for the current user without elevation (verified on the target
+// machine). Values are passed as single-quoted PowerShell literals with
+// embedded quotes doubled, so a path can never break out of its string.
+
+/// Escapes a string for a single-quoted PowerShell literal.
+#[cfg(windows)]
+fn ps_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Runs a PowerShell script, returning stdout on success.
+#[cfg(windows)]
+fn powershell(script: &str) -> Result<String, ServiceError> {
+    run_ok(
+        Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]),
+        "powershell",
+    )
+}
 
 #[cfg(windows)]
 pub fn install(dir: &Path) -> Result<String, ServiceError> {
     let name = instance_name(dir);
     let abs = std::path::absolute(dir)?;
     let exe = current_exe()?;
-    let action = format!(
-        "powershell.exe -NoProfile -WindowStyle Hidden -Command \"& '{}' start --dir '{}'\"",
-        exe.display(),
-        abs.display()
+    let (exe_s, dir_s) = (exe.display().to_string(), abs.display().to_string());
+    // A single quote in either path would need a third escaping layer; reject
+    // it rather than risk a malformed task (Windows user paths never have one).
+    if exe_s.contains('\'') || dir_s.contains('\'') {
+        return Err(ServiceError::Failed(
+            "binary or folder path contains a single quote; unsupported for the service task"
+                .into(),
+        ));
+    }
+    // The action runs the exe through a hidden PowerShell host so no console
+    // window flashes at logon. The inner command single-quotes the exe/dir; the
+    // outer `ps_lit` doubles those quotes so the task stores them correctly.
+    let inner = format!("& '{exe_s}' start --dir '{dir_s}' --log-file");
+    let argument = format!("-NoProfile -WindowStyle Hidden -Command \"{inner}\"");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {arg}; \
+         $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; \
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); \
+         Register-ScheduledTask -TaskName {name} -Action $a -Trigger $t -Settings $s -RunLevel Limited -Force | Out-Null; \
+         'ok'",
+        arg = ps_lit(&argument),
+        name = ps_lit(&name),
     );
-    run_ok(
-        Command::new("schtasks").args([
-            "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", &name, "/TR", &action,
-        ]),
-        "schtasks /Create",
-    )?;
+    powershell(&script)?;
     Ok(format!(
         "installed Scheduled Task {name} (starts at logon; start now with: schtasks /Run /TN {name})"
     ))
@@ -301,32 +345,26 @@ pub fn install(dir: &Path) -> Result<String, ServiceError> {
 #[cfg(windows)]
 pub fn uninstall(dir: &Path) -> Result<String, ServiceError> {
     let name = instance_name(dir);
-    run_ok(
-        Command::new("schtasks").args(["/Delete", "/F", "/TN", &name]),
-        "schtasks /Delete",
-    )?;
+    let script = format!(
+        "Unregister-ScheduledTask -TaskName {name} -Confirm:$false -ErrorAction SilentlyContinue; 'ok'",
+        name = ps_lit(&name),
+    );
+    powershell(&script)?;
     Ok(format!("removed Scheduled Task {name}"))
 }
 
 #[cfg(windows)]
 pub fn platform_status(dir: &Path) -> Result<String, ServiceError> {
     let name = instance_name(dir);
-    let out = Command::new("schtasks")
-        .args(["/Query", "/TN", &name, "/FO", "LIST", "/V"])
-        .output()
-        .map_err(ServiceError::Io)?;
-    if !out.status.success() {
-        return Ok(format!("{name}: not installed"));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text
-        .lines()
-        .filter(|l| {
-            let l = l.trim_start();
-            l.starts_with("TaskName") || l.starts_with("Status") || l.starts_with("Last Run")
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+    let script = format!(
+        "$t = Get-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue; \
+         if (-not $t) {{ 'not installed' }} else {{ \
+           $i = $t | Get-ScheduledTaskInfo; \
+           \"state: $($t.State)\"; \"last run: $($i.LastRunTime)\"; \"last result: $($i.LastTaskResult)\" }}",
+        name = ps_lit(&name),
+    );
+    // Status is best-effort: a query failure still yields a useful line.
+    Ok(powershell(&script).unwrap_or_else(|e| format!("{name}: status query failed ({e})")))
 }
 
 // Unsupported platforms compile but explain themselves.
@@ -496,6 +534,7 @@ mod tests {
         <string>start</string>
         <string>--dir</string>
         <string>/Users/u/project</string>
+        <string>--log-file</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -518,7 +557,7 @@ mod tests {
     fn systemd_unit_contains_the_load_bearing_lines() {
         let unit = systemd_unit(Path::new("/opt/tazamun"), Path::new("/data/proj"));
         for needle in [
-            "ExecStart=\"/opt/tazamun\" start --dir \"/data/proj\"",
+            "ExecStart=\"/opt/tazamun\" start --dir \"/data/proj\" --log-file",
             "Restart=on-failure",
             "WantedBy=default.target",
             "StartLimitBurst=3",

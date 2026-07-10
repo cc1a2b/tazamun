@@ -64,7 +64,15 @@ pub enum Cmd {
     /// Run the sync daemon in the foreground. Network preferences come from
     /// `state.json`; the global `--relay/--no-relay/--no-lan/--airgap` flags
     /// override them for this run only.
-    Start,
+    Start {
+        /// Also write the rotated `.tazamun/logs/daemon.log` regardless of
+        /// whether stdout is a terminal. Set by `service install` so
+        /// unattended daemons log deterministically (a Windows Scheduled Task's
+        /// hidden host still hands the child a console, so TTY detection alone
+        /// is not enough). Hidden from the normal help.
+        #[arg(long, hide = true)]
+        log_file: bool,
+    },
     /// Show or change persisted per-session network preferences.
     Config {
         #[command(subcommand)]
@@ -169,7 +177,7 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
             persist_net_flags(&dir, &net)?;
             Ok(())
         }
-        Cmd::Start => start(&dir, &net, ui).await,
+        Cmd::Start { .. } => start(&dir, &net, ui).await,
         Cmd::Config { cmd } => handle_config_cli(&dir, cmd),
         Cmd::Status { watch, json } => handle_status_cli(&dir, watch, json).await,
         Cmd::Doctor { json } => handle_doctor_cli(&dir, json).await,

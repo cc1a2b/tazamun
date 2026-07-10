@@ -199,6 +199,19 @@ persistent, auto-starting form — with one deliberate deviation from the
   flapping with `StartLimitBurst=3` per 60 s rather than treating
   already-running as success (which would leave systemd claiming an active
   service it does not own).
+- **Two Windows bugs the SMOKE caught (both fixed):** (1) `schtasks.exe
+  /Create /SC ONLOGON` returns `ERROR_ACCESS_DENIED` for a non-elevated user,
+  so the Windows backend uses the `ScheduledTasks` PowerShell cmdlets
+  (`Register-/Unregister-/Get-ScheduledTask`, `-RunLevel Limited`) which
+  succeed unelevated for the current user — values passed as single-quoted PS
+  literals with a reject-if-quote guard on the exe/dir paths. (2) TTY detection
+  is not enough for service logging: a Scheduled Task's hidden PowerShell host
+  still hands the child a **console**, so `stdout().is_terminal()` is *true* and
+  the file log never opened. Fixed with an explicit hidden `--log-file` flag
+  that `service install` bakes into all three backends' start command; the
+  non-TTY heuristic stays as a fallback for systemd/launchd. Verified live on
+  Windows: install → task-run → daemon answers IPC → `daemon.log` written and
+  rotated (`daemon.log.1`) → uninstall removes the task.
 
 ### Test-count baseline reconciliation (P3 "102" vs P4 baseline "98")
 

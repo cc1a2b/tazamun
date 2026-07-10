@@ -67,18 +67,21 @@ fn main() {
     // Progress bars exist only for the foreground daemon; every other command
     // (and every non-TTY invocation) runs with presentation disabled.
     let ui = match &cli.cmd {
-        Cmd::Start => Ui::detect(),
+        Cmd::Start { .. } => Ui::detect(),
         _ => Ui::disabled(),
     };
-    // Service mode (a daemon with no terminal) also writes the rotated
-    // .tazamun/logs/daemon.log; interactive daemons and one-shot commands
-    // don't touch the log.
+    // A daemon writes the rotated .tazamun/logs/daemon.log when running
+    // unattended: either `service install` passed `--log-file` (deterministic,
+    // needed because a Windows Scheduled Task's hidden host still hands the
+    // child a console) or stdout is not a terminal (systemd/launchd). One-shot
+    // commands and interactive daemons never touch the log.
     let file_log = {
         use std::io::IsTerminal;
-        if matches!(&cli.cmd, Cmd::Start) && !std::io::stdout().is_terminal() {
-            RotatingLog::open(&cli.dir, LOG_ROTATE_BYTES, LOG_KEEP).ok()
-        } else {
-            None
+        match &cli.cmd {
+            Cmd::Start { log_file } if *log_file || !std::io::stdout().is_terminal() => {
+                RotatingLog::open(&cli.dir, LOG_ROTATE_BYTES, LOG_KEEP).ok()
+            }
+            _ => None,
         }
     };
     init_tracing(cli.verbose, &ui, file_log);
