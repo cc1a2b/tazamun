@@ -1446,21 +1446,20 @@ impl Actor {
         };
         let apply_result: Result<(), String> = (|| {
             if record.deleted {
+                // Ordering (Windows refuses to delete read-only files):
+                // clear read-only → delete-with-retry; NotFound is success.
                 let _ = guard::set_writable(&abs);
-                match std::fs::remove_file(&abs) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.to_string()),
-                }
+                crate::win_fs::remove_file(&abs).map_err(|e| e.to_string())?;
                 Ok(())
             } else {
                 let staged = staged.ok_or_else(|| "missing staged file".to_string())?;
                 if let Some(parent) = abs.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                // Windows cannot rename over a read-only file.
+                // Ordering: clear read-only (Windows cannot rename over a
+                // read-only file) → rename-over with retry → re-apply guard.
                 let _ = guard::set_writable(&abs);
-                staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+                crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
                 guard::set_readonly(&abs).map_err(|e| e.to_string())?;
                 drop(staged.tags);
                 Ok(())
@@ -1824,7 +1823,7 @@ impl Actor {
                         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                     }
                     let _ = guard::set_writable(&abs);
-                    staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+                    crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
                     guard::set_readonly(&abs).map_err(|e| e.to_string())?;
                     drop(staged.tags);
                     Ok(())
@@ -1863,9 +1862,10 @@ impl Actor {
             }
         };
         self.mute(rel);
-        if let Err(e) = std::fs::remove_file(&abs)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
+        // Ordering: clear a possible read-only attribute first (Windows
+        // refuses to delete read-only files), then delete with retry.
+        let _ = guard::set_writable(&abs);
+        if let Err(e) = crate::win_fs::remove_file(&abs) {
             warn!(path = %rel, "could not remove un-leased new file: {e}");
         }
         warn!(
@@ -2027,12 +2027,12 @@ impl Actor {
         }
         if new_file {
             // No indexed version to restore; the bytes are preserved, so drop
-            // the on-disk copy exactly as the new-file violation path does.
+            // the on-disk copy exactly as the new-file violation path does
+            // (clear read-only first, delete with retry).
             let abs = rel.to_fs_path(&self.dir);
             self.mute(rel);
-            if let Err(e) = std::fs::remove_file(&abs)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
+            let _ = guard::set_writable(&abs);
+            if let Err(e) = crate::win_fs::remove_file(&abs) {
                 warn!(path = %rel, "autolock: could not remove un-leased new file: {e}");
             }
             self.unbusy(rel);
@@ -2627,7 +2627,7 @@ impl Actor {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let _ = guard::set_writable(&abs);
-            staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+            crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
             // The path stays writable: the lease is still ours.
             drop(staged.tags);
             Ok(())

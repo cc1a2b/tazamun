@@ -64,6 +64,125 @@ fn extended_form(s: &str) -> Option<String> {
     None
 }
 
+// ── Windows file-op resilience ──────────────────────────────────────────────
+//
+// Antivirus scanners, indexers, and editors briefly hold handles on files we
+// rename over, delete, or re-attribute. Windows surfaces that as
+// ERROR_SHARING_VIOLATION (32) — or ERROR_ACCESS_DENIED (5) in the
+// set-attributes race — where Unix would just succeed. Every such op goes
+// through a bounded exponential retry: 6 attempts, 50 ms → 1.6 s doubling with
+// ±20% deterministic-jitter, ≤ 3.5 s worst-case total, `debug!` per retry, the
+// original error surfaced on final failure. On non-Windows the wrappers are
+// zero-retry pass-throughs.
+//
+// Ordering rule for read-only files (Windows refuses to delete or rename over
+// a file with the read-only attribute): **clear read-only → mutate → re-apply
+// read-only when the survivor should be guarded.** Every delete/rename-over
+// site follows it.
+
+use std::time::Duration;
+
+/// Max attempts for a retryable Windows file op (initial try + 5 retries).
+pub const RETRY_ATTEMPTS: u32 = 6;
+
+/// Deterministically jittered exponential backoff before retry `attempt`
+/// (1-based: the wait after the attempt-th failure). 50 ms → 1.6 s doubling,
+/// ±20% jitter derived from the attempt number, ≤ 3.5 s summed.
+pub fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 50u64 << (attempt.saturating_sub(1)).min(5);
+    // ±20% jitter without an RNG: spread by attempt parity/step so concurrent
+    // retriers de-synchronize while the total stays provably bounded.
+    let jitter = base_ms / 5;
+    let ms = match attempt % 3 {
+        0 => base_ms - jitter,
+        1 => base_ms + jitter,
+        _ => base_ms,
+    };
+    Duration::from_millis(ms)
+}
+
+/// Whether a raw OS error code is worth retrying on Windows.
+/// 32 = ERROR_SHARING_VIOLATION (another process holds the file);
+/// 5 = ERROR_ACCESS_DENIED, which Windows also returns for the transient
+/// attribute race on files being concurrently re-attributed. A genuine ACL
+/// denial also matches 5 and simply costs one bounded (≤ 3.5 s) retry cycle
+/// before surfacing unchanged.
+pub fn is_retryable_code(code: i32) -> bool {
+    code == 32 || code == 5
+}
+
+fn should_retry(e: &std::io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error().is_some_and(is_retryable_code)
+}
+
+/// Runs a fallible file op with the bounded retry policy. The closure owns all
+/// path state; the final error is the original last failure.
+pub fn with_retry<T>(
+    op: &str,
+    path: &Path,
+    mut f: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < RETRY_ATTEMPTS && should_retry(&e) => {
+                let delay = backoff_delay(attempt);
+                tracing::debug!(
+                    op,
+                    path = %path.display(),
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %e,
+                    "transient Windows file-op failure; retrying"
+                );
+                std::thread::sleep(delay);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `std::fs::remove_file` with the retry policy. Missing files are success
+/// (delete is idempotent at every call site).
+pub fn remove_file(path: &Path) -> std::io::Result<()> {
+    with_retry("remove_file", path, || match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    })
+}
+
+/// Persists a staged temp file over `dest` (atomic rename) with the retry
+/// policy. `TempPath::persist` consumes the handle but hands it back inside
+/// the error, so retries re-drive the same temp file.
+pub fn persist_temp(mut temp: tempfile::TempPath, dest: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match temp.persist(dest) {
+            Ok(()) => return Ok(()),
+            Err(pe) => {
+                if attempt < RETRY_ATTEMPTS && should_retry(&pe.error) {
+                    let delay = backoff_delay(attempt);
+                    tracing::debug!(
+                        op = "persist",
+                        path = %dest.display(),
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %pe.error,
+                        "transient Windows rename-over failure; retrying"
+                    );
+                    temp = pe.path;
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                } else {
+                    return Err(pe.error);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +233,56 @@ mod tests {
     fn windows_to_extended_converts_absolute() {
         let p = Path::new(r"C:\a\b");
         assert_eq!(to_extended(p), Path::new(r"\\?\C:\a\b"));
+    }
+
+    #[test]
+    fn backoff_doubles_with_bounded_jitter_and_total() {
+        // Base sequence 50,100,200,400,800,1600 with ±20% jitter per step.
+        let mut total = Duration::ZERO;
+        for attempt in 1..RETRY_ATTEMPTS {
+            let base = 50u64 << (attempt - 1).min(5);
+            let d = backoff_delay(attempt).as_millis() as u64;
+            let lo = base - base / 5;
+            let hi = base + base / 5;
+            assert!(
+                (lo..=hi).contains(&d),
+                "attempt {attempt}: {d} ∉ [{lo},{hi}]"
+            );
+            total += backoff_delay(attempt);
+        }
+        assert!(
+            total <= Duration::from_millis(3_500),
+            "worst-case retry wait must stay under 3.5s, got {total:?}"
+        );
+        // Deterministic (no RNG): same attempt, same delay.
+        assert_eq!(backoff_delay(3), backoff_delay(3));
+    }
+
+    #[test]
+    fn retryable_codes_are_exactly_sharing_and_access() {
+        assert!(is_retryable_code(32), "ERROR_SHARING_VIOLATION");
+        assert!(is_retryable_code(5), "ERROR_ACCESS_DENIED attribute race");
+        assert!(!is_retryable_code(2), "FILE_NOT_FOUND is not transient");
+        assert!(!is_retryable_code(0));
+    }
+
+    #[test]
+    fn remove_file_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        remove_file(&f).unwrap();
+        // Second delete of a missing file is success, not NotFound.
+        remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn persist_temp_lands_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(named.path(), b"staged").unwrap();
+        let dest = dir.path().join("final.bin");
+        persist_temp(named.into_temp_path(), &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"staged");
     }
 }

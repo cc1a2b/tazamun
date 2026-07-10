@@ -159,7 +159,9 @@ pub fn chunk_file(
         eof: bool,
     }
 
-    let file = std::fs::File::open(path)?;
+    // Publishing races editors/scanners holding the file exclusively on
+    // Windows; the open goes through the bounded sharing-violation retry.
+    let file = crate::win_fs::with_retry("open", path, || std::fs::File::open(path))?;
 
     // recycle: scanner/hasher → reader · filled: reader → scanner.
     let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(BUFS);

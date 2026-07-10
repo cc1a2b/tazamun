@@ -55,9 +55,14 @@ fn apply_mode(path: &Path, readonly: bool) -> Result<(), GuardError> {
     }
     #[cfg(not(unix))]
     {
+        // Windows: scanners/editors race attribute changes (error 5/32), so
+        // the set goes through the bounded retry.
         let mut perms = meta.permissions();
         perms.set_readonly(readonly);
-        std::fs::set_permissions(path, perms).map_err(|e| io_err(path, e))?;
+        crate::win_fs::with_retry("set_attributes", path, || {
+            std::fs::set_permissions(path, perms.clone())
+        })
+        .map_err(|e| io_err(path, e))?;
     }
     Ok(())
 }
