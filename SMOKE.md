@@ -507,3 +507,78 @@ The pre-race attribute check (`STEP 2`) is itself the live verification of the
 genesis read-only fix this smoke originally caught: the importer's copy now
 carries the read-only attribute the moment its genesis publish lands, on
 Windows exactly as on Linux.
+
+---
+
+# P5 addendum — Windows hardening + background service (native NTFS)
+
+Driven by the **Windows release binary** on `E:\` (NTFS) plus a real WSL2 Linux
+daemon, orchestrated from WSL (`~/tazamun-smoke-p5/win_p5.sh`); the systemd leg
+runs the Linux release binary directly. Every assertion passed. Two product
+bugs surfaced here and were fixed before merge (see `DECISIONS.md` P5).
+
+## Windows — five legs, verbatim
+
+```text
+=== LEG 1 — long-path cycle (>300 chars) on NTFS ===
+PASS: deep path (286+ chars rel) synced to B
+PASS: deep file read-only on B (attribute)
+PASS: B locked the deep path
+PASS: B unlocked (published)
+PASS: deep edit round-tripped to A
+=== LEG 2 — live sharing-violation retry (held handle during apply) ===
+PASS: hot.txt on B
+PASS: apply landed on B despite the held handle (retry outlasted it)
+=== LEG 3 — non-portable record from a REAL Linux node → unapplied on Windows ===
+PASS: WSL2 Linux node connected+synced to the Windows-host node (cross-OS session)
+PASS: Linux published da:ta.bin under lease
+PASS: Linux published aux.txt under lease
+----- Windows node status (unapplied section) -----
+unapplied — non-portable paths (2):
+  ⚠ aux.txt  (segment "aux.txt" is a reserved Windows device name (AUX))
+  ⚠ da:ta.bin  (segment "da:ta.bin" contains ':', invalid in Windows file names)
+PASS: Windows node holds both Linux-born names unapplied
+PASS: aux.txt NOT materialized on Windows
+[WARN] portability  [from daemon]
+     unapplied paths    : 2 remote file(s) held back (non-portable names)
+PASS: sync stays healthy after unapplied records
+=== LEG 4+5 — Scheduled Task lifecycle + log rotation ===
+PASS: task installed: tazamun-348b3fa4
+PASS: daemon healthy over IPC (named pipe) under the Scheduled Task
+PASS: log rotation triggered (daemon.log.1 exists; live log restarted)
+service daemon stopped
+✔ removed Scheduled Task tazamun-348b3fa4
+=== RESULT ===
+WINDOWS P5 SMOKE PASSED
+```
+
+The `>300`-char cycle (leg 1) exercises the `\\?\` boundary conversion and the
+`longPathAware` manifest end to end; the read-only *attribute* check is the
+live proof of the genesis fix on NTFS. Leg 3 is a genuine **cross-OS session**
+on one host — a WSL2 Linux daemon publishes `aux.txt` and `da:ta.bin` (names
+NTFS cannot represent) under a lease, and the Windows node acknowledges them,
+lists them `unapplied` with per-file reasons, counts them in `doctor`, never
+materializes them, and keeps syncing portable files. Legs 4–5 run the daemon
+under a **logon Scheduled Task**: it answers IPC over its named pipe and, with
+a pre-filled log, the product's own writer rotates `daemon.log` → `daemon.log.1`.
+
+## Linux — systemd user-service lifecycle (WSL)
+
+```text
+✔ installed systemd user unit tazamun-54a503be (~/.config/systemd/user/…)
+PASS: unit active -> active
+PASS: daemon answers IPC
+PASS: daemon.log written (--log-file)
+last log lines:
+  …  INFO daemon running me=98ba1f42ab dir=…/tzm-svc-linux-3XUb
+=== single-instance collision (manual start while service runs) ===
+error: a daemon is already running for this folder
+✔ removed systemd user unit tazamun-54a503be
+unit now -> inactive
+PASS: unit file removed
+```
+
+Install brings the unit `active` under systemd with the daemon answering IPC
+and writing its rotated log; a manual `tazamun start` against the running
+service refuses cleanly; uninstall returns the unit to `inactive` and removes
+the file.
