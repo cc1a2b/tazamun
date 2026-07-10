@@ -81,9 +81,14 @@ that way so they stay exhaustively unit-testable.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clean -p tazamun && cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+The `cargo clean -p tazamun` is not optional: incremental compilation caches
+lint results per module, so a warm `clippy` silently skips re-linting unchanged
+modules and misses new lints (this bit three times before it became part of
+the gate). Only the crate itself is cleaned — dependency artifacts stay cached.
 
 `cargo build --release` must produce one self-contained binary per OS with no
 extra steps. No `.unwrap()` / `.expect()` outside tests unless provably

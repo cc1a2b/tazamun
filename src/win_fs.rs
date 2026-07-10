@@ -42,7 +42,9 @@ pub fn to_extended(path: &Path) -> PathBuf {
 /// The pure string transformation behind [`to_extended`], separated so the
 /// mapping is unit-testable on every host OS. Returns `None` when the input
 /// needs no conversion (already extended, relative, or not a Windows absolute
-/// path).
+/// path). Compiled on Windows (where `to_extended` calls it) and under test
+/// everywhere; it has no other non-Windows caller.
+#[cfg(any(windows, test))]
 fn extended_form(s: &str) -> Option<String> {
     // Already extended (`\\?\…`) or a device path (`\\.\…`): leave untouched.
     if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
