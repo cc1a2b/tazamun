@@ -19,6 +19,7 @@ pub mod sync;
 pub mod ui;
 pub mod versions;
 pub mod watcher;
+pub mod win_fs;
 
 /// Global tuning constants. Every magic number in the crate lives here.
 pub mod consts {

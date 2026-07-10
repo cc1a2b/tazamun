@@ -142,6 +142,10 @@ pub(crate) enum Event {
         rel: RelPath,
         result: Result<Staged, TransferError>,
         quarantined: Option<PathBuf>,
+        /// True when offending bytes existed to preserve: the restore may only
+        /// proceed if `quarantined` is `Some` (Golden Invariant — never destroy
+        /// bytes that were not preserved first).
+        preserve_required: bool,
     },
     /// Autolock: the un-leased bytes have been preserved (async), so the
     /// standard acquire may now begin.
@@ -559,7 +563,8 @@ impl Actor {
                     rel,
                     result,
                     quarantined,
-                } => self.on_violation_staged(rel, result, quarantined),
+                    preserve_required,
+                } => self.on_violation_staged(rel, result, quarantined, preserve_required),
                 Event::AutolockReady {
                     rel,
                     quarantined,
@@ -1784,6 +1789,7 @@ impl Actor {
                     rel,
                     result,
                     quarantined,
+                    preserve_required: quarantine_first,
                 })
                 .await;
         });
@@ -1794,7 +1800,21 @@ impl Actor {
         rel: RelPath,
         result: Result<Staged, TransferError>,
         quarantined: Option<PathBuf>,
+        preserve_required: bool,
     ) {
+        // Golden Invariant: if there were offending bytes to preserve and the
+        // quarantine failed, do NOT restore over them — leave the user's bytes
+        // in place (writable) and say so loudly. A later pass retries once the
+        // underlying condition (disk space, permissions) clears.
+        if preserve_required && quarantined.is_none() {
+            error!(
+                path = %rel,
+                "violation NOT reverted: preserving the offending bytes failed, \
+                 so the restore was skipped to avoid destroying them"
+            );
+            self.unbusy(&rel);
+            return;
+        }
         match result {
             Ok(staged) => {
                 let abs = rel.to_fs_path(&self.dir);
@@ -1995,6 +2015,16 @@ impl Actor {
             "autolock could not acquire ({precondition}); your bytes are safe in conflicts/"
         );
         self.push_event(format!("autolock failed for {rel} ({precondition})"));
+        // Golden Invariant: if preserving the bytes failed, never remove or
+        // restore over them — leave them in place and say so.
+        if quarantined.is_none() {
+            error!(
+                path = %rel,
+                "autolock revert skipped: the bytes could not be preserved first; leaving them on disk"
+            );
+            self.unbusy(rel);
+            return;
+        }
         if new_file {
             // No indexed version to restore; the bytes are preserved, so drop
             // the on-disk copy exactly as the new-file violation path does.
@@ -2023,6 +2053,7 @@ impl Actor {
                         rel: rel2,
                         result,
                         quarantined,
+                        preserve_required: true,
                     })
                     .await;
             });

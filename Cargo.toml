@@ -94,3 +94,6 @@ targets = [
 install-path = "CARGO_HOME"
 checksum = "sha256"
 pr-run-mode = "skip"
+
+[build-dependencies]
+embed-manifest = "1.5.0"

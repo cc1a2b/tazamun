@@ -1009,6 +1009,9 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
 
     // (d) filesystem sanity (local probe).
     sections.push(filesystem_section(dir, classify_mount(dir)));
+    if let Some(s) = crate::doctor::long_paths_section(dir) {
+        sections.push(s);
+    }
 
     // (e) IPC health (local).
     sections.push(ipc_section(dir, alive));

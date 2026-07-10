@@ -136,6 +136,87 @@ pub fn classify_mount(path: &Path) -> MountKind {
     }
 }
 
+/// Windows long-path section: the embedded `longPathAware` manifest status,
+/// the `LongPathsEnabled` registry switch, and a live >260-char probe with
+/// plain (non-`\\?\`) APIs. tazamun itself is immune either way — every fs
+/// boundary converts to `\\?\` extended-length form (`src/win_fs.rs`) — but
+/// other programs touching a deep session folder (editors, explorers) depend
+/// on the registry switch, so a `0` gets a WARN with the exact enable command.
+#[cfg(windows)]
+pub fn long_paths_section(_dir: &Path) -> Option<Section> {
+    let mut s = Section::from_ok("long paths");
+    s.lines
+        .push("manifest           : longPathAware embedded at build time".into());
+    s.lines
+        .push("tazamun fs calls   : \\\\?\\ extended-length at every boundary".into());
+
+    let reg = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+            "/v",
+            "LongPathsEnabled",
+        ])
+        .output();
+    let enabled = match &reg {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains("0x1") {
+                Some(true)
+            } else if text.contains("0x0") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match enabled {
+        Some(true) => s
+            .lines
+            .push("LongPathsEnabled   : 1 (other programs get long paths too)".into()),
+        Some(false) => {
+            s.verdict = Verdict::Warn;
+            s.lines
+                .push("LongPathsEnabled   : 0 — OTHER programs will fail on deep paths".into());
+            s.action = Some(
+                "run as admin: New-ItemProperty -Path \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force"
+                    .into(),
+            );
+        }
+        None => s
+            .lines
+            .push("LongPathsEnabled   : unreadable (reg query failed)".into()),
+    }
+
+    // Live probe: can a plain Win32 path exceed MAX_PATH end-to-end right now?
+    let deep = std::env::temp_dir()
+        .join("a".repeat(80))
+        .join("b".repeat(80))
+        .join("c".repeat(80));
+    let probe = std::fs::create_dir_all(&deep)
+        .and_then(|()| std::fs::write(deep.join("probe.txt"), b"x"))
+        .and_then(|()| std::fs::remove_file(deep.join("probe.txt")));
+    match probe {
+        Ok(()) => s
+            .lines
+            .push("live >260 probe    : plain-path create+write+delete OK".into()),
+        Err(e) => {
+            s.verdict = s.verdict.max_with(Verdict::Warn);
+            s.lines.push(format!(
+                "live >260 probe    : failed with plain paths ({e})"
+            ));
+        }
+    }
+    Some(s)
+}
+
+/// Non-Windows: long paths are not a constraint; no section.
+#[cfg(not(windows))]
+pub fn long_paths_section(_dir: &Path) -> Option<Section> {
+    None
+}
+
 /// Filesystem-sanity section: watcher backend, mount class, and a live
 /// read-only enforcement probe (create → chmod 0444 → verify not writable).
 pub fn filesystem_section(dir: &Path, mount: MountKind) -> Section {

@@ -38,12 +38,15 @@ impl RelPath {
 
     /// Joins this relative path onto `root` segment by segment. Only safe for
     /// sanitized values, which is all this type holds outside serde decoding.
+    /// Absolute on-disk path for this relative path under `root`. On Windows
+    /// the result is `\\?\` extended-length form (see [`crate::win_fs`]), so
+    /// every downstream filesystem call keeps working past `MAX_PATH`.
     pub fn to_fs_path(&self, root: &Path) -> PathBuf {
         let mut out = root.to_path_buf();
         for seg in self.0.split('/') {
             out.push(seg);
         }
-        out
+        crate::win_fs::to_extended(&out)
     }
 }
 
@@ -203,8 +206,11 @@ impl AppState {
         }
     }
 
+    /// `.tazamun` metadata directory, in `\\?\` extended-length form on
+    /// Windows (covers `state.json`, staging, blobs, conflicts, logs — every
+    /// metadata fs path funnels through here).
     pub fn meta_dir(dir: &Path) -> PathBuf {
-        dir.join(META_DIR)
+        crate::win_fs::to_extended(&dir.join(META_DIR))
     }
 
     pub fn state_path(dir: &Path) -> PathBuf {
