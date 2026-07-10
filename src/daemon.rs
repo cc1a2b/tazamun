@@ -1091,7 +1091,12 @@ impl Actor {
                 let reply = match decision {
                     Decision::Grant => Msg::LockGrant { path: rel },
                     Decision::GrantAndAbortMine => {
-                        if let Some((_, waiter)) = self.pending_acquires.remove(&rel) {
+                        let pending = self.pending_acquires.remove(&rel);
+                        if let Some((q, nf)) = self.autolock_pending.remove(&rel) {
+                            // Our autolock lost the tie: revert locally and keep
+                            // our bytes in quarantine (Golden Invariant).
+                            self.autolock_fail(&rel, q, nf, "LEASE".to_string());
+                        } else if let Some((_, waiter)) = pending {
                             let _ = waiter.send(IpcResponse::err(
                                 "tie_lost",
                                 "a concurrent request won the tie-break",
@@ -1876,13 +1881,17 @@ impl Actor {
         quarantined: Option<PathBuf>,
         new_file: bool,
     ) {
-        // A late-arriving remote lease or our own inspection may have changed
-        // things; re-check freshness/reachability.
+        // `spawn_autolock` set `busy` while it preserved the bytes; that is our
+        // own bookkeeping, so clear it before the precondition check (whose
+        // busy-guard is meant for *other* in-flight ops) and re-set it through
+        // the acquire to block re-inspection of the path.
+        self.busy.remove(&rel);
         if let Some(err) = self.strict_edit_guard(&rel) {
             let pre = Self::precondition_of(&err);
             self.autolock_fail(&rel, quarantined, new_file, pre);
             return;
         }
+        self.busy.insert(rel.clone());
         let lamport = self.state.lamport + 1;
         self.state.lamport = lamport;
         let voters: BTreeSet<String> = self.peers.keys().map(|id| id.to_string()).collect();

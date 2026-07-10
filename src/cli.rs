@@ -1212,4 +1212,40 @@ mod tests {
         let saved = SessionConfig::default();
         assert!(resolve_net_config(&saved, &flags(Some("garbage"), false, false, false)).is_err());
     }
+
+    #[test]
+    fn humantime_durations_parse_and_clamp() {
+        use crate::consts::{MAX_LEASE_TTL, MIN_LEASE_TTL};
+        use std::time::Duration;
+
+        // In-band values parse verbatim.
+        assert_eq!(
+            parse_clamped_dur("15m", MIN_LEASE_TTL, MAX_LEASE_TTL).unwrap(),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            parse_clamped_dur("2h", MIN_LEASE_TTL, MAX_LEASE_TTL).unwrap(),
+            Duration::from_secs(2 * 60 * 60)
+        );
+        // Out-of-band values clamp to the nearest bound.
+        assert_eq!(
+            parse_clamped_dur("1s", MIN_LEASE_TTL, MAX_LEASE_TTL).unwrap(),
+            MIN_LEASE_TTL
+        );
+        assert_eq!(
+            parse_clamped_dur("72h", MIN_LEASE_TTL, MAX_LEASE_TTL).unwrap(),
+            MAX_LEASE_TTL
+        );
+        // Garbage is a clear error, not a silent default.
+        assert!(parse_clamped_dur("soon", MIN_LEASE_TTL, MAX_LEASE_TTL).is_err());
+    }
+
+    #[test]
+    fn on_off_parsing_is_liberal_but_strict() {
+        assert!(parse_on_off("on").unwrap());
+        assert!(parse_on_off("YES").unwrap());
+        assert!(!parse_on_off("off").unwrap());
+        assert!(!parse_on_off("0").unwrap());
+        assert!(parse_on_off("maybe").is_err());
+    }
 }

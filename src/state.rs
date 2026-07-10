@@ -389,5 +389,51 @@ mod tests {
         assert_eq!(st.config.relay, "default");
         assert!(st.config.lan);
         assert!(!st.config.airgap);
+        // The P4 timing/autolock fields also fall back to their defaults.
+        assert_eq!(st.config.lease_ttl(), crate::consts::LEASE_TTL);
+        assert_eq!(st.config.acquire_timeout(), crate::consts::ACQUIRE_TIMEOUT);
+        assert!(!st.config.autolock);
+        assert_eq!(st.config.wait_timeout(), crate::consts::WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn lease_timing_helpers_clamp_and_derive() {
+        use crate::consts::{
+            MAX_ACQUIRE_TIMEOUT, MAX_LEASE_TTL, MIN_ACQUIRE_TIMEOUT, MIN_LEASE_TTL,
+        };
+        let mut c = SessionConfig::default();
+
+        // Below the floor clamps up; above the ceiling clamps down.
+        c.lease_ttl_ms = 1; // 1ms
+        assert_eq!(c.lease_ttl(), MIN_LEASE_TTL);
+        c.lease_ttl_ms = 48 * 60 * 60 * 1000; // 48h
+        assert_eq!(c.lease_ttl(), MAX_LEASE_TTL);
+
+        // Renew is always ttl/3, derived from the (clamped) ttl.
+        c.lease_ttl_ms = 90_000;
+        assert_eq!(c.lease_ttl(), Duration::from_secs(90));
+        assert_eq!(c.lease_renew(), Duration::from_secs(30));
+
+        // Acquire timeout clamps to its own band.
+        c.acquire_timeout_ms = 0;
+        assert_eq!(c.acquire_timeout(), MIN_ACQUIRE_TIMEOUT);
+        c.acquire_timeout_ms = 10 * 60 * 1000;
+        assert_eq!(c.acquire_timeout(), MAX_ACQUIRE_TIMEOUT);
+    }
+
+    #[test]
+    fn new_config_fields_persist_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = AppState::new(encode_hex32(&[1u8; 32]), encode_hex32(&[2u8; 32]));
+        st.config.lease_ttl_ms = 300_000;
+        st.config.acquire_timeout_ms = 12_000;
+        st.config.autolock = true;
+        st.config.wait_timeout_ms = 120_000;
+        st.save(dir.path()).unwrap();
+        let back = AppState::load(dir.path()).unwrap();
+        assert_eq!(back.config.lease_ttl(), Duration::from_secs(300));
+        assert_eq!(back.config.acquire_timeout(), Duration::from_secs(12));
+        assert!(back.config.autolock);
+        assert_eq!(back.config.wait_timeout(), Duration::from_secs(120));
     }
 }

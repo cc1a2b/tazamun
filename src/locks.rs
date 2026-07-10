@@ -654,6 +654,68 @@ mod tests {
     }
 
     #[test]
+    fn hostile_wire_ttl_is_clamped_to_absolute_band() {
+        // A malicious peer sending ttl_ms = 0 must not make the lease
+        // instantaneous: it clamps up to MIN_LEASE_TTL.
+        let mut t = table(A);
+        let now = Instant::now();
+        t.on_remote_request(&p("f"), &B.to_string(), 1, 0, now);
+        assert!(
+            t.sweep(now + MIN_LEASE_TTL - Duration::from_millis(1))
+                .expired
+                .is_empty(),
+            "a zero wire TTL must still last at least MIN_LEASE_TTL"
+        );
+        assert_eq!(
+            t.sweep(now + MIN_LEASE_TTL + Duration::from_millis(1))
+                .expired
+                .len(),
+            1
+        );
+
+        // An enormous wire TTL cannot park the lease past MAX_LEASE_TTL.
+        let mut t = table(A);
+        t.on_remote_request(&p("g"), &B.to_string(), 1, u64::MAX, now);
+        assert!(
+            t.sweep(now + MAX_LEASE_TTL - Duration::from_secs(1))
+                .expired
+                .is_empty()
+        );
+        assert_eq!(
+            t.sweep(now + MAX_LEASE_TTL + Duration::from_secs(1))
+                .expired
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lease_age_tracks_holder_and_survives_renew() {
+        let mut t = table(A);
+        let now = Instant::now();
+        t.on_remote_request(&p("f"), &B.to_string(), 1, 90_000, now);
+        // Age grows with the clock while the same holder renews.
+        let later = now + Duration::from_secs(5);
+        t.on_renew(&p("f"), &B.to_string(), 90_000, later);
+        let leases = t.held_leases(now + Duration::from_secs(10));
+        let (_, holder, _, _, age) = &leases[0];
+        assert_eq!(holder, B);
+        assert_eq!(*age, Duration::from_secs(10));
+        // A lower-(lamport,id) different holder taking over resets the age.
+        t.observe_lease(
+            &p("f"),
+            &C.to_string(),
+            0,
+            90_000,
+            now + Duration::from_secs(10),
+        );
+        let leases = t.held_leases(now + Duration::from_secs(12));
+        let (_, holder, _, _, age) = &leases[0];
+        assert_eq!(holder, C);
+        assert_eq!(*age, Duration::from_secs(2));
+    }
+
+    #[test]
     fn pending_deadline_times_out_via_sweep() {
         let mut t = table(A);
         let now = Instant::now();
