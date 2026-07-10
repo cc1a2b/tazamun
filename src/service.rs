@@ -472,6 +472,10 @@ mod tests {
         assert_eq!(a, instance_name(Path::new("/sessions/alpha")), "stable");
     }
 
+    // The plist only ever renders on macOS; on Windows `Path::join` would
+    // backslash the joined log paths and the byte-for-byte golden could never
+    // match. Unix-only keeps the comparison honest for the platform it serves.
+    #[cfg(not(windows))]
     #[test]
     fn launch_agent_plist_matches_golden() {
         let got = launch_agent_plist(
