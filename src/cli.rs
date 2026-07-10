@@ -91,6 +91,12 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the per-folder background service (systemd user unit on Linux,
+    /// LaunchAgent on macOS, logon Scheduled Task on Windows).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// List active leases: holder, age, and expiry countdown.
     Locks,
     /// Acquire an exclusive lease and make the file writable.
@@ -108,6 +114,16 @@ pub enum Cmd {
     Restore { path: String, n: usize },
     /// Delete unreferenced blobs from the local store.
     Gc,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCmd {
+    /// Install and start the background service for this folder.
+    Install,
+    /// Stop and remove the background service for this folder.
+    Uninstall,
+    /// Show the service state and the last daemon log lines.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,6 +173,7 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
         Cmd::Config { cmd } => handle_config_cli(&dir, cmd),
         Cmd::Status { watch, json } => handle_status_cli(&dir, watch, json).await,
         Cmd::Doctor { json } => handle_doctor_cli(&dir, json).await,
+        Cmd::Service { cmd } => handle_service_cli(&dir, cmd).await,
         Cmd::Invite { qr } => {
             let data = request(&dir, IpcRequest::Invite).await?;
             let ticket = data
@@ -589,6 +606,53 @@ async fn start(dir: &Path, flags: &NetFlags, ui: Ui) -> Result<(), CliError> {
 }
 
 /// `config show|set` — reads/writes the persisted per-session preferences.
+/// `service install|uninstall|status` over the OS-native backend, with the
+/// rotated daemon-log tail appended to `status`.
+async fn handle_service_cli(dir: &Path, cmd: ServiceCmd) -> Result<(), CliError> {
+    // A session must exist before a service is pinned to the folder.
+    let _ = AppState::load(dir)?;
+    match cmd {
+        ServiceCmd::Install => {
+            let msg = crate::service::install(dir).map_err(|e| CliError::Refused(e.to_string()))?;
+            println!("✔ {msg}");
+            Ok(())
+        }
+        ServiceCmd::Uninstall => {
+            let msg =
+                crate::service::uninstall(dir).map_err(|e| CliError::Refused(e.to_string()))?;
+            println!("✔ {msg}");
+            Ok(())
+        }
+        ServiceCmd::Status => {
+            let name = crate::service::instance_name(dir);
+            println!("service  : {name}");
+            let platform = crate::service::platform_status(dir)
+                .map_err(|e| CliError::Refused(e.to_string()))?;
+            for line in platform.lines() {
+                println!("  {line}");
+            }
+            println!(
+                "daemon   : {}",
+                if ipc::daemon_alive(dir).await {
+                    "responding over IPC"
+                } else {
+                    "not responding"
+                }
+            );
+            match crate::service::log_tail(dir, 5) {
+                Some(lines) if !lines.is_empty() => {
+                    println!("last log lines:");
+                    for l in lines {
+                        println!("  {l}");
+                    }
+                }
+                _ => println!("last log lines: (no daemon.log yet)"),
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
     let mut state = AppState::load(dir)?;
     match cmd {

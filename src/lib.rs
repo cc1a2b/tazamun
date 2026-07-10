@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod locks;
 pub mod net;
 pub mod proto;
+pub mod service;
 pub mod session;
 pub mod state;
 pub mod sync;

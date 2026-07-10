@@ -331,6 +331,10 @@ pub fn conflicts_dir(dir: &Path) -> PathBuf {
     AppState::meta_dir(dir).join("conflicts")
 }
 
+pub fn logs_dir(dir: &Path) -> PathBuf {
+    AppState::meta_dir(dir).join("logs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
