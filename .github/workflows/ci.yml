@@ -55,6 +55,13 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.os }}", x64]
     steps:
       - uses: actions/checkout@v4
+      # Self-hosted runners keep the cargo target cache on local disk. A killed
+      # or interrupted build can leave a stale crate artifact that surfaces as
+      # `error[E0463]: can't find crate for tazamun` in the downstream targets.
+      # Surgically rebuild just our own crate each run (the expensive dependency
+      # cache is preserved) so the stale-artifact class of failure cannot recur.
+      - name: Clean local-crate cache (self-hosted stale-artifact guard)
+        run: cargo clean -p tazamun
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)

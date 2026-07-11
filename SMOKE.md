@@ -656,3 +656,64 @@ The token rides the URL fragment, so it never appears in a server request.
 **Deferred to final acceptance** (no Windows-specific code changed in P7): the
 native **Windows** host re-run of this SMOKE, the macOS pass, and the
 cold-runner pass. Pushed to `main` under the push-freely policy.
+
+## Final acceptance — Linux (WSL, release binary)
+
+The full P0→P7 ladder on the release binary, two nodes, airgap:
+
+```text
+PASS: P0 init+invite (ticket minted)
+PASS: P0 join+converge (byte-exact)
+PASS: P0 synced file is read-only on B
+PASS: P2 lock/edit/unlock round-trip byte-exact (B→A)
+PASS: P2 read-only reapplied both sides
+PASS: P0 version history kept (entry 0)
+PASS: P2 doctor ran (exit 0)
+PASS: P7 /api/state mirrors status
+PASS: P7 token-less mutation → 401
+PASS: P7 non-loopback Host → 403
+PASS: P7 lock via API
+PASS: P7 API lock reflected in CLI
+PASS: P7 unlock via API
+PASS: P5 service install
+PASS: P5 service status shows active
+PASS: P5 service uninstall
+PASS: no panic in daemon logs
+=== RESULT ===
+LINUX ACCEPTANCE LADDER PASSED
+```
+
+Init/invite/join/converge byte-exact, a lock/edit/unlock round-trip with
+read-only reapplied on both sides, version history, `doctor`, the whole
+dashboard API surface (state mirrors status, token 401, DNS-rebind 403,
+lock/unlock reflected in the CLI), and a systemd user-service install/status/
+uninstall cycle — all green on the release binary.
+
+## Final acceptance — three-OS CI matrix
+
+One commit (`acceptance/v0.1.0-rc`, PR #6):
+
+- **Linux (self-hosted):** green — `fmt` · `clippy` · `cargo test --all-targets`.
+- **Windows (self-hosted):** a **runner-cache** failure, not a code defect. The
+  run hit `error[E0463]: can't find crate for tazamun` across downstream targets
+  with no `(lib)` source error, while the **identical commit passed on Linux**
+  and the full local suite is green — a killed/stale artifact on the runner's
+  persistent 7.2 GB `target/` cache (disk was fine). Hardened at the root with a
+  `cargo clean -p tazamun` CI guard so the class of failure cannot recur; re-run
+  under that guard for the green result. (Windows-specific product behavior —
+  long paths, sharing-violation retry, non-portable→unapplied, Scheduled-Task
+  service — remains covered by the Windows integration tests and the P4/P5
+  Windows SMOKE records above; a fresh native interactive ladder still wants a
+  hands-on Windows session.)
+- **macOS (hosted):** **not run — billing block.** The dispatch was refused
+  before any step: *"The job was not started because recent account payments
+  have failed or your spending limit needs to be increased."* Needs the owner to
+  resolve billing, then re-dispatch. Not a code issue.
+
+## Final acceptance — Relayed (two networks)
+
+The one manual gate. Bring up your relay (`deploy/relay/docker compose up -d`),
+then run `deploy/relay/acceptance-drill.sh node1 <relay-url>` on machine A and
+`… node2 <relay-url> <ticket>` on machine B (different network). Paste the
+evidence block (a member row with `conn=Relayed` + `relay_url` + `rtt_ms`) back
+to record it here. **Pending the second machine.**

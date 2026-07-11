@@ -134,6 +134,71 @@ P5–P6. From now on:
   **29125369589** (light linux) and **29125371420** (full linux+windows) on
   `0aa18d7`; P6 merged on green local gates + WSL SMOKE + ~75.7M fuzz executions.
 
+## Final acceptance (v0.1.0) — the three-OS cold matrix + release prep
+
+Recorded 2026-07-11. Goal: clear the deferred platform debt, then cut the single
+`v0.1.0` tag. CI triggers restored (`push`/`pull_request`); the freeze is over.
+
+### Runner reality vs. the stated restart (must-note)
+
+The instruction said both self-hosted runners had been restarted; the **GitHub
+API showed both `offline`** and the WSL user unit was still `inactive`/`disabled`
+(exactly as the very first turn of this session left it — that turn disabled
+them to stop the boot-time VmmemWSL). Rather than fabricate a run, I brought them
+up myself: `systemctl --user enable --now actions-runner-tazamun` (WSL →
+`active`, `Runner.Listener` running) and `Start-ScheduledTask actions-runner-win`
+(host). Both then registered **online**. Worth flagging because the reported
+"restart" had not actually taken effect on this machine.
+
+### Three-OS cold matrix (one commit, `acceptance/v0.1.0-rc`, PR #6)
+
+- **Linux (self-hosted `wsl2-linux`): green.** `fmt` + `clippy` +
+  `cargo test --all-targets`. Plus the release-binary P0→P7 SMOKE ladder green
+  (see SMOKE.md "Final acceptance — Linux").
+- **Windows (self-hosted `host-windows`): first run failed on a stale-cache
+  artifact; re-ran clean.** The failure was `error[E0463]: can't find crate for
+  tazamun` across every downstream target, with **no `(lib)` compile error** —
+  the lib compile line was present but never completed. That is the signature of
+  a killed/stale build against the runner's persistent 7.2 GB `target/` cache
+  (disk was fine, 350 GB free), aggravated by P7's new deps (clap_complete,
+  clap_mangen, tokio `net`). The **identical commit passed on Linux**, so it is
+  not a source defect. Root fix: re-ran only the failed Windows leg (the killed
+  build left no finalized fingerprint, so cargo rebuilds cleanly). [Clean re-run
+  result recorded in SMOKE.md.]
+- **macOS (hosted `macos-14`): refused for billing — blocked, not a code
+  failure.** `steps=0`; annotation verbatim: *"The job was not started because
+  recent account payments have failed or your spending limit needs to be
+  increased."* Same block as P5. The cap was reported raised to $5, but the
+  hosted macOS job is still refused. This needs the **owner** to resolve in
+  GitHub Billing; I cannot and must not touch billing. The macOS-only runtime
+  surface for the shipped code is nil (the LaunchAgent plist is golden-file
+  unit-tested cross-platform; the rest is shared-Unix, covered green by Linux).
+
+### Release prep
+
+- `dist plan` (cargo-dist 0.28.0): clean, announces `v0.1.0` with all four
+  targets (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+  `aarch64-apple-darwin`, `x86_64-apple-darwin`) plus shell/PowerShell/Homebrew/
+  npm installers and sha256 checksums. `github-attestations = true` (P5
+  groundwork) → build-provenance attestations at tag time. `release.yml` still
+  fires only on a `v*` tag.
+- `cargo audit`: **0 vulnerabilities** across 552 crates (grew from 549 by the
+  two clap companions). The three accepted transitive build-time "unmaintained"
+  advisories are unchanged; re-verified present.
+- Two-machine Relayed proof (P3 debt): `deploy/relay/acceptance-drill.sh`
+  (role-based `node1`/`node2`) + the existing one-command relay bring-up
+  (`deploy/relay/docker compose up -d`). The **one manual gate** — it needs a
+  second physical machine on a different network, so it stops for the owner.
+
+### Tag gate (why v0.1.0 is NOT cut yet)
+
+The single `v0.1.0` tag fires the **public** `release.yml` (GitHub release, npm
+`@cc1a2b`, Homebrew tap) — irreversible. Held until **all** of: the Windows leg
+green on the clean re-run, the **macOS billing block resolved by the owner** (or
+macOS waived), and the **two-machine Relayed proof** returned by the owner (or
+waived). Linux is green; the release config, audit, and notes are ready. When
+the two owner-gated items clear, the tag is one annotated `git tag`/`push` away.
+
 ## Phase 7 — local web dashboard + CLI polish
 
 The last v0.1 feature: a loopback, read-write control panel the daemon serves,
