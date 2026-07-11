@@ -55,9 +55,9 @@ the push-freely policy (DECISIONS.md). Pushes now happen at every phase close,
 so history reaches GitHub incrementally and `ci.yml` stays
 `workflow_dispatch`-only. What still must be cleared before the release tag:
 
-- [x] **a.** Full history on GitHub with clean-repo gates green (`git grep -i
-      claude` AND `-i anthropic` empty, single cc1a2b identity on every
-      commit). An ongoing invariant, kept green on every push.
+- [x] **a.** Full history on GitHub with clean-repo gates green (the
+      assistant-name and vendor-name greps both empty, single cc1a2b identity
+      on every commit). An ongoing invariant, kept green on every push.
 - [ ] **b.** One full cold 3-OS pass via `workflow_dispatch` (ci.yml stays
       dispatch-only): restart the two self-hosted runner services for the
       linux + windows legs, plus one paid `macos-full` under the $5 cap.

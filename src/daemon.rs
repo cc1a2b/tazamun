@@ -366,9 +366,11 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         })
     };
 
-    // IPC server.
+    // IPC server (local socket) and the loopback web dashboard both feed the
+    // same actor message channel, so the dashboard is a thin adapter with no
+    // second control path of its own.
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<(IpcRequest, oneshot::Sender<IpcResponse>)>(64);
-    let ipc_task = tokio::spawn(ipc_listener.serve(ipc_tx));
+    let ipc_task = tokio::spawn(ipc_listener.serve(ipc_tx.clone()));
     let ipc_fwd = {
         let events = events_tx.clone();
         tokio::spawn(async move {
@@ -379,6 +381,22 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             }
         })
     };
+    // Web dashboard: a fresh per-start session token + the persisted loopback
+    // port. Served over the same IPC channel; a bind failure is non-fatal.
+    let dashboard_port = state.config.dashboard_port;
+    let dashboard_token = {
+        let bytes: [u8; crate::consts::DASHBOARD_TOKEN_BYTES] = rand::random();
+        data_encoding::HEXLOWER.encode(&bytes)
+    };
+    // The actual bound port (may differ from the configured one, e.g. `0` for
+    // an OS-assigned port in tests) is published here for `DashboardInfo`.
+    let dashboard_bound = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(dashboard_port));
+    let dashboard_task = tokio::spawn(crate::dashboard::serve(
+        ipc_tx.clone(),
+        dashboard_token.clone(),
+        dashboard_port,
+        dashboard_bound.clone(),
+    ));
 
     // Timers.
     let timer_task = {
@@ -458,6 +476,8 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         keys,
         events_tx: events_tx.clone(),
         member_cmds: member_cmds_tx,
+        dashboard_token,
+        dashboard_bound,
         _watcher: watcher,
     };
 
@@ -475,6 +495,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             ipc_task,
             ipc_fwd,
             timer_task,
+            dashboard_task,
         ],
     })
 }
@@ -537,6 +558,10 @@ struct Actor {
     keys: SessionKeys,
     events_tx: mpsc::Sender<Event>,
     member_cmds: mpsc::Sender<MemberCmd>,
+    /// Web dashboard: the per-start session token (returned to the CLI over IPC
+    /// so the browser can present it) and the actual bound loopback port.
+    dashboard_token: String,
+    dashboard_bound: std::sync::Arc<std::sync::atomic::AtomicU16>,
     _watcher: crate::watcher::Watcher,
 }
 
@@ -2293,6 +2318,109 @@ impl Actor {
             IpcRequest::Gc => self.start_gc(Some(reply)),
             IpcRequest::Doctor => {
                 let _ = reply.send(IpcResponse::ok(self.doctor_json()));
+            }
+            IpcRequest::DashboardInfo => {
+                let _ = reply.send(IpcResponse::ok(serde_json::json!({
+                    "port": self.dashboard_bound.load(std::sync::atomic::Ordering::Relaxed),
+                    "token": self.dashboard_token,
+                })));
+            }
+            IpcRequest::DashboardState => {
+                let _ = reply.send(IpcResponse::ok(self.dashboard_state_json()));
+            }
+            IpcRequest::ConfigSet { key, value } => self.handle_config_set(key, value, reply),
+        }
+    }
+
+    /// The `api:1` dashboard snapshot: the `status` schema-1 payload plus mode,
+    /// a config summary, the conflicts list, and per-path version entries — one
+    /// snapshot that powers the whole UI without disturbing the schema-1 status
+    /// contract.
+    fn dashboard_state_json(&self) -> serde_json::Value {
+        let mut v = self.status_json();
+        let c = &self.state.config;
+        v["mode"] = serde_json::json!(self.state.mode);
+        v["airgap"] = serde_json::json!(self.airgap);
+        v["config"] = serde_json::json!({
+            "autolock": c.autolock,
+            "lease_ttl_ms": c.lease_ttl_ms,
+            "acquire_timeout_ms": c.acquire_timeout_ms,
+            "wait_timeout_ms": c.wait_timeout_ms,
+            "dashboard_port": c.dashboard_port,
+            "relay": c.relay,
+            "lan": c.lan,
+        });
+        v["conflicts"] = serde_json::json!(self.list_conflicts());
+        let mut versions = serde_json::Map::new();
+        for path in self.state.history.keys() {
+            let entries: Vec<serde_json::Value> = versions::list(&self.state, path)
+                .into_iter()
+                .map(|(n, ts, size)| serde_json::json!({ "n": n, "ts_ms": ts, "size": size }))
+                .collect();
+            if !entries.is_empty() {
+                versions.insert(path.as_str().to_string(), serde_json::Value::Array(entries));
+            }
+        }
+        v["versions"] = serde_json::Value::Object(versions);
+        v
+    }
+
+    /// Lists `.tazamun/conflicts` (preserved quarantine copies), newest first.
+    fn list_conflicts(&self) -> Vec<serde_json::Value> {
+        let dir = crate::state::conflicts_dir(&self.dir);
+        let mut rows: Vec<(String, u64, u64)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let (size, ts_ms) = e
+                    .metadata()
+                    .map(|m| {
+                        let ts = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        (m.len(), ts)
+                    })
+                    .unwrap_or((0, 0));
+                rows.push((name, size, ts_ms));
+            }
+        }
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        rows.into_iter()
+            .map(|(name, size, ts_ms)| serde_json::json!({ "name": name, "size": size, "ts_ms": ts_ms }))
+            .collect()
+    }
+
+    /// Applies a live config change (dashboard `/api/config` and `ConfigSet`
+    /// IPC), persisting it and applying the runtime effect for timing keys.
+    fn handle_config_set(
+        &mut self,
+        key: String,
+        value: String,
+        reply: oneshot::Sender<IpcResponse>,
+    ) {
+        match self.state.config.set_live_value(&key, &value) {
+            Ok(note) => {
+                // Timing keys take effect immediately for future leases.
+                if key == "lease-ttl" || key == "acquire-timeout" {
+                    let timings = LockTimings {
+                        ttl: self.state.config.lease_ttl(),
+                        renew: self.state.config.lease_renew(),
+                        acquire_timeout: self.state.config.acquire_timeout(),
+                    };
+                    self.timings = timings;
+                    self.locks.set_timings(timings);
+                }
+                self.persist();
+                info!(key = %key, "config set live via dashboard/IPC");
+                let _ = reply.send(IpcResponse::ok(
+                    serde_json::json!({ "set": key, "note": note }),
+                ));
+            }
+            Err(e) => {
+                let _ = reply.send(IpcResponse::err("bad_config", e));
             }
         }
     }

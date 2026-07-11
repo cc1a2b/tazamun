@@ -130,6 +130,13 @@ impl LockTable {
         self.timings
     }
 
+    /// Replaces the timing knobs (live `lease-ttl`/`acquire-timeout` config
+    /// change). New leases use the new TTL; existing leases keep their current
+    /// expiry until they next renew.
+    pub fn set_timings(&mut self, timings: LockTimings) {
+        self.timings = timings;
+    }
+
     fn ttl_from_ms(&self, ttl_ms: u64) -> Duration {
         // CONSISTENCY RULE: TTL is lease-scoped — the *holder's* configured TTL
         // governs each lease and rides the wire, so nodes may run different

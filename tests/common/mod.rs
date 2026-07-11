@@ -296,6 +296,15 @@ pub fn set_autolock(dir: &Path, on: bool) {
     st.save(dir).expect("save state");
 }
 
+/// Sets the dashboard loopback port in a prepared session folder before its
+/// daemon starts. `0` = an OS-assigned ephemeral port, so parallel tests never
+/// collide on the fixed default.
+pub fn set_dashboard_port(dir: &Path, port: u16) {
+    let mut st = tazamun::state::AppState::load(dir).expect("load state");
+    st.config.dashboard_port = port;
+    st.save(dir).expect("save state");
+}
+
 pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = std::fs::read_dir(path) {

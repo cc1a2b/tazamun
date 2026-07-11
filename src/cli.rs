@@ -20,7 +20,7 @@ use crate::ui::progress::Ui;
 #[derive(Debug, Parser)]
 #[command(
     name = "tazamun",
-    version,
+    version = env!("TAZAMUN_VERSION"),
     about = "تزامُن — strict-checkout P2P folder sync. No server ever reads your files."
 )]
 pub struct Cli {
@@ -122,6 +122,22 @@ pub enum Cmd {
     Restore { path: String, n: usize },
     /// Delete unreferenced blobs from the local store.
     Gc,
+    /// Open the local web dashboard (loopback only; served by the daemon).
+    Dashboard {
+        /// Port to open in the URL (defaults to the daemon's dashboard port).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Launch the default browser at the dashboard URL.
+        #[arg(long)]
+        open: bool,
+    },
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
+    Completions {
+        /// Target shell.
+        shell: clap_complete::Shell,
+    },
+    /// Print the roff man page for `tazamun` to stdout.
+    Man,
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,8 +156,9 @@ pub enum ConfigCmd {
     Show,
     /// Change a persisted preference. Keys: `relay <default|none|URL>`,
     /// `lan <on|off>`, `airgap <on|off>`, `lease-ttl <90s|15m|2h>`,
-    /// `acquire-timeout <8s>`, `autolock <on|off>`, `wait-timeout <10m>`.
-    /// Takes effect on next `start`.
+    /// `acquire-timeout <8s>`, `autolock <on|off>`, `wait-timeout <10m>`,
+    /// `dashboard-port <8787>`. Takes effect on next `start` (the live keys can
+    /// also be changed while running from the web dashboard).
     Set { key: String, value: String },
 }
 
@@ -225,7 +242,76 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
             println!("✔ garbage collection finished");
             Ok(())
         }
+        Cmd::Dashboard { port, open } => handle_dashboard_cli(&dir, port, open).await,
+        Cmd::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "tazamun", &mut std::io::stdout());
+            Ok(())
+        }
+        Cmd::Man => {
+            use clap::CommandFactory;
+            clap_mangen::Man::new(Cli::command())
+                .render(&mut std::io::stdout())
+                .map_err(|e| CliError::Refused(format!("man page render failed: {e}")))?;
+            Ok(())
+        }
     }
+}
+
+/// `dashboard`: fetch the running daemon's loopback port + session token and
+/// print (optionally open) the URL. The token rides the URL *fragment*, so it
+/// never reaches the server in a request. Requires a running daemon.
+async fn handle_dashboard_cli(dir: &Path, port: Option<u16>, open: bool) -> Result<(), CliError> {
+    // `request` maps a missing daemon to the clean "start the daemon" error.
+    let data = request(dir, IpcRequest::DashboardInfo).await?;
+    let daemon_port = data
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::from(crate::consts::DASHBOARD_PORT)) as u16;
+    let token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let port = port.unwrap_or(daemon_port);
+    let url = format!("http://127.0.0.1:{port}/#{token}");
+    println!("Dashboard: {url}");
+    println!("(loopback only — the token in the URL authorizes changes; do not share the URL)");
+    if open {
+        if let Err(e) = open_browser(&url) {
+            eprintln!("could not launch a browser ({e}); open the URL above manually");
+        }
+    } else {
+        println!("Tip: add --open to launch your browser.");
+    }
+    Ok(())
+}
+
+/// Launches the platform's default browser at `url`. No dependency: shells out
+/// to the OS opener.
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Acquires a lease, with a pre-acquire advisory for degraded links and a
@@ -678,6 +764,7 @@ fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
             println!("  acquire-timeout : {}", fmt_dur(c.acquire_timeout()));
             println!("  autolock        : {}", on_off(c.autolock));
             println!("  wait-timeout    : {}", fmt_dur(c.wait_timeout()));
+            println!("  dashboard-port  : {}", c.dashboard_port);
             println!(
                 "\n(values shown are effective/clamped; per-run flags override network keys; changes apply on next `tazamun start`)"
             );
@@ -723,10 +810,19 @@ fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
                     )?;
                     state.config.wait_timeout_ms = d.as_millis() as u64;
                 }
+                "dashboard-port" => {
+                    let p: u16 = value.trim().parse().map_err(|_| {
+                        CliError::Refused(format!("invalid port {value:?} (1024–65535)"))
+                    })?;
+                    if p < 1024 {
+                        return Err(CliError::Refused("port must be >= 1024".into()));
+                    }
+                    state.config.dashboard_port = p;
+                }
                 other => {
                     return Err(CliError::Refused(format!(
                         "unknown config key {other:?} (valid: relay, lan, airgap, \
-                         lease-ttl, acquire-timeout, autolock, wait-timeout)"
+                         lease-ttl, acquire-timeout, autolock, wait-timeout, dashboard-port)"
                     )));
                 }
             }
@@ -1350,5 +1446,44 @@ mod tests {
         assert!(!parse_on_off("off").unwrap());
         assert!(!parse_on_off("0").unwrap());
         assert!(parse_on_off("maybe").is_err());
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        // Catches arg/subcommand conflicts and drift after seven phases.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_generate_for_every_shell() {
+        use clap::CommandFactory;
+        use clap_complete::Shell;
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "tazamun", &mut buf);
+            assert!(!buf.is_empty(), "{shell:?} completion was empty");
+            assert!(
+                String::from_utf8_lossy(&buf).contains("tazamun"),
+                "{shell:?} completion missing the binary name"
+            );
+        }
+    }
+
+    #[test]
+    fn man_page_renders_nonempty() {
+        use clap::CommandFactory;
+        let mut buf = Vec::new();
+        clap_mangen::Man::new(Cli::command())
+            .render(&mut buf)
+            .expect("man render");
+        assert!(!buf.is_empty());
+        assert!(String::from_utf8_lossy(&buf).contains("tazamun"));
     }
 }
