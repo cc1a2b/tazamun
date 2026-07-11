@@ -75,6 +75,13 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+# The `fuzz/` crate (cargo-fuzz + libFuzzer) is its own detached crate, excluded
+# from this workspace so `cargo build/test/clippy` and the release build never
+# touch it (it needs nightly + a sanitizer). Build/run it with `cargo +nightly
+# fuzz …` — see docs/PENTEST_PLAYBOOK.md.
+[workspace]
+exclude = ["fuzz"]
+
 # cargo-dist drives .github/workflows/release.yml (regenerate with `dist generate`).
 # pr-run-mode = "skip" keeps release.yml triggered ONLY on version tags — never
 # on pushes/PRs — so no release machinery runs until the single v0.1.0 tag.

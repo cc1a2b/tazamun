@@ -543,6 +543,163 @@ impl RawPeer {
         self.conn
             .close(iroh::endpoint::VarInt::from_u32(0), b"test done");
     }
+
+    /// Replay attack: complete one valid handshake and record the `Proof` bytes
+    /// (and `nonce_a`), then open a second connection and replay that recorded
+    /// proof against the node's *fresh* `nonce_b` (reusing the old `nonce_a` for
+    /// the strongest replay). Returns `(first_authenticated, replay_rejected)`.
+    /// A correct node accepts the first and rejects the replay because the proof
+    /// binds *both* nonces.
+    pub async fn capture_then_replay(ticket: &str) -> (bool, bool) {
+        let endpoint = Self::build_endpoint().await;
+        let keys = Self::keys_from_ticket(ticket);
+        let addr = Self::addr_from_ticket(ticket);
+        let me = endpoint.id();
+
+        // Connection 1: a full, valid handshake. Record proof_old + nonce_a.
+        let mut recorded: Option<([u8; 16], [u8; 32])> = None;
+        let mut first_authed = false;
+        if let Ok(conn) = endpoint
+            .connect(addr.clone(), tazamun::consts::CTL_ALPN)
+            .await
+        {
+            let remote = conn.remote_id();
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                let na: [u8; 16] = rand::random();
+                if write_msg(&mut send, &Msg::Hello { nonce: na })
+                    .await
+                    .is_ok()
+                    && let Ok(Msg::HelloAck { nonce: nb, .. }) = read_msg(&mut recv).await
+                {
+                    let mine =
+                        tazamun::net::control::proof(&keys.auth, b"init", &me, &remote, &na, &nb);
+                    if write_msg(&mut send, &Msg::Proof { proof: mine })
+                        .await
+                        .is_ok()
+                    {
+                        first_authed = matches!(
+                            tokio::time::timeout(Duration::from_secs(3), read_msg(&mut recv)).await,
+                            Ok(Ok(Msg::Index { .. }))
+                        );
+                        recorded = Some((na, mine));
+                    }
+                }
+            }
+            conn.close(iroh::endpoint::VarInt::from_u32(0), b"done");
+        }
+        let Some((na_old, proof_old)) = recorded else {
+            endpoint.close().await;
+            return (first_authed, true);
+        };
+
+        // Connection 2 (same identity, fresh session): replay proof_old.
+        let mut replay_rejected = true;
+        if let Ok(conn) = endpoint.connect(addr, tazamun::consts::CTL_ALPN).await {
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                // Reuse the old nonce_a; the node still sends a fresh nonce_b,
+                // against which proof_old cannot verify.
+                if write_msg(&mut send, &Msg::Hello { nonce: na_old })
+                    .await
+                    .is_ok()
+                    && matches!(read_msg(&mut recv).await, Ok(Msg::HelloAck { .. }))
+                    && write_msg(&mut send, &Msg::Proof { proof: proof_old })
+                        .await
+                        .is_ok()
+                {
+                    let accepted = matches!(
+                        tokio::time::timeout(Duration::from_secs(2), read_msg(&mut recv)).await,
+                        Ok(Ok(Msg::Index { .. }))
+                    );
+                    replay_rejected = !accepted;
+                }
+            }
+            conn.close(iroh::endpoint::VarInt::from_u32(0), b"done");
+        }
+        endpoint.close().await;
+        (first_authed, replay_rejected)
+    }
+
+    /// Drives one handshake up to the node's `HelloAck` and returns the node's
+    /// `nonce_b`, so a test can sample many and assert freshness. Never
+    /// completes the handshake.
+    pub async fn capture_acceptor_nonce(ticket: &str) -> Option<[u8; 16]> {
+        let endpoint = Self::build_endpoint().await;
+        let addr = Self::addr_from_ticket(ticket);
+        let conn = endpoint
+            .connect(addr, tazamun::consts::CTL_ALPN)
+            .await
+            .ok()?;
+        let nonce = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            let na: [u8; 16] = rand::random();
+            write_msg(&mut send, &Msg::Hello { nonce: na }).await.ok()?;
+            match read_msg(&mut recv).await.ok()? {
+                Msg::HelloAck { nonce, .. } => Some(nonce),
+                _ => None,
+            }
+        }
+        .await;
+        conn.close(iroh::endpoint::VarInt::from_u32(0), b"done");
+        endpoint.close().await;
+        nonce
+    }
+}
+
+/// Runs one control handshake between two fresh endpoints with the given keys
+/// on each side, concurrently, and returns `(initiator_result, acceptor_result)`
+/// as `Ok(())`/`Err(display)`. Lets the wrong-secret matrix assert both fail
+/// closed with the generic error (no oracle).
+pub async fn handshake_outcome(
+    init_keys: SessionKeys,
+    acc_keys: SessionKeys,
+) -> (Result<(), String>, Result<(), String>) {
+    let acc_ep = RawPeer::build_endpoint().await;
+    let init_ep = RawPeer::build_endpoint().await;
+    let acc_addr = acc_ep.addr();
+    let acc_id = acc_ep.id();
+    let init_id = init_ep.id();
+
+    let acceptor = tokio::spawn(async move {
+        let res = async {
+            let Some(incoming) = acc_ep.accept().await else {
+                return Err("no inbound connection".to_string());
+            };
+            let conn = incoming
+                .accept()
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            handshake_acceptor(&conn, &acc_keys, acc_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        acc_ep.close().await;
+        res
+    });
+
+    // Hold the initiator's Connection open until the acceptor has finished:
+    // handshake_initiator sends its Proof and returns immediately, so dropping
+    // the connection right away would race the acceptor's read of that Proof
+    // (a "connection lost" on the acceptor side). The real daemon keeps the
+    // connection alive via PeerHandle; mirror that. On initiator failure, drop
+    // early so the acceptor fails fast instead of waiting out the deadline.
+    let (init_res, hold) = match init_ep.connect(acc_addr, tazamun::consts::CTL_ALPN).await {
+        Ok(conn) => {
+            let r = handshake_initiator(&conn, &init_keys, init_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let hold = if r.is_ok() { Some(conn) } else { None };
+            (r, hold)
+        }
+        Err(e) => (Err(e.to_string()), None),
+    };
+    let acc_res = acceptor.await.unwrap_or_else(|e| Err(format!("join: {e}")));
+    drop(hold);
+    init_ep.close().await;
+    (init_res, acc_res)
 }
 
 /// Seeds a prepared (not yet started) session folder with a known member, so

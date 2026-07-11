@@ -153,6 +153,30 @@ impl Msg {
             Msg::LockFreed { .. } => "lock_freed",
         }
     }
+
+    /// The relative-path strings this message carries. These are untrusted
+    /// until they pass [`crate::sync::index::sanitize_rel_path`]; the daemon
+    /// runs every one through that gate at the wire boundary, and the fuzz
+    /// harness (`fuzz_msg`) uses this to exercise the sanitizer on decoded
+    /// messages.
+    pub fn wire_paths(&self) -> Vec<&str> {
+        match self {
+            Msg::Index { files, leases, .. } => files
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .chain(leases.iter().map(|l| l.path.as_str()))
+                .collect(),
+            Msg::FileMeta { path, .. }
+            | Msg::LockReq { path, .. }
+            | Msg::LockGrant { path }
+            | Msg::LockDeny { path, .. }
+            | Msg::LockRelease { path }
+            | Msg::LockRenew { path, .. }
+            | Msg::LockInterest { path }
+            | Msg::LockFreed { path } => vec![path.as_str()],
+            Msg::Hello { .. } | Msg::HelloAck { .. } | Msg::Proof { .. } | Msg::Bye => vec![],
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

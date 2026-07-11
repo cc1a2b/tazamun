@@ -1,6 +1,13 @@
 # Build artifacts
 /target/
 
+# cargo-fuzz: track the harness (Cargo.toml + fuzz_targets), not the build
+# output, the libFuzzer-grown corpora, or crash artifacts (all regenerable —
+# seed corpora come from `cargo run --example gen_seeds`).
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
 # Runtime session metadata (contains secret material)
 .tazamun/
 **/.tazamun/
