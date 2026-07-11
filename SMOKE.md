@@ -624,3 +624,35 @@ is rejected because it binds both handshake nonces.
 Windows-specific code changed in P6 — the shared paths are covered by the Linux
 full suite and the fuzzers): the native **Windows** host re-run of this SMOKE,
 the macOS pass, and the cold-runner pass. NOT pushed.
+
+## P7 — web dashboard, end to end (WSL, release binary)
+
+Two real nodes (A + B, airgap). A serves the dashboard on `127.0.0.1:8787`;
+every check drives the **real** HTTP API with `curl` and confirms the CLI sees
+the effect.
+
+```text
+=== dashboard URL: http://127.0.0.1:8787/#<token len 64> ===
+api /api/state id: "id":"fa0e6f61…3a9cf181"
+cli status  id: "id":"fa0e6f61…3a9cf181"
+PASS: API mirrors status
+tokenless POST /api/lock → HTTP 401 PASS
+POST /api/lock → "ok":true
+PASS: CLI locks shows shared.txt held
+POST /api/unlock → "ok":true
+PASS: CLI shows no leases after unlock
+PASS: bash completions generated
+no panic in daemon logs
+=== P7 SMOKE DONE ===
+```
+
+`GET /api/state` returns the same session id as `tazamun status --json`; a
+`POST /api/lock` **without** the token is refused `401`; with the token it
+acquires the lease (B grants) and `tazamun locks` immediately shows
+`shared.txt` held; `POST /api/unlock` releases it and the CLI shows no leases;
+`tazamun completions bash` emits a real script; no panic in either daemon log.
+The token rides the URL fragment, so it never appears in a server request.
+
+**Deferred to final acceptance** (no Windows-specific code changed in P7): the
+native **Windows** host re-run of this SMOKE, the macOS pass, and the
+cold-runner pass. Pushed to `main` under the push-freely policy.
