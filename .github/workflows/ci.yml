@@ -11,12 +11,14 @@ name: CI
 # self-hosted runners keep cargo caches on local disk, so there are no
 # actions/cache restore steps here.
 #
-# LOCAL-ONLY FREEZE (owner decision, 2026-07-11 — see DECISIONS.md,
-# "Local-only development policy"): triggers reduced to workflow_dispatch
-# only until final acceptance after P7, when push/pull_request are restored
-# (final-acceptance item b in ROADMAP.md).
+# Triggers restored at FINAL ACCEPTANCE (2026-07-11): the P5–P7 local-only
+# freeze is over (see DECISIONS.md). push → light self-hosted Linux; PR → full
+# self-hosted Linux+Windows; macOS stays a manual workflow_dispatch job. The
+# release pipeline (release.yml) still fires only on a v* tag.
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
 concurrency:
