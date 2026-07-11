@@ -4,10 +4,33 @@
 
 use clap::Parser;
 use tazamun::cli::{Cli, Cmd, run};
+use tazamun::service::RotatingLog;
 use tazamun::ui::progress::Ui;
 use tracing_subscriber::EnvFilter;
 
-fn init_tracing(verbose: u8, ui: &Ui) {
+/// A daemon without a terminal (service mode) also logs to
+/// `.tazamun/logs/daemon.log`, size-rotated at 5 MiB keeping 3 generations.
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_KEEP: usize = 3;
+
+/// Tee: every trace line goes to the normal writer and, when present, the
+/// rotating service log.
+struct Tee<A, B>(A, B);
+
+impl<A: std::io::Write, B: std::io::Write> std::io::Write for Tee<A, B> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.0.write(buf)?;
+        let _ = self.1.write_all(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()?;
+        let _ = self.1.flush();
+        Ok(())
+    }
+}
+
+fn init_tracing(verbose: u8, ui: &Ui, file_log: Option<RotatingLog>) {
     use std::io::IsTerminal;
     let default = if verbose > 0 {
         "tazamun=debug"
@@ -16,12 +39,27 @@ fn init_tracing(verbose: u8, ui: &Ui) {
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(ansi)
-        .with_writer(ui.tracing_writer())
-        .init();
+    use tracing_subscriber::fmt::MakeWriter;
+    let base = ui.tracing_writer();
+    match file_log {
+        Some(log) => {
+            let make = move || Tee(base.make_writer(), log.clone());
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(make)
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(ansi)
+                .with_writer(base)
+                .init();
+        }
+    }
 }
 
 fn main() {
@@ -29,10 +67,24 @@ fn main() {
     // Progress bars exist only for the foreground daemon; every other command
     // (and every non-TTY invocation) runs with presentation disabled.
     let ui = match &cli.cmd {
-        Cmd::Start => Ui::detect(),
+        Cmd::Start { .. } => Ui::detect(),
         _ => Ui::disabled(),
     };
-    init_tracing(cli.verbose, &ui);
+    // A daemon writes the rotated .tazamun/logs/daemon.log when running
+    // unattended: either `service install` passed `--log-file` (deterministic,
+    // needed because a Windows Scheduled Task's hidden host still hands the
+    // child a console) or stdout is not a terminal (systemd/launchd). One-shot
+    // commands and interactive daemons never touch the log.
+    let file_log = {
+        use std::io::IsTerminal;
+        match &cli.cmd {
+            Cmd::Start { log_file } if *log_file || !std::io::stdout().is_terminal() => {
+                RotatingLog::open(&cli.dir, LOG_ROTATE_BYTES, LOG_KEEP).ok()
+            }
+            _ => None,
+        }
+    };
+    init_tracing(cli.verbose, &ui, file_log);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

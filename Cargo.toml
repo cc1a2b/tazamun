@@ -81,6 +81,11 @@ opt-level = 2
 [workspace.metadata.dist]
 cargo-dist-version = "0.28.0"
 ci = "github"
+# Build-provenance attestations over all artifacts at tag time (free).
+github-attestations = true
+# Signing placeholders — post-v0.1 purchase decisions; see docs/SIGNING.md.
+# ssldotcom-windows-sign = "prod"
+# macos-sign = true
 installers = ["shell", "powershell", "npm", "homebrew"]
 tap = "cc1a2b/homebrew-tap"
 publish-jobs = ["homebrew"]
@@ -94,3 +99,6 @@ targets = [
 install-path = "CARGO_HOME"
 checksum = "sha256"
 pr-run-mode = "skip"
+
+[build-dependencies]
+embed-manifest = "1.5.0"

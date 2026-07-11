@@ -50,7 +50,7 @@ Do **not** reintroduce any TTL rule that depends on the *receiver's* config.
 | `src/session.rs` | HKDF key derivation, `tzm1…` ticket encode/decode; zeroize-on-drop |
 | `src/proto.rs` | control framing (`u32` len + postcard, reject 0 / > 4 MiB) + `Msg` |
 | `src/sync/vclock.rs` | pure version-vector algebra (no I/O) |
-| `src/sync/index.rs` | `sanitize_rel_path` (the only untrusted-path gate) + `diff` (no I/O) |
+| `src/sync/index.rs` | `sanitize_rel_path` (the only untrusted-path gate) + Windows `portability_violation` corpus + `diff` (no I/O) |
 | `src/sync/chunker.rs` | FastCDC — deterministic cut function; parallel hash pipeline (`chunk_file`) |
 | `src/sync/transfer.rs` | iroh-blobs store; publish / pull-stage / materialize / GC-protect |
 | `src/locks.rs` | pure lease state machine (injected clock, zero I/O); lease-scoped TTL clamp (`ttl_from_ms`), `since`/age tracking |
@@ -65,7 +65,10 @@ Do **not** reintroduce any TTL rule that depends on the *receiver's* config.
 | `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
 | `src/ipc.rs` | local socket / named pipe, one JSON line per request |
 | `src/daemon.rs` | the single state-owning actor; **all** mutation happens here; autolock flow + waitlist (`my_waits`/`interest`) live here |
-| `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config` command, flag→config→default precedence |
+| `src/win_fs.rs` | `\\?\` extended-length conversion (long paths) + bounded retry for contended Windows file ops + RO-clear ordering rule |
+| `src/service.rs` | per-folder background service (systemd user unit / LaunchAgent / Scheduled Task) + size-rotated `daemon.log` writer |
+| `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config`/`service` commands, flag→config→default precedence, non-TTY log tee |
+| `build.rs` | Windows-target `longPathAware` manifest embed (no effect elsewhere) |
 | `deploy/relay/` | self-contained self-hosted iroh-relay kit (Docker Compose + ACME TLS); not part of the crate build |
 
 **Architecture rule:** `AppState`, `LockTable`, and the member table are only
@@ -78,9 +81,14 @@ that way so they stay exhaustively unit-testable.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clean -p tazamun && cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+The `cargo clean -p tazamun` is not optional: incremental compilation caches
+lint results per module, so a warm `clippy` silently skips re-linting unchanged
+modules and misses new lints (this bit three times before it became part of
+the gate). Only the crate itself is cleaned — dependency artifacts stay cached.
 
 `cargo build --release` must produce one self-contained binary per OS with no
 extra steps. No `.unwrap()` / `.expect()` outside tests unless provably

@@ -71,14 +71,20 @@ fn to_rel(roots: &[PathBuf], abs: &Path) -> Option<RelPath> {
 /// Starts watching `root` recursively, forwarding debounced events into `tx`.
 pub fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Watcher, WatchError> {
     // Candidate roots for relative-path mapping: the original path plus its
-    // canonical form (they differ on macOS, where `/var` → `/private/var`).
-    // The original root is still what we watch, so Windows/Linux behaviour is
-    // unchanged. Deduplicate so the common case tries a single root.
+    // canonical form (they differ on macOS, where `/var` → `/private/var`),
+    // plus the Windows `\\?\` extended-length form — the root actually watched
+    // there, so the directory handle opens past MAX_PATH; events may be
+    // reported under either spelling. Deduplicate so the common case tries a
+    // single root.
     let mut event_roots = vec![root.clone()];
     if let Ok(canon) = root.canonicalize()
         && canon != root
     {
         event_roots.push(canon);
+    }
+    let watch_root = crate::win_fs::to_extended(&root);
+    if watch_root != root {
+        event_roots.push(watch_root.clone());
     }
     let mut debouncer =
         new_debouncer(
@@ -126,7 +132,7 @@ pub fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Watcher, Wat
                 }
             },
         )?;
-    debouncer.watch(&root, RecursiveMode::Recursive)?;
+    debouncer.watch(&watch_root, RecursiveMode::Recursive)?;
     Ok(Watcher {
         _debouncer: debouncer,
     })

@@ -55,16 +55,21 @@ fn apply_mode(path: &Path, readonly: bool) -> Result<(), GuardError> {
     }
     #[cfg(not(unix))]
     {
+        // Windows: scanners/editors race attribute changes (error 5/32), so
+        // the set goes through the bounded retry.
         let mut perms = meta.permissions();
         perms.set_readonly(readonly);
-        std::fs::set_permissions(path, perms).map_err(|e| io_err(path, e))?;
+        crate::win_fs::with_retry("set_attributes", path, || {
+            std::fs::set_permissions(path, perms.clone())
+        })
+        .map_err(|e| io_err(path, e))?;
     }
     Ok(())
 }
 
 /// Copies the current bytes of `rel` into
-/// `.tazamun/conflicts/<UTC-timestamp>__<percent-encoded-rel>` and returns the
-/// quarantine path. The original file is left untouched.
+/// `.tazamun/conflicts/<UTC-timestamp>__<name>` and returns the quarantine
+/// path. The original file is left untouched.
 pub fn quarantine(dir: &Path, rel: &RelPath) -> Result<PathBuf, GuardError> {
     let src = rel.to_fs_path(dir);
     let cdir = conflicts_dir(dir);
@@ -72,11 +77,34 @@ pub fn quarantine(dir: &Path, rel: &RelPath) -> Result<PathBuf, GuardError> {
     let name = format!(
         "{}__{}",
         utc_timestamp(crate::now_ms()),
-        percent_encode(rel.as_str())
+        quarantine_name(rel)
     );
     let dest = cdir.join(name);
     std::fs::copy(&src, &dest).map_err(|e| io_err(&src, e))?;
     Ok(dest)
+}
+
+/// Encoded quarantine file name for `rel`, bounded so it always fits the
+/// 255-byte per-component limit (ext4 bytes, NTFS UTF-16 units). Short paths
+/// keep the fully readable percent-encoded form; long ones keep a readable
+/// truncated prefix plus a 16-hex BLAKE3 of the exact relative path, so
+/// distinct deep paths never collide and the original is recoverable from the
+/// violation log line (which prints `rel` in full).
+pub fn quarantine_name(rel: &RelPath) -> String {
+    const MAX_ENCODED: usize = 180;
+    let encoded = percent_encode(rel.as_str());
+    if encoded.len() <= MAX_ENCODED {
+        return encoded;
+    }
+    let hash = blake3::hash(rel.as_str().as_bytes());
+    let hex = data_encoding::HEXLOWER.encode(&hash.as_bytes()[..8]);
+    // Cut on a char boundary (percent-encoded output is pure ASCII, but stay
+    // defensive) and mark the elision.
+    let mut prefix = &encoded[..MAX_ENCODED];
+    while !encoded.is_char_boundary(prefix.len()) {
+        prefix = &encoded[..prefix.len() - 1];
+    }
+    format!("{prefix}---{hex}")
 }
 
 /// On daemon start: every indexed, non-deleted file that is not leased by us
@@ -176,5 +204,40 @@ mod tests {
     fn percent_encoding() {
         assert_eq!(percent_encode("a/b c.txt"), "a%2Fb%20c.txt");
         assert_eq!(percent_encode("safe-1_2.bin"), "safe-1_2.bin");
+    }
+
+    #[test]
+    fn quarantine_name_is_bounded_and_collision_free() {
+        // Short rels keep the readable encoded form.
+        let short = sanitize_rel_path("sub/data.bin").unwrap();
+        assert_eq!(quarantine_name(&short), "sub%2Fdata.bin");
+
+        // Deep rels (>255-byte encoded names would exceed the per-component
+        // filesystem limit) are truncated + hash-disambiguated.
+        let seg = "d".repeat(40);
+        let deep_a =
+            sanitize_rel_path(&format!("{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/a.bin")).unwrap();
+        let deep_b =
+            sanitize_rel_path(&format!("{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/b.bin")).unwrap();
+        let (na, nb) = (quarantine_name(&deep_a), quarantine_name(&deep_b));
+        // Timestamp prefix (20 chars + "__") still fits under 255 with these.
+        assert!(na.len() <= 200, "bounded: {} chars", na.len());
+        assert_ne!(na, nb, "distinct deep paths must not collide");
+        assert!(na.contains("---"), "elision marker present: {na}");
+        // Deterministic.
+        assert_eq!(na, quarantine_name(&deep_a));
+    }
+
+    #[test]
+    fn quarantine_works_on_a_deep_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = "d".repeat(40);
+        let rel =
+            sanitize_rel_path(&format!("{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/{seg}/f.bin")).unwrap();
+        let abs = rel.to_fs_path(dir.path());
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, b"deep evidence").unwrap();
+        let q = quarantine(dir.path(), &rel).unwrap();
+        assert_eq!(std::fs::read(&q).unwrap(), b"deep evidence");
     }
 }

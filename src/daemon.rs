@@ -142,6 +142,10 @@ pub(crate) enum Event {
         rel: RelPath,
         result: Result<Staged, TransferError>,
         quarantined: Option<PathBuf>,
+        /// True when offending bytes existed to preserve: the restore may only
+        /// proceed if `quarantined` is `Some` (Golden Invariant — never destroy
+        /// bytes that were not preserved first).
+        preserve_required: bool,
     },
     /// Autolock: the un-leased bytes have been preserved (async), so the
     /// standard acquire may now begin.
@@ -423,6 +427,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         interest: BTreeMap::new(),
         autolock_idle: BTreeMap::new(),
         autolock_pending: BTreeMap::new(),
+        warned_nonportable: BTreeSet::new(),
         muted: HashMap::new(),
         busy: BTreeSet::new(),
         recheck: BTreeSet::new(),
@@ -495,6 +500,9 @@ struct Actor {
     /// Autolock acquires in flight: `path → (preserved-bytes quarantine, was it
     /// a brand-new file)`. Resolved by the grant/deny/timeout handlers.
     autolock_pending: BTreeMap<RelPath, (Option<PathBuf>, bool)>,
+    /// Paths already warned about as Windows-non-portable this run (Unix
+    /// warn-only mode; keeps the log to one line per path).
+    warned_nonportable: BTreeSet<RelPath>,
     muted: HashMap<RelPath, Instant>,
     busy: BTreeSet<RelPath>,
     recheck: BTreeSet<RelPath>,
@@ -559,7 +567,8 @@ impl Actor {
                     rel,
                     result,
                     quarantined,
-                } => self.on_violation_staged(rel, result, quarantined),
+                    preserve_required,
+                } => self.on_violation_staged(rel, result, quarantined, preserve_required),
                 Event::AutolockReady {
                     rel,
                     quarantined,
@@ -1229,6 +1238,22 @@ impl Actor {
             remote.iter().map(|(p, r)| (p.clone(), r.clone())).collect();
         let d = diff(&self.state.files, &remote_vec);
         let records: BTreeMap<RelPath, FileRecord> = remote_vec.into_iter().collect();
+        // Retire any unapplied markers the origin has since deleted (a tombstone
+        // for an unapplied path is dropped by `diff`, so handle it directly).
+        if !self.state.unapplied.is_empty() {
+            let deleted: Vec<RelPath> = self
+                .state
+                .unapplied
+                .keys()
+                .filter(|rel| records.get(*rel).is_some_and(|r| r.deleted))
+                .cloned()
+                .collect();
+            for rel in deleted {
+                if let Some(rec) = records.get(&rel) {
+                    self.maybe_clear_unapplied(&rel, rec);
+                }
+            }
+        }
         for rel in d.pull {
             if let Some(rec) = records.get(&rel) {
                 self.maybe_pull(&rel, from, rec.clone());
@@ -1241,7 +1266,22 @@ impl Actor {
         }
     }
 
+    /// Clears a non-portable `unapplied` marker when the origin deletes the
+    /// path. Such a path is absent from `state.files`, so the normal
+    /// tombstone-vs-index reconciliation skips it — this is the only place the
+    /// marker is retired on deletion.
+    fn maybe_clear_unapplied(&mut self, rel: &RelPath, record: &FileRecord) {
+        if record.deleted && self.state.unapplied.remove(rel).is_some() {
+            self.persist();
+            self.push_event(format!(
+                "unapplied non-portable path removed upstream: {rel}"
+            ));
+            info!(path = %rel, "unapplied path tombstoned upstream; marker cleared");
+        }
+    }
+
     fn reconcile_one(&mut self, from: EndpointId, rel: &RelPath, record: &FileRecord) {
+        self.maybe_clear_unapplied(rel, record);
         match self.state.files.get(rel) {
             None => {
                 if !record.deleted {
@@ -1294,13 +1334,70 @@ impl Actor {
 
     // ---------------- pulls ----------------
 
+    /// The portability verdict for a remote path on this node: the pure
+    /// character/device-name rules plus the stateful NTFS case-fold check —
+    /// a path that differs from an already-indexed live path only by case
+    /// would silently overwrite it on a case-insensitive filesystem.
+    fn portability_reason(&self, rel: &RelPath) -> Option<String> {
+        if let Some(reason) = crate::sync::index::portability_violation(rel.as_str()) {
+            return Some(reason);
+        }
+        let folded = rel.as_str().to_lowercase();
+        self.state
+            .files
+            .iter()
+            .find(|(p, r)| !r.deleted && *p != rel && p.as_str().to_lowercase() == folded)
+            .map(|(p, _)| {
+                format!("case-fold collision with already-indexed {p:?} (NTFS is case-insensitive)")
+            })
+    }
+
     fn maybe_pull(&mut self, rel: &RelPath, from: EndpointId, record: FileRecord) {
         if self.locks.is_held_by_me(rel) {
             return;
         }
         if record.deleted {
+            // A tombstone settles an unapplied path too: the record is gone
+            // upstream, so drop the marker.
+            if self.state.unapplied.remove(rel).is_some() {
+                self.persist();
+                info!(path = %rel, "unapplied non-portable path deleted upstream; marker cleared");
+            }
             self.apply_remote(rel.clone(), from, record, None);
             return;
+        }
+        // Portability gate: a path that cannot exist on this filesystem is
+        // acknowledged but never materialized (Windows), or applied with a
+        // loud warning (Unix). The stored record keeps the sync loop settled —
+        // no re-pull churn — and never wedges anything else.
+        if let Some(reason) = self.portability_reason(rel) {
+            if cfg!(windows) {
+                let changed = self
+                    .state
+                    .unapplied
+                    .get(rel)
+                    .is_none_or(|e| e.record.vv != record.vv);
+                if changed {
+                    warn!(
+                        path = %rel,
+                        reason = %reason,
+                        "UNAPPLIED: remote file has a non-portable path; record stored, file NOT materialized"
+                    );
+                    self.push_event(format!("unapplied (non-portable path): {rel}"));
+                    self.state
+                        .unapplied
+                        .insert(rel.clone(), crate::state::UnappliedEntry { record, reason });
+                    self.persist();
+                }
+                return;
+            }
+            if self.warned_nonportable.insert(rel.clone()) {
+                warn!(
+                    path = %rel,
+                    reason = %reason,
+                    "path is not portable to Windows nodes (applied here; Windows members will hold it unapplied)"
+                );
+            }
         }
         if let Some(job) = self.pending_pulls.get_mut(rel) {
             if job.record.manifest == record.manifest && job.record.vv == record.vv {
@@ -1441,21 +1538,20 @@ impl Actor {
         };
         let apply_result: Result<(), String> = (|| {
             if record.deleted {
+                // Ordering (Windows refuses to delete read-only files):
+                // clear read-only → delete-with-retry; NotFound is success.
                 let _ = guard::set_writable(&abs);
-                match std::fs::remove_file(&abs) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.to_string()),
-                }
+                crate::win_fs::remove_file(&abs).map_err(|e| e.to_string())?;
                 Ok(())
             } else {
                 let staged = staged.ok_or_else(|| "missing staged file".to_string())?;
                 if let Some(parent) = abs.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                // Windows cannot rename over a read-only file.
+                // Ordering: clear read-only (Windows cannot rename over a
+                // read-only file) → rename-over with retry → re-apply guard.
                 let _ = guard::set_writable(&abs);
-                staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+                crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
                 guard::set_readonly(&abs).map_err(|e| e.to_string())?;
                 drop(staged.tags);
                 Ok(())
@@ -1784,6 +1880,7 @@ impl Actor {
                     rel,
                     result,
                     quarantined,
+                    preserve_required: quarantine_first,
                 })
                 .await;
         });
@@ -1794,7 +1891,21 @@ impl Actor {
         rel: RelPath,
         result: Result<Staged, TransferError>,
         quarantined: Option<PathBuf>,
+        preserve_required: bool,
     ) {
+        // Golden Invariant: if there were offending bytes to preserve and the
+        // quarantine failed, do NOT restore over them — leave the user's bytes
+        // in place (writable) and say so loudly. A later pass retries once the
+        // underlying condition (disk space, permissions) clears.
+        if preserve_required && quarantined.is_none() {
+            error!(
+                path = %rel,
+                "violation NOT reverted: preserving the offending bytes failed, \
+                 so the restore was skipped to avoid destroying them"
+            );
+            self.unbusy(&rel);
+            return;
+        }
         match result {
             Ok(staged) => {
                 let abs = rel.to_fs_path(&self.dir);
@@ -1804,7 +1915,7 @@ impl Actor {
                         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                     }
                     let _ = guard::set_writable(&abs);
-                    staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+                    crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
                     guard::set_readonly(&abs).map_err(|e| e.to_string())?;
                     drop(staged.tags);
                     Ok(())
@@ -1843,9 +1954,10 @@ impl Actor {
             }
         };
         self.mute(rel);
-        if let Err(e) = std::fs::remove_file(&abs)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
+        // Ordering: clear a possible read-only attribute first (Windows
+        // refuses to delete read-only files), then delete with retry.
+        let _ = guard::set_writable(&abs);
+        if let Err(e) = crate::win_fs::remove_file(&abs) {
             warn!(path = %rel, "could not remove un-leased new file: {e}");
         }
         warn!(
@@ -1995,14 +2107,24 @@ impl Actor {
             "autolock could not acquire ({precondition}); your bytes are safe in conflicts/"
         );
         self.push_event(format!("autolock failed for {rel} ({precondition})"));
+        // Golden Invariant: if preserving the bytes failed, never remove or
+        // restore over them — leave them in place and say so.
+        if quarantined.is_none() {
+            error!(
+                path = %rel,
+                "autolock revert skipped: the bytes could not be preserved first; leaving them on disk"
+            );
+            self.unbusy(rel);
+            return;
+        }
         if new_file {
             // No indexed version to restore; the bytes are preserved, so drop
-            // the on-disk copy exactly as the new-file violation path does.
+            // the on-disk copy exactly as the new-file violation path does
+            // (clear read-only first, delete with retry).
             let abs = rel.to_fs_path(&self.dir);
             self.mute(rel);
-            if let Err(e) = std::fs::remove_file(&abs)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
+            let _ = guard::set_writable(&abs);
+            if let Err(e) = crate::win_fs::remove_file(&abs) {
                 warn!(path = %rel, "autolock: could not remove un-leased new file: {e}");
             }
             self.unbusy(rel);
@@ -2023,6 +2145,7 @@ impl Actor {
                         rel: rel2,
                         result,
                         quarantined,
+                        preserve_required: true,
                     })
                     .await;
             });
@@ -2141,6 +2264,7 @@ impl Actor {
             "lan_discovery": self.lan_enabled,
             "known_members": self.state.known_members.len(),
             "connected_peers": self.peers.len(),
+            "unapplied_count": self.state.unapplied.len(),
             "peers": peers,
         })
     }
@@ -2596,7 +2720,7 @@ impl Actor {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let _ = guard::set_writable(&abs);
-            staged.temp.persist(&abs).map_err(|e| e.to_string())?;
+            crate::win_fs::persist_temp(staged.temp, &abs).map_err(|e| e.to_string())?;
             // The path stays writable: the lease is still ours.
             drop(staged.tags);
             Ok(())
@@ -2785,6 +2909,12 @@ impl Actor {
             "members": members,
             "leases": leases,
             "waiting": waiting,
+            "unapplied": self
+                .state
+                .unapplied
+                .iter()
+                .map(|(p, e)| serde_json::json!({ "path": p.as_str(), "reason": e.reason }))
+                .collect::<Vec<_>>(),
             "pending_pulls": pending_pulls,
             "events": events,
             "file_count": live_files.len(),

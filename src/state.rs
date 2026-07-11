@@ -38,12 +38,15 @@ impl RelPath {
 
     /// Joins this relative path onto `root` segment by segment. Only safe for
     /// sanitized values, which is all this type holds outside serde decoding.
+    /// Absolute on-disk path for this relative path under `root`. On Windows
+    /// the result is `\\?\` extended-length form (see [`crate::win_fs`]), so
+    /// every downstream filesystem call keeps working past `MAX_PATH`.
     pub fn to_fs_path(&self, root: &Path) -> PathBuf {
         let mut out = root.to_path_buf();
         for seg in self.0.split('/') {
             out.push(seg);
         }
-        out
+        crate::win_fs::to_extended(&out)
     }
 }
 
@@ -170,6 +173,19 @@ pub struct AppState {
     pub files: BTreeMap<RelPath, FileRecord>,
     pub known_members: BTreeMap<String, AddrWire>,
     pub history: BTreeMap<RelPath, Vec<VersionEntry>>,
+    /// Remote records this node acknowledges but refuses to materialize
+    /// because the path is not representable here (Windows portability rules).
+    /// The sync loop treats them as settled — no re-pull churn — and `status`
+    /// / `doctor` surface them. Never populated on Unix (warn-only there).
+    #[serde(default)]
+    pub unapplied: BTreeMap<RelPath, UnappliedEntry>,
+}
+
+/// One non-materialized remote record plus the human-readable reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnappliedEntry {
+    pub record: FileRecord,
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,11 +216,15 @@ impl AppState {
             files: BTreeMap::new(),
             known_members: BTreeMap::new(),
             history: BTreeMap::new(),
+            unapplied: BTreeMap::new(),
         }
     }
 
+    /// `.tazamun` metadata directory, in `\\?\` extended-length form on
+    /// Windows (covers `state.json`, staging, blobs, conflicts, logs — every
+    /// metadata fs path funnels through here).
     pub fn meta_dir(dir: &Path) -> PathBuf {
-        dir.join(META_DIR)
+        crate::win_fs::to_extended(&dir.join(META_DIR))
     }
 
     pub fn state_path(dir: &Path) -> PathBuf {
@@ -309,6 +329,10 @@ pub fn blobs_dir(dir: &Path) -> PathBuf {
 
 pub fn conflicts_dir(dir: &Path) -> PathBuf {
     AppState::meta_dir(dir).join("conflicts")
+}
+
+pub fn logs_dir(dir: &Path) -> PathBuf {
+    AppState::meta_dir(dir).join("logs")
 }
 
 #[cfg(test)]

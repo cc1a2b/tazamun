@@ -64,7 +64,15 @@ pub enum Cmd {
     /// Run the sync daemon in the foreground. Network preferences come from
     /// `state.json`; the global `--relay/--no-relay/--no-lan/--airgap` flags
     /// override them for this run only.
-    Start,
+    Start {
+        /// Also write the rotated `.tazamun/logs/daemon.log` regardless of
+        /// whether stdout is a terminal. Set by `service install` so
+        /// unattended daemons log deterministically (a Windows Scheduled Task's
+        /// hidden host still hands the child a console, so TTY detection alone
+        /// is not enough). Hidden from the normal help.
+        #[arg(long, hide = true)]
+        log_file: bool,
+    },
     /// Show or change persisted per-session network preferences.
     Config {
         #[command(subcommand)]
@@ -91,6 +99,12 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the per-folder background service (systemd user unit on Linux,
+    /// LaunchAgent on macOS, logon Scheduled Task on Windows).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// List active leases: holder, age, and expiry countdown.
     Locks,
     /// Acquire an exclusive lease and make the file writable.
@@ -108,6 +122,16 @@ pub enum Cmd {
     Restore { path: String, n: usize },
     /// Delete unreferenced blobs from the local store.
     Gc,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCmd {
+    /// Install and start the background service for this folder.
+    Install,
+    /// Stop and remove the background service for this folder.
+    Uninstall,
+    /// Show the service state and the last daemon log lines.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -153,10 +177,11 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
             persist_net_flags(&dir, &net)?;
             Ok(())
         }
-        Cmd::Start => start(&dir, &net, ui).await,
+        Cmd::Start { .. } => start(&dir, &net, ui).await,
         Cmd::Config { cmd } => handle_config_cli(&dir, cmd),
         Cmd::Status { watch, json } => handle_status_cli(&dir, watch, json).await,
         Cmd::Doctor { json } => handle_doctor_cli(&dir, json).await,
+        Cmd::Service { cmd } => handle_service_cli(&dir, cmd).await,
         Cmd::Invite { qr } => {
             let data = request(&dir, IpcRequest::Invite).await?;
             let ticket = data
@@ -589,6 +614,53 @@ async fn start(dir: &Path, flags: &NetFlags, ui: Ui) -> Result<(), CliError> {
 }
 
 /// `config show|set` — reads/writes the persisted per-session preferences.
+/// `service install|uninstall|status` over the OS-native backend, with the
+/// rotated daemon-log tail appended to `status`.
+async fn handle_service_cli(dir: &Path, cmd: ServiceCmd) -> Result<(), CliError> {
+    // A session must exist before a service is pinned to the folder.
+    let _ = AppState::load(dir)?;
+    match cmd {
+        ServiceCmd::Install => {
+            let msg = crate::service::install(dir).map_err(|e| CliError::Refused(e.to_string()))?;
+            println!("✔ {msg}");
+            Ok(())
+        }
+        ServiceCmd::Uninstall => {
+            let msg =
+                crate::service::uninstall(dir).map_err(|e| CliError::Refused(e.to_string()))?;
+            println!("✔ {msg}");
+            Ok(())
+        }
+        ServiceCmd::Status => {
+            let name = crate::service::instance_name(dir);
+            println!("service  : {name}");
+            let platform = crate::service::platform_status(dir)
+                .map_err(|e| CliError::Refused(e.to_string()))?;
+            for line in platform.lines() {
+                println!("  {line}");
+            }
+            println!(
+                "daemon   : {}",
+                if ipc::daemon_alive(dir).await {
+                    "responding over IPC"
+                } else {
+                    "not responding"
+                }
+            );
+            match crate::service::log_tail(dir, 5) {
+                Some(lines) if !lines.is_empty() => {
+                    println!("last log lines:");
+                    for l in lines {
+                        println!("  {l}");
+                    }
+                }
+                _ => println!("last log lines: (no daemon.log yet)"),
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_config_cli(dir: &Path, cmd: ConfigCmd) -> Result<(), CliError> {
     let mut state = AppState::load(dir)?;
     match cmd {
@@ -856,6 +928,17 @@ fn render_status(data: &serde_json::Value, out: &mut String) {
             l["expires_in_ms"].as_u64().unwrap_or(0) / 1000
         );
     }
+    let unapplied = data["unapplied"].as_array().cloned().unwrap_or_default();
+    if !unapplied.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nunapplied — non-portable paths ({}):",
+            unapplied.len()
+        );
+        for u in &unapplied {
+            let _ = writeln!(out, "  ⚠ {}  ({})", s(&u["path"]), s(&u["reason"]));
+        }
+    }
     let pulls = data["pending_pulls"]
         .as_array()
         .cloned()
@@ -922,6 +1005,23 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
             s.action = Some("run `tazamun start` and re-run `tazamun doctor`".into());
             sections.push(s);
         }
+    }
+
+    // Portability (from daemon): count of remote records held unapplied
+    // because their paths cannot exist on this filesystem.
+    if let Some(n) = daemon
+        .as_ref()
+        .and_then(|d| d["unapplied_count"].as_u64())
+        .filter(|n| *n > 0)
+    {
+        let mut s = Section::from_warn("portability  [from daemon]");
+        s.lines.push(format!(
+            "unapplied paths    : {n} remote file(s) held back (non-portable names)"
+        ));
+        s.action = Some(
+            "run `tazamun status` for the list; rename on the origin node to sync them".into(),
+        );
+        sections.push(s);
     }
 
     // Airgap banner (from daemon): list the closed-network guarantees.
@@ -1009,6 +1109,9 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
 
     // (d) filesystem sanity (local probe).
     sections.push(filesystem_section(dir, classify_mount(dir)));
+    if let Some(s) = crate::doctor::long_paths_section(dir) {
+        sections.push(s);
+    }
 
     // (e) IPC health (local).
     sections.push(ipc_section(dir, alive));
