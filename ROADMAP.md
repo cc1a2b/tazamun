@@ -50,19 +50,17 @@ below is **out of scope for v0.1** and tracked here for later milestones.
 
 ## Final acceptance (after P7, before the single v0.1.0 tag)
 
-Recorded 2026-07-11 under the local-only development policy (owner decision;
-the policy is verbatim in DECISIONS.md). Until final acceptance: no pushes and
-no GitHub Actions — the local gates and the SMOKE ladder are the only gates.
-In item (a) the scrub pattern is spelled `<assistant-name>` so this file can
-never trip the very gate it records.
+Recorded 2026-07-11; updated after the local-only freeze was **rescinded** for
+the push-freely policy (DECISIONS.md). Pushes now happen at every phase close,
+so history reaches GitHub incrementally and `ci.yml` stays
+`workflow_dispatch`-only. What still must be cleared before the release tag:
 
-- [ ] **a.** ONE push of the complete local history to GitHub (after
-      clean-repo gates over the FULL accumulated history: `git grep -i
-      <assistant-name>` empty, `git ls-files` empty, `git log --all --grep`
-      empty, single cc1a2b identity on every commit).
-- [ ] **b.** Restore ci.yml push/pull_request triggers; restart both
-      self-hosted runner services; one full cold 3-OS pass (self-hosted linux
-      + windows, one paid macos-full under the existing $5 cap).
+- [x] **a.** Full history on GitHub with clean-repo gates green (`git grep -i
+      claude` AND `-i anthropic` empty, single cc1a2b identity on every
+      commit). An ongoing invariant, kept green on every push.
+- [ ] **b.** One full cold 3-OS pass via `workflow_dispatch` (ci.yml stays
+      dispatch-only): restart the two self-hosted runner services for the
+      linux + windows legs, plus one paid `macos-full` under the $5 cap.
 - [ ] **c.** The deferred platform debt, all of it: P5 macOS LaunchAgent live
       bootstrap check · P3 two-network Relayed proof (two machines, different
       networks, self-hosted relay, status shows Relayed + hostname) · the
