@@ -66,8 +66,15 @@ pub struct LeaseInfo {
 /// Why a lock request was denied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DenyReason {
-    Held { by: String },
+    Held {
+        by: String,
+    },
     TieLost,
+    // ── Protocol minor 3 (P6): appended after `TieLost` so `Held` = 0 and
+    // `TieLost` = 1 keep their postcard discriminants (append-only wire compat).
+    /// The responder is at its tracked-lease capacity (a DoS bound), so it
+    /// declines to track a new lease rather than grow without limit.
+    Unavailable,
 }
 
 /// Every message that can cross an authenticated control connection, plus the
@@ -174,6 +181,26 @@ pub async fn write_msg(send: &mut SendStream, msg: &Msg) -> Result<(), ProtoErro
     send.write_all(&len).await?;
     send.write_all(&body).await?;
     Ok(())
+}
+
+/// Decodes one complete framed message from an in-memory buffer, applying the
+/// exact rules of [`read_msg`]: a `u32` big-endian length prefix, reject length
+/// `0` or `> MAX_FRAME`, then postcard-decode exactly that many body bytes.
+///
+/// Pure and allocation-bounded (it never allocates more than the caller already
+/// holds), so the fuzz harness (`fuzz/fuzz_targets/fuzz_frame.rs`) and the
+/// framing regression tests exercise the decoder without a live QUIC stream.
+pub fn decode_frame(buf: &[u8]) -> Result<Msg, ProtoError> {
+    let len_bytes: [u8; 4] = buf
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ProtoError::BadLength(buf.len()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len == 0 || len > MAX_FRAME {
+        return Err(ProtoError::BadLength(len));
+    }
+    let body = buf.get(4..4 + len).ok_or(ProtoError::BadLength(len))?;
+    postcard::from_bytes(body).map_err(ProtoError::Decode)
 }
 
 /// Reads one framed message. Any error is fatal for the connection.

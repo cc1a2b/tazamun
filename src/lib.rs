@@ -34,6 +34,43 @@ pub mod consts {
     pub const MAX_PATH_LEN: usize = 4096;
     /// Hard cap on the number of chunks a single file manifest may reference.
     pub const MAX_CHUNKS_PER_FILE: usize = 1_048_576;
+
+    // ── DoS / resource bounds (P6 security pass) ────────────────────────────
+    // Every value here caps a resource an attacker on the wire could otherwise
+    // grow without limit. Rationale for each lives in DECISIONS.md and
+    // docs/THREAT_MODEL.md; the enforcement sites are named there.
+    /// Max control connections allowed to be mid-handshake at once. A peer that
+    /// knows the gossip topic but not the session secret can open QUIC
+    /// connections yet never complete the proof; without a cap each attempt
+    /// ties up a task and a stream for up to [`HANDSHAKE_DEADLINE`]. Beyond
+    /// this the accept side closes immediately (fail-closed).
+    pub const MAX_INFLIGHT_HANDSHAKES: usize = 64;
+    /// Max simultaneously authenticated control peers. A session is a small
+    /// trusted group; this bounds peer-table, per-peer task and channel growth
+    /// even if an insider spins up many endpoint identities.
+    pub const MAX_PEERS: usize = 128;
+    /// Max file pulls executing at once. A malicious `Index` advertising
+    /// thousands of paths would otherwise spawn one dial+fetch task each;
+    /// excess paths wait in a backlog and start as running pulls complete.
+    pub const MAX_CONCURRENT_PULLS: usize = 32;
+    /// Max paths waiting behind the running-pull cap. Beyond this an advertised
+    /// record is dropped (it stays in the peer index, so FRESHNESS still gates
+    /// edits and the peer re-advertises it later); bounds backlog memory under
+    /// a hostile `Index` flood.
+    pub const MAX_PULL_BACKLOG: usize = 8192;
+    /// Max distinct paths the lock-waitlist interest map tracks. A new path is
+    /// ignored past this cap so a peer cannot grow the map without limit (the
+    /// per-path waiter set is separately bounded by [`MAX_PEERS`]).
+    pub const MAX_WAITLIST_ENTRIES: usize = 4096;
+    /// Max leases the pure lock table tracks across all paths. Bounds memory
+    /// against an `Index` advertising a flood of hostile `LeaseInfo` entries or
+    /// a `LockReq` storm.
+    pub const MAX_TRACKED_LEASES: usize = 4096;
+    /// Max encoded size of a manifest blob the transfer layer will load into
+    /// memory. [`MAX_CHUNKS_PER_FILE`] chunk refs at the largest postcard
+    /// encoding (32-byte hash + 5-byte varint length ≈ 37 B) with headroom, so
+    /// a hostile peer cannot force an unbounded `get_bytes` on a manifest blob.
+    pub const MAX_MANIFEST_BYTES: u64 = MAX_CHUNKS_PER_FILE as u64 * 48;
     /// FastCDC minimum chunk size.
     pub const CDC_MIN: u32 = 16 * 1024;
     /// FastCDC average (target) chunk size.
@@ -72,10 +109,12 @@ pub mod consts {
     /// Control-plane protocol minor version. The `CTL_ALPN` major stays `/1`;
     /// this documents append-only wire additions. Bumped to 2 in P4 for the
     /// `LockInterest` / `LockFreed` waitlist messages (appended after `Bye`, so
-    /// every prior variant keeps its postcard discriminant). Within the v0.1
-    /// dev line all nodes share one build, so an older node never receives a
-    /// newer variant; the const is the forward-compat marker.
-    pub const PROTOCOL_MINOR: u16 = 2;
+    /// every prior variant keeps its postcard discriminant). Bumped to 3 in P6
+    /// for the `DenyReason::Unavailable` variant (appended after `TieLost`, same
+    /// append-only rule). Within the v0.1 dev line all nodes share one build, so
+    /// an older node never receives a newer variant; the const is the
+    /// forward-compat marker.
+    pub const PROTOCOL_MINOR: u16 = 3;
     /// Whole-handshake deadline for the control-plane proof exchange.
     pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
     /// Interval between encrypted presence beacons on the gossip topic.

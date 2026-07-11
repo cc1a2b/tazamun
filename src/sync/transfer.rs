@@ -18,10 +18,10 @@ use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 
-use crate::consts::{FETCH_CONCURRENCY, INLINE_MANIFEST_MAX, MAX_CHUNKS_PER_FILE};
+use crate::consts::{FETCH_CONCURRENCY, INLINE_MANIFEST_MAX, MAX_MANIFEST_BYTES};
 use crate::proto::{ChunkRef, FileRecord, ManifestRef};
 use crate::state::RelPath;
-use crate::sync::chunker;
+use crate::sync::{chunker, manifest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -229,23 +229,29 @@ impl Transfer {
                         .map_err(|e| TransferError::Fetch(e.to_string()))?;
                 }
                 tags.push(self.store.tags().temp_tag(h).await.map_err(store_err)?);
+                // DoS bound: a manifest blob is untrusted peer input. Its size
+                // is known from the verified store entry, so refuse to load one
+                // larger than MAX_MANIFEST_BYTES into memory before `get_bytes`.
+                if let iroh_blobs::api::proto::BlobStatus::Complete { size } =
+                    self.store.blobs().status(h).await.map_err(store_err)?
+                    && size > MAX_MANIFEST_BYTES
+                {
+                    return Err(TransferError::ManifestInvalid(format!(
+                        "manifest blob is {size} bytes, exceeds the {MAX_MANIFEST_BYTES}-byte cap"
+                    )));
+                }
                 let bytes = self.store.blobs().get_bytes(h).await.map_err(store_err)?;
-                postcard::from_bytes(&bytes)
+                // Decode with the chunk-count cap enforced (pure, shared with
+                // the fuzz harness and the manifest-bomb regression tests).
+                manifest::decode_blob(&bytes)
                     .map_err(|e| TransferError::ManifestInvalid(e.to_string()))?
             }
         };
-        if refs.len() > MAX_CHUNKS_PER_FILE {
-            return Err(TransferError::ManifestInvalid(format!(
-                "{} chunks exceeds cap",
-                refs.len()
-            )));
-        }
-        let total: u64 = refs.iter().map(|r| u64::from(r.len)).sum();
-        if total != expected_size {
-            return Err(TransferError::ManifestInvalid(format!(
-                "chunk lengths sum to {total}, record says {expected_size}"
-            )));
-        }
+        // Count cap + checked (overflow-audited) length fold equal to the
+        // record's declared size. Rejects chunk-count/size bombs before any
+        // allocation proportional to the claim.
+        manifest::check(&refs, expected_size)
+            .map_err(|e| TransferError::ManifestInvalid(e.to_string()))?;
         Ok(refs)
     }
 

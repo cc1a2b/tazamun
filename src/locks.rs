@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use crate::consts::{ACQUIRE_TIMEOUT, LEASE_RENEW, LEASE_TTL, MAX_LEASE_TTL, MIN_LEASE_TTL};
+use crate::consts::{
+    ACQUIRE_TIMEOUT, LEASE_RENEW, LEASE_TTL, MAX_LEASE_TTL, MAX_TRACKED_LEASES, MIN_LEASE_TTL,
+};
 use crate::proto::DenyReason;
 use crate::state::RelPath;
 
@@ -89,6 +91,11 @@ pub struct LockTable {
     me: Id,
     timings: LockTimings,
     states: BTreeMap<RelPath, LockState>,
+    /// DoS bound: the most distinct paths the table will ever track. A new-path
+    /// insertion at capacity is refused (an existing path still updates), so a
+    /// hostile `Index` lease flood or `LockReq` storm cannot grow it without
+    /// limit. See [`MAX_TRACKED_LEASES`].
+    max_leases: usize,
 }
 
 impl LockTable {
@@ -97,7 +104,22 @@ impl LockTable {
             me,
             timings,
             states: BTreeMap::new(),
+            max_leases: MAX_TRACKED_LEASES,
         }
+    }
+
+    /// True when the table already tracks `path`; used to decide whether a new
+    /// insertion would breach the [`MAX_TRACKED_LEASES`] cap.
+    fn at_capacity_for_new(&self, path: &RelPath) -> bool {
+        !self.states.contains_key(path) && self.states.len() >= self.max_leases
+    }
+
+    /// Test-only: shrink the tracked-lease cap so the bound is exercised
+    /// without inserting thousands of entries.
+    #[cfg(test)]
+    fn with_max_leases(mut self, n: usize) -> Self {
+        self.max_leases = n;
+        self
     }
 
     pub fn me(&self) -> &Id {
@@ -211,6 +233,11 @@ impl LockTable {
     ) -> Decision {
         self.prune_expired(path, now);
         let ttl = self.ttl_from_ms(ttl_ms);
+        if self.at_capacity_for_new(path) {
+            // DoS bound: at the tracked-lease cap, decline a brand-new path
+            // rather than grow the table. Existing paths are unaffected.
+            return Decision::Deny(DenyReason::Unavailable);
+        }
         match self.states.get(path) {
             Some(LockState::Held {
                 holder: h,
@@ -317,6 +344,11 @@ impl LockTable {
         now: Instant,
     ) {
         self.prune_expired(path, now);
+        if self.at_capacity_for_new(path) {
+            // DoS bound: do not begin tracking a new observed lease past the
+            // cap (an `Index` can advertise a flood of hostile `LeaseInfo`).
+            return;
+        }
         let expires = now + self.ttl_from_ms(expires_in_ms);
         match self.states.get(path) {
             None => {
@@ -722,5 +754,53 @@ mod tests {
         t.start_request(&p("f"), 1, voters(&[B]), now).unwrap();
         let swept = t.sweep(now + Duration::from_secs(9));
         assert_eq!(swept.timed_out, vec![p("f")]);
+    }
+
+    #[test]
+    fn tracked_lease_cap_refuses_new_paths_but_updates_existing() {
+        // Cap of 2 tracked paths. A third distinct remote request is denied
+        // with `Unavailable` rather than growing the table.
+        let mut t = table(A).with_max_leases(2);
+        let now = Instant::now();
+        assert_eq!(
+            t.on_remote_request(&p("a"), &B.to_string(), 1, 90_000, now),
+            Decision::Grant
+        );
+        assert_eq!(
+            t.on_remote_request(&p("b"), &B.to_string(), 1, 90_000, now),
+            Decision::Grant
+        );
+        assert_eq!(
+            t.on_remote_request(&p("c"), &B.to_string(), 1, 90_000, now),
+            Decision::Deny(DenyReason::Unavailable)
+        );
+        // An already-tracked path still refreshes at capacity (same holder).
+        assert_eq!(
+            t.on_remote_request(&p("a"), &B.to_string(), 2, 90_000, now),
+            Decision::Grant
+        );
+        // A freed slot admits a new path again.
+        t.on_release(&p("a"), &B.to_string());
+        assert_eq!(
+            t.on_remote_request(&p("c"), &B.to_string(), 1, 90_000, now),
+            Decision::Grant
+        );
+    }
+
+    #[test]
+    fn observed_lease_flood_is_capped() {
+        // A hostile Index advertising many leases cannot grow the table past
+        // the cap; existing entries still update.
+        let mut t = table(A).with_max_leases(2);
+        let now = Instant::now();
+        t.observe_lease(&p("a"), &B.to_string(), 1, 90_000, now);
+        t.observe_lease(&p("b"), &B.to_string(), 1, 90_000, now);
+        t.observe_lease(&p("c"), &B.to_string(), 1, 90_000, now); // dropped
+        assert_eq!(t.holder(&p("a")), Some(&B.to_string()));
+        assert_eq!(t.holder(&p("b")), Some(&B.to_string()));
+        assert_eq!(t.holder(&p("c")), None);
+        // Existing path still takes a lower-(lamport,id) takeover at capacity.
+        t.observe_lease(&p("a"), &"aaaa".to_string(), 0, 90_000, now);
+        assert_eq!(t.holder(&p("a")), Some(&"aaaa".to_string()));
     }
 }
