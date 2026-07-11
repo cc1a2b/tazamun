@@ -46,7 +46,7 @@ Do **not** reintroduce any TTL rule that depends on the *receiver's* config.
 | File | Invariant it owns |
 | --- | --- |
 | `src/lib.rs` | `consts` — every tuning constant lives here |
-| `src/state.rs` | atomic `state.json` persistence; `RelPath` newtype; 0600/0700 modes; `SessionConfig` (relay/lan/airgap) with defaulting in-place upgrade |
+| `src/state.rs` | atomic `state.json` persistence; `RelPath` newtype; 0600/0700 modes; `SessionConfig` (relay/lan/airgap + timings/autolock/`dashboard-port`) with defaulting in-place upgrade; shared live-config setter (`set_live_value`) |
 | `src/session.rs` | HKDF key derivation, `tzm1…` ticket encode/decode; zeroize-on-drop |
 | `src/proto.rs` | control framing (`u32` len + postcard, reject 0 / > 4 MiB) + `Msg` |
 | `src/sync/vclock.rs` | pure version-vector algebra (no I/O) |
@@ -63,11 +63,12 @@ Do **not** reintroduce any TTL rule that depends on the *receiver's* config.
 | `src/net/telemetry.rs` | pure per-peer health sampling + grade function (zero I/O) |
 | `src/doctor.rs` | `doctor` sections + verdicts; injectable mount classifier (zero state I/O) |
 | `src/ui/progress.rs` | terminal-only presentation: bars, spinners, tracing bridge (no protocol/state) |
-| `src/ipc.rs` | local socket / named pipe, one JSON line per request |
-| `src/daemon.rs` | the single state-owning actor; **all** mutation happens here; autolock flow + waitlist (`my_waits`/`interest`) live here |
+| `src/ipc.rs` | local socket / named pipe, one JSON line per request; `Dashboard{Info,State}` + `ConfigSet` ops |
+| `src/dashboard.rs` / `src/dashboard.html` | loopback web dashboard served by the daemon: hand-rolled HTTP/1.1 over tokio (no framework), random session token (constant-time), CSP+nonce, `Host` allowlist (anti-DNS-rebind), 127.0.0.1-only bind; a **thin adapter** over the same IPC channel; single-file embedded UI via `include_str!` |
+| `src/daemon.rs` | the single state-owning actor; **all** mutation happens here; autolock flow + waitlist (`my_waits`/`interest`) + the dashboard state/config-set handlers live here |
 | `src/win_fs.rs` | `\\?\` extended-length conversion (long paths) + bounded retry for contended Windows file ops + RO-clear ordering rule |
 | `src/service.rs` | per-folder background service (systemd user unit / LaunchAgent / Scheduled Task) + size-rotated `daemon.log` writer |
-| `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config`/`service` commands, flag→config→default precedence, non-TTY log tee |
+| `src/cli.rs` / `src/main.rs` | clap surface + thin binary; global net flags, `config`/`service`/`dashboard` commands, `completions`/`man` generators, `--version` build id, flag→config→default precedence, non-TTY log tee |
 | `build.rs` | Windows-target `longPathAware` manifest embed (no effect elsewhere) |
 | `deploy/relay/` | self-contained self-hosted iroh-relay kit (Docker Compose + ACME TLS); not part of the crate build |
 

@@ -39,14 +39,16 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [x] DoS/resource bounds across the wire surface (handshakes, peers, pulls,
         waitlist, lease table, manifest-blob size)
   - [x] Threat model document + pentest playbook + runnable hostile-peer kit
-- [ ] **P7 — User surface**
-  - [ ] Local web dashboard served by the daemon: live members & health from
-        the `status` JSON schema-1 contract, file & lock table with one-click
-        lock/unlock, conflicts browser, version history + restore, invite QR
-  - [ ] CLI polish: shell completions, man page
-  - [ ] Portability polish: opt-in name-mangling so Windows nodes can
-        materialize non-portable paths under an escaped name (today they are
-        held as "unapplied" — never guessed, never mangled silently)
+- [x] **P7 — User surface**
+  - [x] Local web dashboard served by the daemon: live members & health (status
+        schema-1), files & locks with one-click lock/unlock + inline
+        lock-failure diagnosis, conflicts browser, version history + restore,
+        invite QR — loopback-only, token-guarded, strict CSP; `api:1` contract
+  - [x] CLI polish: shell completions (bash/zsh/fish/powershell/elvish), man
+        page, `--version` build id, per-subcommand `--help` audit
+  - [ ] Portability polish: opt-in name-mangling for non-portable paths on
+        Windows — **deferred beyond v0.1** (today they are held "unapplied",
+        never guessed, never mangled silently; the safe default stands)
 
 ## Final acceptance (after P7, before the single v0.1.0 tag)
 
