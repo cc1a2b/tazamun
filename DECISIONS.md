@@ -176,6 +176,151 @@ below are verbatim, with one substitution: the scrub pattern in 4a is spelled
   frozen on GitHub with the rest of the remote; the single final push will
   mark it merged.
 
+## Phase 6 — security pass (fuzzing, replay resistance, DoS bounds, threat model)
+
+Adversary model for the whole phase: an attacker who has the **gossip topic but
+not the session secret**, plus a **malicious authenticated insider** (a former
+member). Everything on the wire is treated as hostile. The full write-up is
+`docs/THREAT_MODEL.md`; the hands-on drills are `docs/PENTEST_PLAYBOOK.md`.
+
+### What was already sound (verified, not added)
+
+The insider-facing integrity defenses already existed and were confirmed by the
+new tests, not newly built: every remote path is re-run through
+`sanitize_rel_path` at the wire boundary (`daemon::on_ctl`), `on_grant` counts a
+grant only from a voter, `on_renew`/`on_release` check holder identity,
+concurrent version vectors quarantine rather than merge, and pulled bytes are
+BLAKE3-verified with atomic staging. P6 hardened the parts that were **not**
+bounded: resource exhaustion, and one manifest memory-amplification path.
+
+### DoS / resource bounds (new — the load-bearing additions)
+
+Every attacker-growable resource now has a cap in `consts`. Values are
+first-cut, legible round numbers (data, easy to retune), chosen to be far above
+any legitimate small-group session yet bound worst-case memory/FDs/tasks.
+
+| Bound (`consts`) | Value | Guards against | Enforcement site |
+| --- | --- | --- | --- |
+| `MAX_INFLIGHT_HANDSHAKES` | 64 | topic-only peer opening connections it can never authenticate, tying up tasks/streams for the handshake deadline | `daemon::CtlAccept::accept` (semaphore, fail-closed) |
+| `MAX_PEERS` | 128 | an insider spinning up many identities to bloat the peer table | `daemon::on_authed` |
+| `MAX_CONCURRENT_PULLS` | 32 | a hostile `Index` spawning one dial/fetch task per advertised path | `daemon::maybe_pull` + `drain_pull_backlog` |
+| `MAX_PULL_BACKLOG` | 8192 | the backlog itself growing without limit under a flood | `daemon::enqueue_pull_backlog` (drop-at-cap; record stays in the peer index so FRESHNESS still gates edits) |
+| `MAX_WAITLIST_ENTRIES` | 4096 | `LockInterest` flooding the interest map | `daemon::on_ctl` (`Msg::LockInterest`) |
+| `MAX_TRACKED_LEASES` | 4096 | an `Index` advertising a flood of `LeaseInfo`, or a `LockReq` storm | `locks::{on_remote_request, observe_lease}` via `at_capacity_for_new` |
+| `MAX_MANIFEST_BYTES` | `MAX_CHUNKS_PER_FILE × 48` (~50 MiB) | a manifest **blob** forcing an unbounded `get_bytes` into memory | `transfer::resolve_manifest` (size checked via `BlobStatus::Complete` before load) |
+
+**Wire change (append-only, `PROTOCOL_MINOR` 2→3):** the tracked-lease cap needs
+a way to decline a new lease, so `DenyReason::Unavailable` was appended after
+`TieLost` (keeping `Held`=0/`TieLost`=1 discriminants). Same append-only rule as
+the P4 waitlist variants; within the v0.1 dev line all nodes share one build.
+
+**Pull-concurrency design note:** dropping a backlogged record at the cap is
+safe because it stays in the peer index — the FRESHNESS precondition still
+refuses a local lease while a peer advertises a newer version, so the Golden
+Invariant holds; the file simply isn't pulled until the peer re-advertises. A
+determined insider can therefore delay (not corrupt) a sync. This is the
+"integrity, not availability, against a hostile member" trade in the threat
+model's "not defended" list.
+
+### Manifest size-fold overflow audit (explicit, as required)
+
+Extracted the pure checks into `sync::manifest` (zero I/O), shared by the
+transfer layer, the fuzz harness, and the bomb regression tests:
+
+- **Count cap first:** `decode_blob` rejects `> MAX_CHUNKS_PER_FILE` chunks
+  after postcard decode (postcard/serde bound their own pre-allocation, so a
+  hostile length prefix errors on a short buffer rather than reserving GBs).
+- **Checked fold:** `folded_size` uses `checked_add`, returning a typed
+  `SizeOverflow` instead of wrapping (release) or panicking (debug). Audit: at
+  the cap (2^20) with every `len = u32::MAX` the exact sum is ≈ 4.5e15, well
+  inside `u64` — so with the count cap enforced first it never overflows in
+  practice; the checked fold is defense against a future cap change.
+- **Blob-size pre-check:** a manifest blob larger than `MAX_MANIFEST_BYTES` is
+  rejected before `get_bytes`, closing the one real memory-amplification path an
+  insider had (advertise `ManifestRef::Blob`, then serve a huge blob).
+
+### Fuzzing (cargo-fuzz + libFuzzer, `fuzz/` — detached workspace member)
+
+`fuzz/` is excluded from the workspace (parent `Cargo.toml` `[workspace]
+exclude`) so the normal gates and the release build never touch it (it needs
+nightly + a sanitizer). Four targets over the untrusted parsers, seeded from
+real encoded artifacts (`examples/gen_seeds.rs`). To make the stream decoders
+fuzzable without a live QUIC stream, two pure helpers were added:
+`proto::decode_frame` (length-prefix + postcard, mirrors `read_msg`) and the
+`sync::manifest` module.
+
+Bounded run on this machine (WSL, `-max_total_time=180` each), **zero surviving
+crashers**:
+
+| target | parser | executions | cov |
+| --- | --- | --- | --- |
+| `fuzz_frame` | `proto::decode_frame` | 35,162,989 | 736 |
+| `fuzz_ticket` | `session::Ticket::decode` | 15,530,237 | 622 |
+| `fuzz_manifest` | `sync::manifest::{decode_blob, folded_size, check}` | 17,126,124 | 434 |
+| `fuzz_msg` | full `Msg` deserializer + `sanitize_rel_path` | 7,922,563 | 1,023 |
+
+~75.7M total executions, no panics / OOMs / hangs, so there are currently **no
+crashers to turn into regressions** — the bomb/overflow/traversal cases are
+instead pinned by the deterministic unit tests in `sync::manifest` and the
+integration tests in `tests/security.rs`. (Had a crasher appeared, the exact
+bytes would become a `tests/` case per the plan.)
+
+### Handshake replay, auth matrix, insider, traversal (`tests/security.rs`)
+
+Extended the existing suite (in-memory/loopback real transport via the
+`RawPeer` harness):
+
+- **Replay:** a proof recorded from one valid handshake, replayed on a fresh
+  connection (reusing the old `nonce_a` for the strongest replay), is rejected —
+  the node's fresh `nonce_b` defeats it. Proofs bind both nonces.
+- **Wrong-secret matrix, no oracle:** initiator-wrong / acceptor-wrong /
+  both-wrong all fail closed; the initiator always returns the *same* generic
+  `"handshake failed"` regardless of which side is wrong, so nothing
+  distinguishes a bad proof from a wrong peer.
+- **Nonce freshness:** 24 handshakes yield 24 distinct, non-zero `nonce_b`.
+- **Insider illegal sequences:** after a valid handshake, `LockGrant` for an
+  unrequested path, `LockRenew` for a lease not held, and `FileMeta` advertising
+  unservable content are all ignored — no lease created, nothing written, the
+  peer is not dropped, the daemon stays responsive.
+- **Flood respects the pull cap:** a 300-path hostile `Index` never pushes
+  active pulls past `MAX_CONCURRENT_PULLS`, writes nothing, daemon healthy.
+- **Wire traversal via `FileMeta`** (not just `Index`): `../`, absolute,
+  drive-letter, backslash, NUL, reserved, and overlong paths are dropped whole.
+
+Reserved-device / case-collision on a live Windows node stays a SMOKE item
+(deferred to final acceptance, per the local-only policy — the pure validator is
+already unit-tested cross-platform in `sync::index`).
+
+### cargo audit reconciliation (P6)
+
+`cargo audit` reports **zero vulnerabilities** across the now-**549**-crate
+lockfile (was 495 at P0; the growth is P1–P5 deps — rayon/indicatif/humantime,
+the build-dep `embed-manifest`, etc.). The three ignored advisories in
+`.cargo/audit.toml` are all still present and all still "unmaintained crate"
+notices in transitive **build-time** deps, freshly re-verified:
+
+- **RUSTSEC-2023-0089 (`atomic-polyfill`)** — still has *no* reverse edge for our
+  host targets (`cargo tree -i atomic-polyfill` is empty); a platform-gated
+  lockfile entry only. Zero runtime impact.
+- **RUSTSEC-2024-0436 (`paste`)** — via `iroh → netwatch → netdev →
+  netlink-packet-core`; a build-time proc-macro.
+- **RUSTSEC-2024-0370 (`proc-macro-error`)** — via `iroh-blobs → bao-tree →
+  genawaiter → genawaiter-proc-macro`; a build-time proc-macro.
+
+None is an exploitable vulnerability; each is fixed only by an upstream iroh-tree
+bump, so re-check on the next iroh update. Ignore-list unchanged (no stale
+entries — all three still match).
+
+### cc1a2b's pentest kit (deliverable)
+
+`examples/hostile_peer.rs` — a runnable insider that completes the real
+handshake and drives attacker-chosen frames by scenario flag
+(`--scenario lease-grant-flood | manifest-storm | traversal-index |
+replay-handshake | all`, `--count N`). `docs/PENTEST_PLAYBOOK.md` has the exact
+build/run commands, per-scenario "what healthy looks like", and evidence
+capture. This is the manual window: run it after the automated pass and report
+survivors.
+
 ## Phase 5 — Windows hardening, background service, signing groundwork
 
 ### macos-full dispatch vs the $0 budget (unresolved external block) + macOS risk analysis

@@ -31,10 +31,14 @@ below is **out of scope for v0.1** and tracked here for later milestones.
         Scheduled Task) with a size-rotated daemon log
   - [x] Code signing groundwork (release provenance attestations; certificate
         signing deferred and documented in docs/SIGNING.md)
-- [ ] **P6 — Security pass**
-  - [ ] `cargo-fuzz` targets (frame decoder, ticket parser, manifest parser)
-  - [ ] Handshake replay tests
-  - [ ] Threat model document
+- [x] **P6 — Security pass**
+  - [x] `cargo-fuzz` targets (frame decoder, ticket parser, manifest parser,
+        full `Msg` deserializer) — ~75.7M executions, zero crashers
+  - [x] Handshake replay + wrong-secret-matrix + nonce-freshness tests
+  - [x] Malicious-insider + wire-traversal tests (nothing un-verified written)
+  - [x] DoS/resource bounds across the wire surface (handshakes, peers, pulls,
+        waitlist, lease table, manifest-blob size)
+  - [x] Threat model document + pentest playbook + runnable hostile-peer kit
 - [ ] **P7 — User surface**
   - [ ] Local web dashboard served by the daemon: live members & health from
         the `status` JSON schema-1 contract, file & lock table with one-click

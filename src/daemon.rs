@@ -188,10 +188,23 @@ struct CtlAccept {
     keys: std::sync::Arc<SessionKeys>,
     me: EndpointId,
     events: mpsc::Sender<Event>,
+    /// DoS bound: permits for concurrent pre-auth handshakes
+    /// ([`crate::consts::MAX_INFLIGHT_HANDSHAKES`]).
+    handshakes: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl ProtocolHandler for CtlAccept {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // DoS bound: a peer that knows the gossip topic but not the session
+        // secret can open QUIC connections it can never authenticate. Cap the
+        // number mid-handshake at once; beyond it, close immediately rather
+        // than tie up a task and a stream for the full handshake deadline. The
+        // permit is held (RAII) for the duration of the handshake.
+        let Ok(_permit) = self.handshakes.clone().try_acquire_owned() else {
+            debug!("at MAX_INFLIGHT_HANDSHAKES; refusing inbound control connection");
+            conn.close(iroh::endpoint::VarInt::from_u32(2), b"busy");
+            return Ok(());
+        };
         match handshake_acceptor(&conn, &self.keys, self.me).await {
             Ok((send, recv)) => {
                 let _ = self
@@ -293,6 +306,9 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     let (events_tx, events_rx) = mpsc::channel::<Event>(4096);
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
+    let ctl_handshakes = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        crate::consts::MAX_INFLIGHT_HANDSHAKES,
+    ));
     let router = Router::builder(endpoint.clone())
         .accept(
             crate::consts::CTL_ALPN,
@@ -300,6 +316,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
                 keys: std::sync::Arc::new(keys.clone()),
                 me,
                 events: events_tx.clone(),
+                handshakes: ctl_handshakes,
             },
         )
         .accept(iroh_blobs::ALPN, BlobsProtocol::new(transfer.store(), None))
@@ -415,6 +432,7 @@ pub async fn spawn(cfg: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         redial_scheduled: BTreeSet::new(),
         backoff: BTreeMap::new(),
         pending_pulls: BTreeMap::new(),
+        pull_backlog: std::collections::VecDeque::new(),
         pull_meters: BTreeMap::new(),
         peer_health: BTreeMap::new(),
         fast_redial_used: BTreeSet::new(),
@@ -479,6 +497,10 @@ struct Actor {
     redial_scheduled: BTreeSet<EndpointId>,
     backoff: BTreeMap<EndpointId, Duration>,
     pending_pulls: BTreeMap<RelPath, PullJob>,
+    /// DoS bound: paths waiting to become active pulls once a slot frees, so at
+    /// most [`crate::consts::MAX_CONCURRENT_PULLS`] pulls run at once. Bounded
+    /// by [`crate::consts::MAX_PULL_BACKLOG`].
+    pull_backlog: std::collections::VecDeque<(RelPath, EndpointId, FileRecord)>,
     pull_meters: BTreeMap<RelPath, std::sync::Arc<Meter>>,
     peer_health: BTreeMap<EndpointId, PeerHealth>,
     fast_redial_used: BTreeSet<EndpointId>,
@@ -627,6 +649,14 @@ impl Actor {
         let id = conn.remote_id();
         if id == self.me {
             conn.close(iroh::endpoint::VarInt::from_u32(0), b"self");
+            return;
+        }
+        // DoS bound: a session is a small trusted group. Refuse a *new* peer id
+        // past MAX_PEERS (a reconnecting/duplicate known peer still gets in via
+        // the duplicate-handling path below).
+        if !self.peers.contains_key(&id) && self.peers.len() >= crate::consts::MAX_PEERS {
+            warn!(peer = %id.fmt_short(), "at MAX_PEERS; refusing new control connection");
+            conn.close(iroh::endpoint::VarInt::from_u32(2), b"busy");
             return;
         }
         let new_initiator = if initiated_by_me { self.me } else { id };
@@ -1179,6 +1209,13 @@ impl Actor {
                                 vec![voter],
                                 "another node requested the same path first; retry in a moment",
                             ),
+                            DenyReason::Unavailable => self.lock_error(
+                                "unavailable",
+                                "the peer is at its tracked-lease capacity",
+                                "LEASE",
+                                vec![voter],
+                                "the responding peer is tracking too many leases; retry later",
+                            ),
                         };
                         let _ = waiter.send(response);
                     }
@@ -1210,6 +1247,14 @@ impl Actor {
                 let Ok(rel) = sanitize_rel_path(path.as_str()) else {
                     return;
                 };
+                // DoS bound: cap the number of distinct waitlisted paths so a
+                // peer cannot grow the interest map without limit.
+                if !self.interest.contains_key(&rel)
+                    && self.interest.len() >= crate::consts::MAX_WAITLIST_ENTRIES
+                {
+                    debug!(peer = %from.fmt_short(), "waitlist at capacity; ignoring LockInterest");
+                    return;
+                }
                 self.interest
                     .entry(rel.clone())
                     .or_default()
@@ -1406,6 +1451,14 @@ impl Actor {
             job.queued = Some((from, record));
             return;
         }
+        // DoS bound: cap concurrently running pulls. Excess new paths wait in a
+        // bounded backlog and start as running pulls complete (finish_pull
+        // drains it); a dropped-at-backlog-cap path stays in the peer index, so
+        // FRESHNESS still gates edits and the peer re-advertises it.
+        if self.pending_pulls.len() >= crate::consts::MAX_CONCURRENT_PULLS {
+            self.enqueue_pull_backlog(rel.clone(), from, record);
+            return;
+        }
         self.pending_pulls.insert(
             rel.clone(),
             PullJob {
@@ -1416,6 +1469,42 @@ impl Actor {
             },
         );
         self.start_pull(rel.clone(), from, record);
+    }
+
+    /// Adds (or refreshes) a path in the bounded pull backlog. Dedups by path
+    /// so a churning advertiser cannot enqueue the same path repeatedly; drops
+    /// the record if the backlog is at [`crate::consts::MAX_PULL_BACKLOG`].
+    fn enqueue_pull_backlog(&mut self, rel: RelPath, from: EndpointId, record: FileRecord) {
+        if let Some(slot) = self.pull_backlog.iter_mut().find(|(p, _, _)| *p == rel) {
+            *slot = (rel, from, record);
+        } else if self.pull_backlog.len() < crate::consts::MAX_PULL_BACKLOG {
+            self.pull_backlog.push_back((rel, from, record));
+        } else {
+            debug!(path = %rel, "pull backlog full; dropping advertised record (stays gated by the peer index)");
+        }
+    }
+
+    /// Starts backlogged pulls while there is capacity (a completed pull just
+    /// freed a slot). Skips paths that became pending or self-held meanwhile.
+    fn drain_pull_backlog(&mut self) {
+        while self.pending_pulls.len() < crate::consts::MAX_CONCURRENT_PULLS {
+            let Some((rel, from, record)) = self.pull_backlog.pop_front() else {
+                break;
+            };
+            if self.pending_pulls.contains_key(&rel) || self.locks.is_held_by_me(&rel) {
+                continue;
+            }
+            self.pending_pulls.insert(
+                rel.clone(),
+                PullJob {
+                    from,
+                    record: record.clone(),
+                    attempts: 0,
+                    queued: None,
+                },
+            );
+            self.start_pull(rel, from, record);
+        }
     }
 
     fn start_pull(&mut self, rel: RelPath, from: EndpointId, record: FileRecord) {
@@ -1588,6 +1677,8 @@ impl Actor {
             );
             self.start_pull(rel.clone(), from, record);
         }
+        // A slot may have freed; admit any waiting backlogged pulls.
+        self.drain_pull_backlog();
     }
 
     // ---------------- watch pipeline ----------------

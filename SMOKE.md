@@ -582,3 +582,45 @@ Install brings the unit `active` under systemd with the daemon answering IPC
 and writing its rotated log; a manual `tazamun start` against the running
 service refuses cleanly; uninstall returns the unit to `inactive` and removes
 the file.
+
+## P6 — security pass: live hostile-peer + replay (WSL, release binary)
+
+Real release binary, real transport. A daemon runs an airgap session with one
+file; `examples/hostile_peer` completes the real handshake and runs every
+attack scenario against it.
+
+```text
+=== BEFORE: file_count=1  "leases": [] ===
+=== hostile_peer --scenario all --count 150 ===
+[lease-grant-flood] sending 150 unrequested LockGrant messages
+[lease-grant-flood] done; the daemon must hold no new leases
+[manifest-storm] sending 150 malformed FileMeta messages
+[manifest-storm] done; the daemon must write nothing (all unverifiable)
+[traversal-index] sending one Index with 11 hostile paths
+[traversal-index] done; every record must be dropped whole
+[replay-handshake] recording a valid proof, then replaying it
+[replay-handshake] OK: the replayed proof was rejected (nonce binding holds)
+=== AFTER: file_count=1  "leases": []  pulls=none ===
+no panic in daemon log
+nothing escaped the folder
+visible files in session: notes.txt
+=== RESULT ===
+P6 WSL SMOKE PASSED (file_count stable at 1, no leases created, daemon healthy)
+```
+
+A former member turned hostile floods 150 unrequested `LockGrant`, storms 150
+malformed `FileMeta` (size-lying inline manifests and petabyte blob bombs),
+sends an `Index` of 11 traversal/reserved/overlong paths, and replays a
+recorded proof — and afterwards the daemon's file table is unchanged (still
+just `notes.txt`), no lease was created, no pull is stuck, the log has no
+panic, and nothing was written outside the session folder. The replayed proof
+is rejected because it binds both handshake nonces.
+
+**Fuzzing (same machine):** `cargo +nightly fuzz run` on all four targets,
+`-max_total_time=180` each — `fuzz_frame` 35.16M execs, `fuzz_ticket` 15.53M,
+`fuzz_manifest` 17.13M, `fuzz_msg` 7.92M (~75.7M total), **zero crashers**.
+
+**Deferred to final acceptance** (per the local-only development policy, and no
+Windows-specific code changed in P6 — the shared paths are covered by the Linux
+full suite and the fuzzers): the native **Windows** host re-run of this SMOKE,
+the macOS pass, and the cold-runner pass. NOT pushed.

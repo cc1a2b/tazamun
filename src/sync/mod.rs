@@ -3,5 +3,6 @@
 
 pub mod chunker;
 pub mod index;
+pub mod manifest;
 pub mod transfer;
 pub mod vclock;
