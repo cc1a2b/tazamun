@@ -94,6 +94,88 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Local-only development policy (owner decision)
+
+Recorded 2026-07-11. Decided by cc1a2b (the project owner), effective
+immediately through the end of P7. He has been explicitly informed of the
+data-loss and deferred-platform-debt risks and accepts them. The six rules
+below are verbatim, with one substitution: the scrub pattern in 4a is spelled
+`<assistant-name>` so this ledger can never trip the very gate it records.
+
+1. NO PUSHES to GitHub of any kind until final acceptance after P7 — no
+   branches, no main, nothing. The remote freezes at its current state (end
+   of P4). All work is local-only: continue branching, committing, and
+   merging to LOCAL main exactly as before; history stays clean for the
+   eventual single push.
+2. NO GitHub Actions of any kind until final acceptance: edit
+   .github/workflows/ci.yml to trigger ONLY on workflow_dispatch (remove
+   push/pull_request triggers) — commit that locally. The pending P5
+   macos-full dispatch is CANCELLED. Do not mint runner tokens, do not touch
+   billing, do not dispatch anything. The self-hosted runner services on this
+   machine may be stopped (svc.sh stop in WSL; Stop-Service on the host) to
+   free resources — note it so they can be restarted at final acceptance.
+3. LOCAL GATES BECOME THE ONLY GATES and are now MANDATORY-STRICT: cargo fmt
+   --check · cargo clippy --all-targets -- -D warnings · cargo test after
+   every step, plus the full real-binary SMOKE ladder re-run at every phase
+   close on this machine (Linux/WSL) AND natively on the Windows host (both
+   toolchains exist locally). A phase merges to local main only when both are
+   green. Each closing report states: "platform verification (macOS +
+   cold-runner) deferred to final acceptance; NOT pushed."
+4. FINAL ACCEPTANCE (after P7, before the single v0.1.0 tag) — write this
+   list into ROADMAP.md now as the "Final acceptance" section so none of it
+   is forgotten:
+   a. ONE push of the complete local history to GitHub (after clean-repo
+      gates over the FULL accumulated history: git grep -i <assistant-name>
+      empty, git ls-files empty, git log --all --grep empty, single cc1a2b
+      identity on every commit).
+   b. Restore ci.yml push/pull_request triggers; restart both self-hosted
+      runner services; one full cold 3-OS pass (self-hosted linux + windows,
+      one paid macos-full under the existing $5 cap).
+   c. The deferred platform debt, all of it: P5 macOS LaunchAgent live
+      bootstrap check · P3 two-network Relayed proof (two machines, different
+      networks, self-hosted relay, status shows Relayed + hostname) · the
+      full SMOKE ladder P0→P7 on the release binary.
+   d. Only when a–c are all green: the single annotated v0.1.0 tag, pushed,
+      which fires the parked release.yml.
+5. BACKUP SUBSTITUTE (local-only, since the owner declined remote backup): at
+   every phase close, produce a git bundle of the full repo — git bundle
+   create ~/tazamun-backups/tazamun-p<N>-$(date +%Y%m%d).bundle --all — and
+   verify it with git bundle verify. This costs nothing, touches no network,
+   and gives a restorable snapshot per phase. STRONGLY RECOMMEND to cc1a2b in
+   each closing report that he copy the latest bundle to any second medium
+   (USB stick, phone, E: drive — anything not this NVMe).
+6. Then unblock Phase 5 immediately: merge it to LOCAL main on the strength
+   of the already-green local gates + both self-hosted runs that completed
+   green on the final commit before this policy (record those run IDs as
+   historical evidence), flip ROADMAP P5, create the P5 bundle per rule 5,
+   and deliver the closing report ending "Phase 5 complete — ready for P6."
+   Do NOT push.
+
+### Execution notes (2026-07-11)
+
+- **Runners stopped (rule 2)** — in the form they actually run on this
+  machine (see "Runner persistence" in the Phase 5 section below: they are
+  user-level units/tasks, not svc.sh installs or Windows services). Stopped
+  and disabled: the WSL systemd user unit (`systemctl --user disable --now
+  actions-runner-tazamun`), both Windows logon Scheduled Tasks
+  (`actions-runner-win`, `actions-runner-wsl-boot`), and the running host
+  `Runner.Listener` process. Registrations and `_work` caches left intact.
+  **Restart at final acceptance:** `systemctl --user enable --now
+  actions-runner-tazamun` in WSL; `Enable-ScheduledTask
+  actions-runner-win,actions-runner-wsl-boot` plus `Start-ScheduledTask` for
+  each (or simply log off and on) on the host.
+- **macos-full cancellation needed no remote action:** nothing was queued or
+  running on GitHub — the only dispatch (run 29124994835) had already
+  completed as the billing-refused failure recorded in the Phase 5 section
+  below. The planned re-dispatch is cancelled per rule 2.
+- **P5 merge evidence (rule 6):** on the final pre-policy commit `0aa18d7`,
+  push run **29125369589** (light, self-hosted linux) and PR run
+  **29125371420** (full suite, self-hosted linux AND windows) both completed
+  green on 2026-07-10; the suite had additionally been run natively on the
+  Windows host (see the macOS risk analysis below). PR #5 stays open and
+  frozen on GitHub with the rest of the remote; the single final push will
+  mark it merged.
+
 ## Phase 5 — Windows hardening, background service, signing groundwork
 
 ### macos-full dispatch vs the $0 budget (unresolved external block) + macOS risk analysis
