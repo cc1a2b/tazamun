@@ -51,6 +51,18 @@ pub enum IpcRequest {
     /// The daemon's contribution to `tazamun doctor`: identity, bound sockets,
     /// relay policy/status, and per-peer connectivity from telemetry.
     Doctor,
+    /// Dashboard bootstrap: the loopback port and session token the browser
+    /// needs. Local-only, returned over the 0700 IPC socket.
+    DashboardInfo,
+    /// The full `api:1` dashboard snapshot (status schema-1 plus mode, config
+    /// summary, conflicts, and per-path version counts).
+    DashboardState,
+    /// Set a live-settable config key through the running daemon (applies now
+    /// where possible and persists). Non-network keys only.
+    ConfigSet {
+        key: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

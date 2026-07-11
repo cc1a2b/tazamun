@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod daemon;
+pub mod dashboard;
 pub mod doctor;
 pub mod guard;
 pub mod ipc;
@@ -155,6 +156,18 @@ pub mod consts {
     pub const EVENT_RING: usize = 5;
     /// Name of the metadata directory inside a session folder.
     pub const META_DIR: &str = ".tazamun";
+
+    // ── Web dashboard (P7) ──────────────────────────────────────────────────
+    /// Default loopback port the daemon serves the web dashboard on
+    /// (overridable via the `dashboard_port` session config key).
+    pub const DASHBOARD_PORT: u16 = 8787;
+    /// Length in bytes of the random dashboard session token (hex-encoded to
+    /// twice this many characters). Guards every state-changing dashboard call.
+    pub const DASHBOARD_TOKEN_BYTES: usize = 32;
+    /// Hard cap on one inbound dashboard HTTP request (headers + body). The
+    /// dashboard is a single-user localhost surface; this bounds a hostile or
+    /// buggy client.
+    pub const DASHBOARD_MAX_REQUEST: usize = 1024 * 1024;
 }
 
 /// Milliseconds since the Unix epoch, saturating at zero for pre-epoch clocks.

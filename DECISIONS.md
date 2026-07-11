@@ -134,6 +134,81 @@ P5–P6. From now on:
   **29125369589** (light linux) and **29125371420** (full linux+windows) on
   `0aa18d7`; P6 merged on green local gates + WSL SMOKE + ~75.7M fuzz executions.
 
+## Phase 7 — local web dashboard + CLI polish
+
+The last v0.1 feature: a loopback, read-write control panel the daemon serves,
+for people who dislike the terminal. Built on the `status --json` schema-1
+contract from P2, which was designed for exactly this.
+
+### New dependencies (each justified)
+
+- **`tokio` `net` feature** — not a new crate, one feature flag on the tokio we
+  already run. Gives `TcpListener`/`TcpStream` so the dashboard serves HTTP over
+  the *existing* async runtime and integrates natively with the actor's
+  `mpsc`/`oneshot` channels (no bridge, no extra thread pool). Chosen over a
+  synchronous crate like `tiny_http` precisely to avoid a second runtime.
+- **`clap_complete = "4.6"`** — the official clap companion for `completions
+  <shell>`; matches the pinned clap 4.6 line. Tiny, generator-only, not in the
+  hot path.
+- **`clap_mangen = "0.2"`** — the official clap companion for the roff man page
+  (`tazamun man`); wired into cargo-dist packaging later. Generator-only.
+
+No web framework, no async framework, and **zero JS/npm build step** — the
+frontend is one hand-written `dashboard.html` embedded via `include_str!`.
+
+### Hand-rolled HTTP (no framework)
+
+The API is a handful of localhost endpoints with a single client (the browser),
+so a bounded HTTP/1.1 handler over `tokio::net` (`src/dashboard.rs`) is simpler
+and smaller than pulling in `hyper`/`axum`, and gives full control over the
+security headers. It reads one request bounded by `DASHBOARD_MAX_REQUEST`
+(1 MiB), routes, and replies `Connection: close`.
+
+### Security model (this is a local *write* surface)
+
+- **Loopback-only bind** — `SocketAddr::from(([127,0,0,1], port))`, never
+  `0.0.0.0`. Not configurable.
+- **Session token** — a random `DASHBOARD_TOKEN_BYTES` (32) token minted per
+  daemon start, delivered to the browser in the URL **fragment** (never sent
+  back to the server, so it stays out of logs), presented as `X-Tazamun-Token`
+  on mutations, compared with `subtle::ConstantTimeEq`. Reads are tokenless;
+  every mutation requires it.
+- **Anti-DNS-rebinding** — every request's `Host` must be a loopback name; a
+  rebound attacker hostname is refused, protecting the tokenless reads too.
+- **Strict CSP** — `default-src 'none'`; the single inline script/style run
+  under a **per-response nonce** (`{{__NONCE__}}` substituted at serve time);
+  `connect-src 'self'`; plus `X-Frame-Options: DENY`, `nosniff`,
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-store`.
+- **Thin adapter (the load-bearing design choice)** — the HTTP layer shares the
+  *same* `ipc_tx` channel the local socket uses; every endpoint forwards an
+  `IpcRequest` and awaits the `oneshot` reply, so there is **no second control
+  path** with its own logic, preconditions, or bugs. `/api/lock` is exactly
+  `tazamun lock`, diagnosis and all.
+
+### Design decisions
+
+- **`api:1` envelope** — every response is `{ "api": 1, "ok", data?, error? }`.
+  `/api/state` is a dedicated `DashboardState` IPC op that returns the schema-1
+  status payload plus `mode`, a `config` summary, the `conflicts` list, and
+  per-path `versions` entries — one snapshot for the whole UI, so the **schema-1
+  status contract is left untouched** (no bump, CLI/tests unaffected).
+- **Bound-port reporting** — `serve` may bind port `0` (OS-assigned, used by the
+  parallel integration tests) and publishes the actual port via an
+  `Arc<AtomicU16>` that `DashboardInfo` reads, so the CLI always reports the real
+  URL. A bind failure is logged and non-fatal (the daemon keeps running).
+- **Live config through the daemon** — `/api/config` and the `ConfigSet` IPC go
+  through the *running* actor (`SessionConfig::set_live_value`, shared with the
+  CLI), which persists and applies the effect live (autolock immediately;
+  `lease-ttl`/`acquire-timeout` update `LockTable::set_timings` for new leases;
+  `dashboard-port` on next start). Network keys are refused live (need a
+  restart). This avoids the CLI's edit-`state.json`-while-running race.
+- **`--version` build id** — `build.rs` best-effort captures the git short hash
+  (`rustc-env TAZAMUN_VERSION`), so `tazamun --version` reads `0.1.0 (<hash>)`
+  from a checkout and just `0.1.0` from a release tarball (no `.git`).
+- **Browser launch without a dependency** — `--open` shells out to the platform
+  opener (`xdg-open`/`open`/`cmd /C start`), so no `webbrowser`-style crate.
+- **QR reuses `qrcode`** (from P1) rendered as SVG at `/api/invite/qr`.
+
 ## Phase 6 — security pass (fuzzing, replay resistance, DoS bounds, threat model)
 
 Adversary model for the whole phase: an attacker who has the **gossip topic but

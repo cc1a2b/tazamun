@@ -96,6 +96,9 @@ pub struct SessionConfig {
     /// How long a lock-waitlist entry lives before timing out, in milliseconds.
     #[serde(default = "default_wait_timeout_ms")]
     pub wait_timeout_ms: u64,
+    /// Loopback port the web dashboard binds (P7). Effective on next `start`.
+    #[serde(default = "default_dashboard_port")]
+    pub dashboard_port: u16,
 }
 
 fn default_relay() -> String {
@@ -118,6 +121,10 @@ fn default_wait_timeout_ms() -> u64 {
     crate::consts::WAIT_TIMEOUT.as_millis() as u64
 }
 
+fn default_dashboard_port() -> u16 {
+    crate::consts::DASHBOARD_PORT
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
@@ -128,11 +135,87 @@ impl Default for SessionConfig {
             acquire_timeout_ms: default_acquire_timeout_ms(),
             autolock: false,
             wait_timeout_ms: default_wait_timeout_ms(),
+            dashboard_port: default_dashboard_port(),
         }
     }
 }
 
+fn parse_on_off(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(format!("expected on/off, got {other:?}")),
+    }
+}
+
 impl SessionConfig {
+    /// Applies a config change for the keys that may be set **live** through the
+    /// running daemon (the dashboard's `/api/config` and the `ConfigSet` IPC):
+    /// the non-network keys only. Parses and clamps the value, mutating `self`;
+    /// returns a human note or an error. Network keys (`relay`/`lan`/`airgap`)
+    /// require a restart and are refused here — use `tazamun config set` before
+    /// `start`. Pure (no I/O); the caller persists.
+    pub fn set_live_value(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let clamp_dur = |value: &str, min: Duration, max: Duration| -> Result<Duration, String> {
+            let raw = humantime::parse_duration(value.trim())
+                .map_err(|e| format!("invalid duration {value:?}: {e} (use 90s, 15m, 2h)"))?;
+            Ok(raw.clamp(min, max))
+        };
+        match key {
+            "autolock" => {
+                self.autolock = parse_on_off(value)?;
+                Ok(format!(
+                    "autolock = {}",
+                    if self.autolock { "on" } else { "off" }
+                ))
+            }
+            "lease-ttl" => {
+                let d = clamp_dur(
+                    value,
+                    crate::consts::MIN_LEASE_TTL,
+                    crate::consts::MAX_LEASE_TTL,
+                )?;
+                self.lease_ttl_ms = d.as_millis() as u64;
+                Ok(format!("lease-ttl = {}", humantime::format_duration(d)))
+            }
+            "acquire-timeout" => {
+                let d = clamp_dur(
+                    value,
+                    crate::consts::MIN_ACQUIRE_TIMEOUT,
+                    crate::consts::MAX_ACQUIRE_TIMEOUT,
+                )?;
+                self.acquire_timeout_ms = d.as_millis() as u64;
+                Ok(format!(
+                    "acquire-timeout = {}",
+                    humantime::format_duration(d)
+                ))
+            }
+            "wait-timeout" => {
+                let d = clamp_dur(value, Duration::from_secs(10), crate::consts::MAX_LEASE_TTL)?;
+                self.wait_timeout_ms = d.as_millis() as u64;
+                Ok(format!("wait-timeout = {}", humantime::format_duration(d)))
+            }
+            "dashboard-port" | "dashboard.port" => {
+                let p: u16 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid port {value:?} (1024–65535)"))?;
+                if p < 1024 {
+                    return Err("port must be >= 1024".to_string());
+                }
+                self.dashboard_port = p;
+                Ok(format!("dashboard-port = {p} (effective on next start)"))
+            }
+            "relay" | "lan" | "airgap" => Err(format!(
+                "{key} needs a restart; use `tazamun config set {key} …` then restart the daemon"
+            )),
+            other => Err(format!(
+                "unknown or non-live config key {other:?} (live keys: autolock, lease-ttl, \
+                 acquire-timeout, wait-timeout, dashboard-port)"
+            )),
+        }
+    }
+
     /// Effective lease TTL, clamped to `[MIN_LEASE_TTL, MAX_LEASE_TTL]`.
     pub fn lease_ttl(&self) -> Duration {
         Duration::from_millis(self.lease_ttl_ms)

@@ -248,6 +248,9 @@ Commands:
   versions <PATH>      List kept historical versions of a path
   restore  <PATH> <N>  Restore version N of a path (requires a held lease)
   gc                   Delete unreferenced blobs from the local store
+  dashboard [--open]   Open the local web control panel (loopback only)
+  completions <SHELL>  Print a shell completion script (bash/zsh/fish/powershell/elvish)
+  man                  Print the roff man page to stdout
 
 Options:
       --dir <PATH>     Session folder (defaults to the current directory)
@@ -423,6 +426,93 @@ tazamun doctor
 
 summary: OK
 ```
+
+---
+
+## Web dashboard
+
+Prefer a browser to the terminal? The daemon serves a local control panel — a
+visual view of the same session, read-write. It is meant for designers and game
+teams who would rather click than type.
+
+```bash
+tazamun start                 # in one terminal (the daemon serves the panel)
+tazamun dashboard --open      # in another: prints the URL and opens your browser
+```
+
+It is a single hand-written HTML/CSS/JS page **embedded in the binary** — no
+npm, no build step, no CDN, no external font, no telemetry. Panels:
+
+- **Members** — live health dot (Good/Fair/Poor/Offline), Direct/Relayed + *via
+  LAN*, RTT ± jitter, relay hostname.
+- **Files & locks** — every file with its lease state and a one-click
+  lock/unlock; a refused lock shows the **diagnosis inline** (which
+  precondition, which peer, its grade) with a soft banner when you would acquire
+  through a Poor-grade link.
+- **Conflicts** — the `.tazamun/conflicts` quarantine copies, so preserved bytes
+  are visible, not buried on disk.
+- **Version history** — per file, the kept versions with timestamps and a
+  restore-to-#N button (the API enforces the hold-the-lease rule).
+- **Invite** — the `tzm1…` ticket, a rendered QR, and a copy button.
+
+Dark mode by default; respects `prefers-color-scheme`.
+
+### Security model
+
+This is a local **write** surface, and it is built like one:
+
+- **Loopback only.** The listener binds `127.0.0.1` — never `0.0.0.0`. It is
+  unreachable from the network. The bind address is not configurable.
+- **Session token.** The daemon mints a random 32-byte token at start. `tazamun
+  dashboard` hands it to the browser in the URL **fragment**
+  (`http://127.0.0.1:8787/#<token>`), which browsers never send back to the
+  server. The page presents it as `X-Tazamun-Token` on every change; tokens are
+  compared in constant time. Reads are tokenless; **every mutation needs it**.
+- **Anti-DNS-rebinding.** Every request's `Host` must be a loopback name, so a
+  malicious web page that rebinds a hostname to `127.0.0.1` is refused — reads
+  included.
+- **Strict CSP.** `default-src 'none'`; the one inline script/style run under a
+  per-response nonce; `connect-src 'self'`; no external origins, no `eval`. Plus
+  `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`.
+- **No second control path.** Every endpoint forwards to the *same* daemon actor
+  message the CLI uses over IPC — same preconditions, same errors, no duplicated
+  logic.
+
+The port is configurable: `tazamun config set dashboard-port 9000` (or
+`tazamun dashboard --port 9000` for the URL). Do not share the URL — the token
+in it authorizes changes on your machine.
+
+### API contract (`api:1`)
+
+The panel is backed by a small, versioned JSON API. Every response carries
+`"api": 1` and the `{ok, data?, error?}` envelope. It is a stable contract for
+any future client.
+
+| Method | Endpoint | Token | Purpose |
+| --- | --- | --- | --- |
+| GET | `/api/state` | no | One snapshot: members+health (status schema-1), files & leases, pending pulls, conflicts, per-path version entries, session id, mode, config summary. Poll ~1 s. |
+| GET | `/api/invite` | no | The current `tzm1…` invite ticket. |
+| GET | `/api/invite/qr` | no | The ticket as an SVG QR (`image/svg+xml`). |
+| POST | `/api/lock` | **yes** | `{path}` → acquire a lease (same preconditions as `tazamun lock`; failure returns the diagnosis). |
+| POST | `/api/unlock` | **yes** | `{path}` → publish edits and release. |
+| POST | `/api/restore` | **yes** | `{path, n}` → restore version *n* (requires a held lease). |
+| POST | `/api/config` | **yes** | `{key, value}` for the live subset: `autolock`, `lease-ttl`, `dashboard-port`. |
+
+Mutations without a valid token return `401`; a non-loopback `Host` returns
+`403`; a daemon-level refusal returns `409` with the structured error.
+
+### Shell completions & man page
+
+```bash
+tazamun completions bash  > /etc/bash_completion.d/tazamun         # bash
+tazamun completions zsh   > "${fpath[1]}/_tazamun"                 # zsh
+tazamun completions fish  > ~/.config/fish/completions/tazamun.fish
+tazamun completions powershell >> $PROFILE                         # PowerShell
+tazamun man > /usr/share/man/man1/tazamun.1                        # man page
+```
+
+`tazamun --version` prints the version plus a short build id (the git commit)
+when built from a checkout.
 
 ---
 

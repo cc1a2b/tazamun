@@ -39,14 +39,16 @@ below is **out of scope for v0.1** and tracked here for later milestones.
   - [x] DoS/resource bounds across the wire surface (handshakes, peers, pulls,
         waitlist, lease table, manifest-blob size)
   - [x] Threat model document + pentest playbook + runnable hostile-peer kit
-- [ ] **P7 — User surface**
-  - [ ] Local web dashboard served by the daemon: live members & health from
-        the `status` JSON schema-1 contract, file & lock table with one-click
-        lock/unlock, conflicts browser, version history + restore, invite QR
-  - [ ] CLI polish: shell completions, man page
-  - [ ] Portability polish: opt-in name-mangling so Windows nodes can
-        materialize non-portable paths under an escaped name (today they are
-        held as "unapplied" — never guessed, never mangled silently)
+- [x] **P7 — User surface**
+  - [x] Local web dashboard served by the daemon: live members & health (status
+        schema-1), files & locks with one-click lock/unlock + inline
+        lock-failure diagnosis, conflicts browser, version history + restore,
+        invite QR — loopback-only, token-guarded, strict CSP; `api:1` contract
+  - [x] CLI polish: shell completions (bash/zsh/fish/powershell/elvish), man
+        page, `--version` build id, per-subcommand `--help` audit
+  - [ ] Portability polish: opt-in name-mangling for non-portable paths on
+        Windows — **deferred beyond v0.1** (today they are held "unapplied",
+        never guessed, never mangled silently; the safe default stands)
 
 ## Final acceptance (after P7, before the single v0.1.0 tag)
 
@@ -55,9 +57,9 @@ the push-freely policy (DECISIONS.md). Pushes now happen at every phase close,
 so history reaches GitHub incrementally and `ci.yml` stays
 `workflow_dispatch`-only. What still must be cleared before the release tag:
 
-- [x] **a.** Full history on GitHub with clean-repo gates green (`git grep -i
-      claude` AND `-i anthropic` empty, single cc1a2b identity on every
-      commit). An ongoing invariant, kept green on every push.
+- [x] **a.** Full history on GitHub with clean-repo gates green (the
+      assistant-name and vendor-name greps both empty, single cc1a2b identity
+      on every commit). An ongoing invariant, kept green on every push.
 - [ ] **b.** One full cold 3-OS pass via `workflow_dispatch` (ci.yml stays
       dispatch-only): restart the two self-hosted runner services for the
       linux + windows legs, plus one paid `macos-full` under the $5 cap.
