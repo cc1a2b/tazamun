@@ -295,19 +295,34 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
-    # Hand edit (preserved via allow-dirty = ["ci"] in the dist config): also
-    # require the tap token to exist, so a release without it shows this job
-    # as skipped rather than failed. After adding the secret, `gh run rerun`
-    # the release to publish the formula.
-    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      # Hand edit (preserved via allow-dirty = ["ci"] in the dist config).
+      # GitHub forbids the secrets context in job-level `if`, so the token is
+      # probed here and every real step is guarded on the result: without the
+      # token the job succeeds with its steps skipped, instead of failing red
+      # on every release. After adding the secret, `gh run rerun` the release
+      # run to publish the formula.
+      - name: Check for tap token
+        id: tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the formula publish."
+          fi
       - uses: actions/checkout@v6
+        if: steps.tap.outputs.present == 'true'
         with:
           persist-credentials: true
           repository: "cc1a2b/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       # So we have access to the formula
       - name: Fetch homebrew formulae
+        if: steps.tap.outputs.present == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
@@ -316,6 +331,7 @@ jobs:
       # This is extra complex because you can make your Formula name not match your app name
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
+        if: steps.tap.outputs.present == 'true'
         run: |
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
