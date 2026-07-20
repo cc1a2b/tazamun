@@ -94,6 +94,53 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## Release engineering (v0.1.0 – v0.1.2)
+
+- **The public history is one root commit, deliberately.** The 99-commit
+  development history was collapsed to a single v0.1.0 root before the repo
+  went public; the full history survives in a local bundle
+  (`~/tazamun-history-backup-*.bundle`) and in local branches. Anything that
+  looks like a missing paper trail in the public repo is in that bundle.
+- **Every pre-public Release run died silently, and the signature is worth
+  remembering.** dist 0.28's generated workflow pinned `ubuntu-20.04`, a
+  runner label GitHub has retired — jobs queued for exactly 24 hours and were
+  auto-cancelled, run after run, with no error anywhere. A job that sits
+  *queued* more than a couple of minutes means a dead label, not a busy
+  queue. Regenerated with dist 0.32.0 (`ubuntu-22.04`, `windows-2022`,
+  `macos-14`, `macos-15-intel`), which also ships macOS both-arch binaries.
+- **`release.yml` carries ONE hand edit, protected by `allow-dirty = ["ci"]`.**
+  The homebrew-formula job probes `HOMEBREW_TAP_TOKEN` in a step and guards
+  its real steps on the result, so a release without the token skips green
+  instead of failing red. It is a *step* probe because the `secrets` context
+  is forbidden in job-level `if` — the first attempt used it there and the
+  whole workflow failed to parse: a 0-second run with no jobs, which is worse
+  than the red job it was meant to cure.
+- **dist's two archive formats have two different layouts, and guessing cost
+  a broken release.** The unix `.tar.gz` nests the binary under
+  `tazamun-<target>/`; the Windows `.zip` is flat. v0.1.1's updater assumed
+  the tar shape for both, so every Windows `tazamun update` died with
+  "specified file not found in archive" at the last step. Each format now has
+  its own `bin_path_in_archive` constant, and a test pins both against the
+  layouts read from live release assets. Do not "simplify" them back into one.
+- **`self_update` matches release assets by substring of the compile-time
+  target triple** (`env!("TARGET")`). Releases ship MSVC on Windows, so a
+  locally cross-built GNU binary normalises its target to the MSVC asset —
+  otherwise side-loaded builds could never update at all.
+- **Updates do not prompt.** The confirm's only protection was against
+  receiving a newer binary — the failure mode of proceeding is "keep what you
+  already had" — and self_update's narration drowned the two lines that
+  matter. `no_confirm(true)`, `show_output(false)`; the command's own output
+  says what was found and what happened.
+- **A self-update inside npm's or Homebrew's tree ends with a note naming the
+  manager's own command.** The swap works, but the manager's records still
+  hold the old version and its next operation may roll the file back;
+  pretending otherwise would be a quiet downgrade waiting to happen.
+- **npm's `allowScripts` warning is expected and self-healing.** The npm
+  package downloads the platform binary in `postinstall`; when npm blocks the
+  script, dist's run shim installs on first invocation (`run()` calls
+  `install()` when the binary is absent). Documented in the README rather
+  than worked around.
+
 ## Development hygiene
 
 - **`cargo test` used to write into the developer's real config directory.**

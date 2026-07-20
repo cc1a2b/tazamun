@@ -1,10 +1,29 @@
-# Going public, and shipping v0.1.0
+# Going public, and shipping releases
 
-The maintainer's runbook: every step from a private repo to a public release
-that installs with one line, `brew`, `npm i -g tazamun`, or `cargo install
-tazamun` — in the order that works. Steps marked **[done]** were completed in
-the release-readiness commit this file arrived in; everything else is yours,
-because it needs your accounts.
+The maintainer's runbook: from a private repo to a public release that
+installs with one line, `brew`, `npm i -g tazamun`, or `cargo install
+tazamun` — in the order that works.
+
+## Status — 2026-07-20
+
+Most of this document has been executed. The repo is **public**, with
+description, topics, private vulnerability reporting, secret scanning and
+push protection enabled; CI runs green on hosted runners; **v0.1.0, v0.1.1
+and v0.1.2 shipped** through the pipeline below, and the self-update path is
+proven in production (a released v0.1.1 updated itself to v0.1.2 in place).
+`npm install -g tazamun` is live. Three things remain, and each needs the
+maintainer's own accounts:
+
+1. **Rotate the npm token.** The token currently in the `NPM_TOKEN` secret
+   was exposed in a chat transcript. Revoke it on npmjs.com, mint a fresh
+   Automation token, then
+   `printf '%s' 'NEW' | gh secret set NPM_TOKEN --repo cc1a2b/tazamun`.
+2. **Mint the Homebrew tap PAT** (fine-grained, only `cc1a2b/homebrew-tap`,
+   Contents: read-and-write), set it as `HOMEBREW_TAP_TOKEN`, then re-run the
+   latest release's jobs — the formula job currently skips, green, when the
+   token is absent.
+3. **`cargo login && cargo publish`** to put the crate on crates.io — the
+   package is pre-verified by `cargo package`.
 
 The state of things: the release pipeline is cargo-dist. A pushed tag that
 looks like a version builds every platform, checksums and attests the
@@ -49,6 +68,8 @@ Three externals, all needed before the first tag:
 
 **npm.** Create/log into the npm account that will own `tazamun`, mint an
 **Automation** token (Access Tokens → Generate → Automation), then:
+(As of 2026-07-20 a token is set and publishing works — but it must be
+rotated; see Status above.)
 
 ```bash
 gh secret set NPM_TOKEN --repo cc1a2b/tazamun
@@ -135,7 +156,7 @@ survive. There are no releases yet, so nothing stale becomes visible.
 
 ---
 
-## 5. Ship v0.1.0
+## 5. Ship a release (v0.1.0 through v0.1.2 shipped exactly this way)
 
 The tag must point at a commit whose workflows are the fixed ones — the tag
 currently on the remote points at the old, unrunnable release.yml. Move it:
