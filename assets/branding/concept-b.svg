@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tazamun">
+  <title>tazamun — concept B (ت monogram)</title>
+  <!--
+    Concept B: the single letter ت (tā) as an icon-mark.
+    - a deep broad-nib vessel (a boat, not a shallow smile) = the shared folder;
+      its right tip rises higher than the left = direction, not mirror-symmetry
+    - the two dots of ت = the two peer nodes, set on a slight diagonal so they
+      read as nodes, not eyes: a filled gold disc holds the lease, an open ring
+      waits — the strict exclusive checkout, exactly one at a time
+    Navy structure + one gold accent; a clean 1-color silhouette at 16px.
+  -->
+  <g fill="none" stroke="#0E2A47" stroke-width="64" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M118 250 C130 360 204 396 256 396 C308 396 384 358 396 240"/>
+  </g>
+  <circle cx="194" cy="150" r="30" fill="none" stroke="#C8A24B" stroke-width="17"/>
+  <circle cx="312" cy="176" r="40" fill="#C8A24B"/>
+</svg>

@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tazamun</title>
+<style nonce="__NONCE__">
+:root{
+  color-scheme: dark light;
+  --bg:#0b0f14; --panel:#111823; --panel2:#0e141d; --line:#1f2a37;
+  --fg:#e6edf3; --dim:#8b98a9; --accent:#5aa9ff; --gold:#c8a24b;
+  --good:#3fb950; --fair:#d29922; --poor:#f85149; --off:#6e7681;
+  --mono: ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f6f8fa; --panel:#fff; --panel2:#f0f3f6; --line:#d0d7de;
+    --fg:#1f2328; --dim:#59636e; --off:#8c959f; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:13px;line-height:1.45}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:2}
+header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+header .sid{font-family:var(--mono);color:var(--dim);font-size:12px}
+header .spacer{flex:1}
+.brand{display:inline-flex;align-items:center}
+.brand svg{width:26px;height:26px;color:var(--gold);display:block}
+.sub{font-weight:400;color:var(--dim);margin-inline-start:4px}
+.badge{font-size:11px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;color:var(--dim)}
+.badge.live{color:var(--good);border-color:var(--good)}
+.badge.stale{color:var(--poor);border-color:var(--poor)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:14px;max-width:1400px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;min-width:0}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin:0;padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+.card h2 .count{margin-left:auto;color:var(--dim);font-weight:400}
+.card .body{padding:6px 6px 10px}
+.row{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:7px}
+.row:hover{background:var(--panel2)}
+.mono{font-family:var(--mono)}
+.dim{color:var(--dim)}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;display:inline-block}
+.dot.Good{background:var(--good)} .dot.Fair{background:var(--fair)}
+.dot.Poor{background:var(--poor)} .dot.Offline{background:var(--off)}
+.grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:0 6px}
+.tag.lan{color:var(--good);border-color:var(--good)}
+button{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.locked{color:var(--accent)}
+.warn{background:rgba(210,153,34,.12);border:1px solid var(--fair);color:var(--fg);border-radius:7px;padding:6px 10px;margin:4px 8px;font-size:12px}
+.err{background:rgba(248,81,73,.1);border:1px solid var(--poor);border-radius:7px;padding:6px 10px;margin:4px 8px;font-size:12px}
+.diag{font-size:12px;color:var(--dim);margin:2px 8px 6px 26px}
+.versions{margin:2px 8px 8px 26px;border-left:2px solid var(--line);padding-left:10px}
+.versions .row{padding:3px 4px}
+input[type=text]{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 8px;width:90px}
+.qr{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:6px 10px}
+.qr img{width:180px;height:180px;background:#e6edf3;border-radius:8px}
+.ticket{font-family:var(--mono);font-size:11px;word-break:break-all;color:var(--dim);flex:1;min-width:180px}
+.cfg{display:grid;grid-template-columns:auto 1fr auto;gap:8px 10px;align-items:center;padding:8px 12px}
+.cfg label{color:var(--dim)}
+.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 14px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+.empty{color:var(--dim);padding:8px 10px;font-size:12px}
+.notoken{margin:14px;padding:12px 14px}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand" aria-hidden="true">__LOGO__</span>
+  <h1>تزامُن<span class="sub"> · tazamun</span></h1>
+  <span class="sid" id="sid">—</span>
+  <span class="spacer"></span>
+  <span class="badge" id="mode">—</span>
+  <span class="badge" id="files">—</span>
+  <span class="badge" id="conflicts" hidden>—</span>
+  <span class="badge stale" id="live">connecting…</span>
+</header>
+<main id="app"></main>
+<div class="toast" id="toast"></div>
+
+<script nonce="__NONCE__">
+"use strict";
+const TOKEN = location.hash.slice(1);
+const $ = (id) => document.getElementById(id);
+let lastGood = 0;
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function shortId(s){ return (s||"?").slice(0,10); }
+function ms(v){ v=Math.round((v||0)/1000); if(v<60) return v+"s"; const m=Math.floor(v/60); return m+"m "+(v%60)+"s"; }
+function bytes(n){ n=n||0; if(n<1024) return n+" B"; if(n<1048576) return (n/1024).toFixed(0)+" KB"; return (n/1048576).toFixed(1)+" MB"; }
+
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
+
+async function api(path){
+  const r = await fetch(path, {headers:{"Accept":"application/json"}});
+  return r.json();
+}
+async function mutate(path, body){
+  if(!TOKEN){ toast("no dashboard token in the URL — reopen via `tazamun dashboard`"); return {ok:false,error:{message:"no token"}}; }
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json","X-Tazamun-Token":TOKEN}, body:JSON.stringify(body)});
+  return r.json();
+}
+
+function card(title, count, inner){
+  const c = count==null ? "" : `<span class="count">${count}</span>`;
+  return `<section class="card"><h2>${title}${c}</h2><div class="body">${inner}</div></section>`;
+}
+
+function render(s){
+  $("sid").textContent = shortId(s.id);
+  $("mode").textContent = s.airgap ? "airgap" : (s.mode||"strict");
+  $("files").textContent = (s.file_count||0)+" files · "+bytes(s.total_bytes);
+  const ctotal = s.conflicts_total||0;
+  const cb = $("conflicts");
+  cb.hidden = ctotal===0;
+  cb.textContent = ctotal+" conflict"+(ctotal===1?"":"s");
+  cb.className = "badge"+(ctotal?" stale":"");
+
+  const leaseByPath = {}; (s.leases||[]).forEach(l => leaseByPath[l.path]=l);
+  const app = $("app");
+  let html = "";
+
+  // Members
+  const members = s.members||[];
+  html += card("Members", members.length, members.length ? members.map(m=>{
+    const grade = m.grade||"Offline";
+    const rtt = m.conn==="None" ? "—" : `${Math.round(m.rtt_ms||0)}±${Math.round(m.rtt_jitter_ms||0)}ms`;
+    let origin = "";
+    if(m.relay_url){ origin = `<span class="tag">via ${esc(relayHost(m.relay_url))}</span>`; }
+    else if(m.via_lan){ origin = `<span class="tag lan">via LAN</span>`; }
+    return `<div class="row"><span class="dot ${grade}" title="${grade}"></span>
+      <span class="mono grow">${esc(shortId(m.id))}</span>
+      <span class="dim">${esc(m.conn||"None")}</span>
+      <span class="dim mono">${rtt}</span>${origin}</div>`;
+  }).join("") : `<div class="empty">no members yet — share an invite</div>`);
+
+  // Files & locks
+  const files = s.files||{}; const paths = Object.keys(files).filter(p=>!files[p].deleted).sort();
+  html += card("Files &amp; locks", paths.length, paths.length ? paths.map(p=>{
+    const f = files[p]; const lease = leaseByPath[p];
+    let state = "", btn = "";
+    if(lease){
+      if(lease.mine){ state = `<span class="locked">● you hold this</span>`; btn = `<button data-unlock="${esc(p)}">unlock</button>`; }
+      else { state = `<span class="dim">● held by ${esc(shortId(lease.holder))}</span>`; btn = `<button data-lock="${esc(p)}">lock</button>`; }
+    } else { state = `<span class="dim">unlocked</span>`; btn = `<button data-lock="${esc(p)}">lock</button>`; }
+    const vs = (s.versions&&s.versions[p])||[];
+    const vbtn = vs.length ? `<button data-hist="${esc(p)}">history (${vs.length})</button>` : "";
+    return `<div class="row"><span class="grow mono" title="${esc(p)}">${esc(p)}</span>
+      <span class="dim">${bytes(f.size)}</span>${state}${vbtn}${btn}</div>
+      <div id="diag-${cssid(p)}"></div><div id="hist-${cssid(p)}"></div>`;
+  }).join("") : `<div class="empty">no files synced yet</div>`);
+
+  // Conflicts (preserved bytes) — resolvable
+  const conflicts = s.conflicts||[];
+  const ctot = s.conflicts_total||conflicts.length;
+  const capNote = ctot>conflicts.length ? `<div class="dim" style="padding:2px 6px">showing ${conflicts.length} of ${ctot} — use <span class="mono">tazamun conflicts list</span> for all</div>` : "";
+  html += card("Conflicts (preserved bytes)", ctot, conflicts.length ? conflicts.map(c=>{
+    const why = c.reason ? esc(c.reason) : "unknown";
+    const path = c.path ? esc(c.path) : "(unknown path)";
+    const acts = `<button data-cmine="${esc(c.name)}"${c.path?"":" disabled title='original path unknown'"}>keep mine</button>`
+      + `<button data-ctheirs="${esc(c.name)}">keep theirs</button>`
+      + `<button data-cboth="${esc(c.name)}" data-into="${esc(c.both_name||"")}">keep both</button>`;
+    return `<div class="row"><span class="grow mono" title="${esc(c.name)}">${path}</span>
+      <span class="tag">${why}</span><span class="dim">${bytes(c.size)}</span><span class="dim">${esc(ms(c.age_ms))} ago</span></div>
+      <div class="row" style="padding-top:0">${acts}</div>
+      <div id="cres-${cssid(c.name)}"></div>`;
+  }).join("")+capNote : `<div class="empty">none — no quarantined copies</div>`);
+
+  // Invite
+  html += card("Invite", null,
+    `<div class="qr"><img id="qr" alt="invite QR" src="/api/invite/qr?t=${Date.now()}">
+      <div style="flex:1;min-width:180px"><div class="ticket" id="ticket">loading…</div>
+      <div style="margin-top:8px"><button class="primary" id="copy">copy ticket</button></div></div></div>`);
+
+  // Config (live subset)
+  const cfg = s.config||{};
+  html += card("Settings", null, `<div class="cfg">
+    <label>autolock</label><span class="dim">auto-lock on first write</span>
+      <button id="cfg-autolock">${cfg.autolock?"on":"off"}</button>
+    <label>lease-ttl</label><input type="text" id="cfg-ttl" value="${esc(fmtDur(cfg.lease_ttl_ms))}">
+      <button id="cfg-ttl-set">set</button>
+    <label>dashboard port</label><input type="text" id="cfg-port" value="${esc(cfg.dashboard_port||8787)}">
+      <button id="cfg-port-set">set</button>
+  </div><div class="dim" style="padding:0 12px 8px">port change applies on next daemon start</div>`);
+
+  app.innerHTML = html;
+  wire(s);
+}
+
+function cssid(p){ return p.replace(/[^a-zA-Z0-9]/g,"_"); }
+function relayHost(u){ try{ return new URL(u).hostname.replace(/\.$/,""); }catch(e){ return u; } }
+function fmtTs(t){ if(!t) return ""; const d=new Date(t); return d.toLocaleString(); }
+function fmtDur(msv){ let s=Math.round((msv||0)/1000); if(s%3600===0) return (s/3600)+"h"; if(s%60===0) return (s/60)+"m"; return s+"s"; }
+
+function wire(s){
+  document.querySelectorAll("[data-lock]").forEach(b=>b.onclick=()=>doLock(b.getAttribute("data-lock")));
+  document.querySelectorAll("[data-unlock]").forEach(b=>b.onclick=()=>doUnlock(b.getAttribute("data-unlock")));
+  document.querySelectorAll("[data-hist]").forEach(b=>b.onclick=()=>toggleHist(b.getAttribute("data-hist"), s));
+  const copy=$("copy"); if(copy) copy.onclick=copyTicket;
+  const al=$("cfg-autolock"); if(al) al.onclick=()=>setCfg("autolock", (s.config&&s.config.autolock)?"off":"on");
+  const ts=$("cfg-ttl-set"); if(ts) ts.onclick=()=>setCfg("lease-ttl", $("cfg-ttl").value);
+  const ps=$("cfg-port-set"); if(ps) ps.onclick=()=>setCfg("dashboard-port", $("cfg-port").value);
+  document.querySelectorAll("[data-ctheirs]").forEach(b=>b.onclick=()=>resolveConflict(b.getAttribute("data-ctheirs"),"theirs",null));
+  document.querySelectorAll("[data-cmine]").forEach(b=>b.onclick=()=>{ const p=findPath(s,b.getAttribute("data-cmine")); resolveConflict(b.getAttribute("data-cmine"),"mine",p); });
+  document.querySelectorAll("[data-cboth]").forEach(b=>b.onclick=()=>resolveConflict(b.getAttribute("data-cboth"),"both",b.getAttribute("data-into")));
+  loadTicket();
+}
+
+function findPath(s, name){ return ((s.conflicts||[]).find(c=>c.name===name)||{}).path||null; }
+
+// Compose the two thin verbs + lock/unlock exactly like the CLI's guided flow,
+// so a failure at any step leaves the quarantined copy untouched.
+async function resolveConflict(id, keep, target){
+  const el = $("cres-"+cssid(id));
+  const say = (m)=>{ if(el) el.innerHTML = m; };
+  if(keep==="theirs"){
+    const r = await mutate("/api/conflict/discard", {id});
+    if(r.ok){ toast("kept the synced version"); refresh(); } else say(`<div class="err">✗ ${esc((r.error&&r.error.message)||"discard failed")}</div>`);
+    return;
+  }
+  if(!target){ say(`<div class="err">✗ original path unknown — resolve from the CLI with <span class="mono">--into</span></div>`); return; }
+  say(`<div class="dim">locking ${esc(target)} …</div>`);
+  let r = await mutate("/api/lock", {path:target});
+  if(!r.ok){ say(diagHtml(r)); return; }
+  r = await mutate("/api/conflict/apply", {id, target});
+  if(!r.ok){ await mutate("/api/unlock", {path:target}); say(`<div class="err">✗ ${esc((r.error&&r.error.message)||"apply failed")} — copy untouched</div>`); return; }
+  r = await mutate("/api/unlock", {path:target});
+  if(!r.ok){ say(`<div class="err">✗ publish failed: ${esc((r.error&&r.error.message)||"?")}</div>`); return; }
+  await mutate("/api/conflict/discard", {id});
+  toast("resolved "+target); refresh();
+}
+
+async function doLock(path){
+  const r = await mutate("/api/lock", {path});
+  const el = $("diag-"+cssid(path)); if(!el) return;
+  if(r.ok){ el.innerHTML=""; toast("locked "+path); refresh(); return; }
+  el.innerHTML = diagHtml(r);
+}
+async function doUnlock(path){
+  const r = await mutate("/api/unlock", {path});
+  if(r.ok){ toast("unlocked "+path); refresh(); }
+  else toast("unlock failed: "+((r.error&&r.error.message)||"?"));
+}
+function diagHtml(r){
+  const msg = (r.error&&r.error.message)||"lock refused";
+  const d = (r.data&&r.data.diagnosis)||null;
+  let extra = "";
+  if(d){
+    const peers = (d.peers||[]).map(p=>`${shortId(p.id)} (${p.grade}, ${p.conn})`).join(", ");
+    extra = `<div class="diag">blocked: <b>${esc(d.precondition||"?")}</b>${d.hint?" — "+esc(d.hint):""}${peers?"<br>peers: "+esc(peers):""}</div>`;
+  }
+  const poor = d && (d.peers||[]).some(p=>p.grade==="Poor");
+  const banner = poor ? `<div class="warn">a consulted peer is on a Poor-grade link — sync may lag</div>` : "";
+  return `<div class="err">✗ ${esc(msg)}</div>${extra}${banner}`;
+}
+
+async function toggleHist(path, s){
+  const el = $("hist-"+cssid(path)); if(!el) return;
+  if(el.innerHTML){ el.innerHTML=""; return; }
+  const vs = (s.versions&&s.versions[path])||[];
+  el.innerHTML = `<div class="versions">`+ vs.map(v=>
+    `<div class="row"><span class="dim">#${v.n}</span><span class="grow dim">${esc(fmtTs(v.ts_ms))}</span>
+      <span class="dim">${bytes(v.size)}</span><button data-restore="${esc(path)}" data-n="${v.n}">restore</button></div>`
+  ).join("") + `<div class="dim" style="padding:2px 4px">restore requires you to hold the lease</div></div>`;
+  el.querySelectorAll("[data-restore]").forEach(b=>b.onclick=()=>doRestore(b.getAttribute("data-restore"), parseInt(b.getAttribute("data-n"),10)));
+}
+async function doRestore(path, n){
+  const r = await mutate("/api/restore", {path, n});
+  if(r.ok){ toast("restored "+path+" #"+n); refresh(); }
+  else toast("restore failed: "+((r.error&&r.error.message)||"?"));
+}
+async function setCfg(key, value){
+  const r = await mutate("/api/config", {key, value:String(value)});
+  if(r.ok){ toast("set "+key); refresh(); }
+  else toast((r.error&&r.error.message)||"config rejected");
+}
+
+async function loadTicket(){
+  try{ const r = await api("/api/invite"); const t=(r.data&&r.data.ticket)||""; const el=$("ticket"); if(el) el.textContent=t||"(no invite)"; }catch(e){}
+}
+async function copyTicket(){
+  const t = $("ticket").textContent;
+  try{ await navigator.clipboard.writeText(t); toast("ticket copied"); }
+  catch(e){ toast("copy blocked — select the text manually"); }
+}
+
+async function refresh(){
+  try{
+    const r = await api("/api/state");
+    if(r && r.ok && r.data){ render(r.data); lastGood=Date.now(); $("live").textContent="live"; $("live").className="badge live"; }
+    else throw new Error("bad state");
+  }catch(e){
+    if(Date.now()-lastGood>3000){ $("live").textContent="daemon offline"; $("live").className="badge stale"; }
+  }
+}
+
+if(!TOKEN){
+  $("app").innerHTML = `<div class="card notoken"><b>No dashboard token.</b>
+    <div class="dim" style="margin-top:6px">Read access works, but locking, restoring and settings need the token.
+    Open the dashboard with <span class="mono">tazamun dashboard --open</span> so the URL carries it.</div></div>`;
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

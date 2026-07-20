@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 330" role="img" aria-label="tazamun">
+  <title>tazamun — concept A (wordmark bridge ت → ن)</title>
+  <!--
+    Concept A: a compact horizontal wordmark. Arabic reads right-to-left, so the
+    word's bookend letters are featured, large and balanced: ت (tā, right) and
+    ن (nūn, left), joined by a short kashida — the calligraphic connective.
+    - ت's two dots (gold) = the two peer nodes
+    - the kashida = the sync link / the shared file between them
+    - ن's deep bowl = the single converged session; its one dot (navy) = that
+      unified result. Rendering the full five-letter word is an iterate option.
+  -->
+  <g fill="none" stroke="#0E2A47" stroke-width="56" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M378 150 C406 222 476 246 520 246 C570 246 600 210 602 150"/>
+    <path d="M378 176 C350 198 334 198 310 184"/>
+    <path d="M310 176 C310 258 250 302 184 302 C110 302 66 256 70 176"/>
+  </g>
+  <circle cx="470" cy="92" r="28" fill="#C8A24B"/>
+  <circle cx="552" cy="92" r="28" fill="#C8A24B"/>
+  <circle cx="184" cy="104" r="28" fill="#0E2A47"/>
+</svg>

@@ -1,0 +1,58 @@
+# cargo-fuzz harness for tazamun's untrusted parsers. Detached from the parent
+# workspace (see the parent Cargo.toml `[workspace] exclude`) so the normal
+# gates never build it — it needs nightly + a sanitizer. Run with
+# `cargo +nightly fuzz run <target> -- -max_total_time=180`.
+[package]
+name = "tazamun-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postcard = { version = "1.1", features = ["use-std"] }
+tazamun = { path = ".." }
+
+# Detach fully from the parent workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ticket"
+path = "fuzz_targets/fuzz_ticket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_manifest"
+path = "fuzz_targets/fuzz_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_msg"
+path = "fuzz_targets/fuzz_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ignore"
+path = "fuzz_targets/fuzz_ignore.rs"
+test = false
+doc = false
+bench = false

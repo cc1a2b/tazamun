@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="657" height="438" viewBox="0 0 657 438" font-family="ui-monospace,SFMono-Regular,Menlo,DejaVu Sans Mono,Consolas,monospace" font-size="15">
+<rect width="657" height="438" rx="12" fill="#0a0f1e"/>
+<rect x="1" y="1" width="655" height="436" rx="11" fill="#0d1426" stroke="#1b2440"/>
+<line x1="22" y1="36" x2="635" y2="36" stroke="#1b2440"/>
+<rect x="22" y="18" width="3" height="14" rx="1.5" fill="#c8a24b"/>
+<text x="34" y="30" fill="#8e97b3" font-size="13">tazamun status</text>
+<text x="22.0" y="67.0" fill="#c8a24b" xml:space="preserve">$ tazamun status</text>
+<text x="22.0" y="115.6" fill="#e9ecf8" xml:space="preserve">peer id : ac133e7591fce384d60dde89966c7b71ddb0b7f6f07780bb256105e70…</text>
+<text x="22.0" y="139.9" fill="#e9ecf8" xml:space="preserve">folder  : ~/work/design-system</text>
+<text x="22.0" y="164.2" fill="#e9ecf8" xml:space="preserve">files   : 5 (540176 bytes)</text>
+<text x="22.0" y="212.8" fill="#e9ecf8" xml:space="preserve">members (1):</text>
+<text x="40.0" y="237.1" fill="#3fbf7f" xml:space="preserve">● Good   b960b62f03 Direct  0±0ms        Δ5 via LAN</text>
+<text x="22.0" y="285.7" fill="#e9ecf8" xml:space="preserve">active leases (1):</text>
+<text x="40.0" y="310.0" fill="#e9ecf8" xml:space="preserve">components/button.tsx  held by you  expires in 77s</text>
+<text x="22.0" y="358.6" fill="#e9ecf8" xml:space="preserve">recent events:</text>
+<text x="40.0" y="382.9" fill="#8e97b3" xml:space="preserve">• peer b960b62f03 connected (Direct, rtt 0ms)</text>
+<text x="40.0" y="407.2" fill="#8e97b3" xml:space="preserve">• peer b960b62f03 connected (Relayed, rtt 647ms)</text>
+</svg>

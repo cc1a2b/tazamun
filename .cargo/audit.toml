@@ -1,0 +1,24 @@
+# cargo-audit configuration.
+#
+# The ignored advisories below are all "unmaintained crate" notices (not
+# vulnerabilities) in transitive dependencies of the iroh networking stack.
+# Each acceptance is justified in DECISIONS.md and should be revisited whenever
+# the iroh dependency tree is bumped.
+#
+# NOT ignored, and deliberately left failing so the next person sees them:
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml, denial of service). They
+# arrive by two paths, with very different reach:
+#   - wayland-scanner, a build-time proc-macro that parses the Wayland protocol
+#     XML shipped with the build. Not attacker-reachable.
+#   - self_update, which parses GitHub release metadata over TLS during
+#     `tazamun update`. Reachable in principle by whoever can answer as
+#     api.github.com; denial of service only, never code execution.
+# `self_update` 0.44.0 is the latest release and still requires quick-xml ^0.38,
+# so there is no version of this tree that resolves them. Revisit when
+# self_update bumps; do not silence them here without saying why.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (not in host build graph)
+    "RUSTSEC-2024-0436", # paste unmaintained (via iroh → netwatch → netlink)
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via iroh-blobs → genawaiter)
+]

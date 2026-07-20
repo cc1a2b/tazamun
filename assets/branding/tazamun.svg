@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tazamun">
+  <title>tazamun — app icon (the handoff / interlock)</title>
+  <!--
+    Primary app icon. Two identical vessel-glyphs in 180° ROTATIONAL symmetry
+    (equal peers facing opposite ways) clasp in the centre = the exclusive lease
+    handoff. Each carries one node dot; the two peers are one gold, one ivory so
+    neither owns the mark. Set on a self-contained navy tile so it reads on any
+    light/dark taskbar.
+  -->
+  <rect width="512" height="512" rx="116" fill="#0E2A47"/>
+  <g fill="none" stroke="#C8A24B" stroke-width="54" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 250 C164 330 230 356 282 340 C316 330 334 298 318 264"/>
+  </g>
+  <circle cx="150" cy="250" r="29" fill="#C8A24B"/>
+  <g transform="rotate(180 256 256)">
+    <g fill="none" stroke="#F3EDDD" stroke-width="54" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M150 250 C164 330 230 356 282 340 C316 330 334 298 318 264"/>
+    </g>
+    <circle cx="150" cy="250" r="29" fill="#F3EDDD"/>
+  </g>
+</svg>

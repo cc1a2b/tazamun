@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tazamun">
+  <title>tazamun — concept C (the handoff / interlock)</title>
+  <!--
+    Concept C: two identical vessel-glyphs (derived from the نـ / ت bowl) placed
+    in 180° ROTATIONAL symmetry — not a mirror. Rotational = dynamic, equal
+    peers facing opposite ways: the P2P pair. Their hooks clasp in the centre
+    negative space = the exclusive lease *handoff* (exactly one holds at a time).
+    Each vessel carries one node dot (navy / gold) = the two peers; the colours
+    cross so neither peer "owns" the mark. No circle, no arrows — the loop is
+    implied by the interlock.
+  -->
+  <g fill="none" stroke="#0E2A47" stroke-width="58" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M148 246 C160 328 226 356 278 342 C312 332 330 300 316 268"/>
+  </g>
+  <circle cx="148" cy="246" r="30" fill="#0E2A47"/>
+  <g transform="rotate(180 256 256)">
+    <g fill="none" stroke="#C8A24B" stroke-width="58" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M148 246 C160 328 226 356 278 342 C312 332 330 300 316 268"/>
+    </g>
+    <circle cx="148" cy="246" r="30" fill="#C8A24B"/>
+  </g>
+</svg>

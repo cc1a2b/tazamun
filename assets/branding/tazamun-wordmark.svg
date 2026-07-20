@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 340" role="img" aria-label="تزامن — tazamun">
+  <title>tazamun — wordmark تزامُن</title>
+  <!--
+    Full five-letter wordmark تزامُن, hand-authored monoline (original geometry,
+    no font). Right-to-left: ت (two gold peer-dots) · ز · ا · م (damma) · ن,
+    riding a flowing kashida sync-stroke that resolves into the deep final نـ.
+    The two gold dots keep the P2P peer motif; the connective stroke is the sync.
+  -->
+  <g fill="none" stroke="#0E2A47" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <!-- ت bowl + connection down into ز (they join); ز is a smooth descender -->
+    <path d="M962 190 C934 222 892 230 862 214 C824 196 792 226 776 260"/>
+    <!-- ا alif (standalone vertical) -->
+    <path d="M706 214 L706 92"/>
+    <!-- م mīm: a small loop with a tail flowing left toward the nūn -->
+    <path d="M640 198 C640 168 614 154 588 162 C564 170 558 196 574 214 C586 228 610 232 628 222"/>
+    <path d="M600 220 C558 250 512 258 480 252"/>
+    <!-- ن nūn: the deep final bowl -->
+    <path d="M480 246 C458 314 386 348 300 342 C188 336 126 276 136 178"/>
+    <!-- damma over the mīm -->
+    <path d="M590 120 C604 106 622 108 628 124" stroke-width="30"/>
+  </g>
+  <!-- ت two dots = the two peer nodes (gold) -->
+  <circle cx="898" cy="116" r="22" fill="#C8A24B"/>
+  <circle cx="936" cy="116" r="22" fill="#C8A24B"/>
+  <!-- ز one dot, ن one dot (navy) -->
+  <circle cx="820" cy="130" r="22" fill="#0E2A47"/>
+  <circle cx="300" cy="104" r="22" fill="#0E2A47"/>
+</svg>

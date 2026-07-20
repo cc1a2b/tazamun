@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="630" height="438" viewBox="0 0 630 438" font-family="ui-monospace,SFMono-Regular,Menlo,DejaVu Sans Mono,Consolas,monospace" font-size="15">
+<rect width="630" height="438" rx="12" fill="#0a0f1e"/>
+<rect x="1" y="1" width="628" height="436" rx="11" fill="#0d1426" stroke="#1b2440"/>
+<line x1="22" y1="36" x2="608" y2="36" stroke="#1b2440"/>
+<rect x="22" y="18" width="3" height="14" rx="1.5" fill="#c8a24b"/>
+<text x="34" y="30" fill="#8e97b3" font-size="13">two machines, one folder</text>
+<text x="22.0" y="67.0" fill="#5a6480" xml:space="preserve"># on the first machine</text>
+<text x="22.0" y="91.3" fill="#c8a24b" xml:space="preserve">$ tazamun init</text>
+<text x="22.0" y="115.6" fill="#3fbf7f" xml:space="preserve">✔ session created — hand this ticket to a collaborator</text>
+<text x="40.0" y="139.9" fill="#e9ecf8" xml:space="preserve">tzm1akqhrtm5lfr2tnri67jm6qmg2jb7euzymomokrxo3slv3vj3urwj4xr4o2…</text>
+<text x="22.0" y="188.5" fill="#c8a24b" xml:space="preserve">$ tazamun start</text>
+<text x="22.0" y="212.8" fill="#5a6480" xml:space="preserve"># on the second machine</text>
+<text x="22.0" y="237.1" fill="#c8a24b" xml:space="preserve">$ tazamun join tzm1akqhrtm5lfr2tnri67jm6qmg2jb7euzymomokrxo3slv3…</text>
+<text x="22.0" y="261.4" fill="#3fbf7f" xml:space="preserve">✔ joined — 5 files arriving</text>
+<text x="22.0" y="310.0" fill="#c8a24b" xml:space="preserve">$ tazamun lock notes.md</text>
+<text x="22.0" y="334.3" fill="#3fbf7f" xml:space="preserve">✔ notes.md is now writable (lease TTL 90s, auto-renewed)</text>
+<text x="22.0" y="382.9" fill="#c8a24b" xml:space="preserve">$ tazamun unlock notes.md</text>
+<text x="22.0" y="407.2" fill="#3fbf7f" xml:space="preserve">✔ published 1 change — notes.md is read-only again</text>
+</svg>

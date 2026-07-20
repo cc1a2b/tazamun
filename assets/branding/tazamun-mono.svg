@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tazamun">
+  <title>tazamun — monochrome mark (currentColor)</title>
+  <!-- The interlock only, no tile, in a single ink via currentColor: for the
+       dashboard header (inherits the light text colour on the dark panel) and
+       any 1-colour context. -->
+  <g fill="none" stroke="currentColor" stroke-width="54" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 250 C164 330 230 356 282 340 C316 330 334 298 318 264"/>
+  </g>
+  <circle cx="150" cy="250" r="29" fill="currentColor"/>
+  <g transform="rotate(180 256 256)">
+    <g fill="none" stroke="currentColor" stroke-width="54" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M150 250 C164 330 230 356 282 340 C316 330 334 298 318 264"/>
+    </g>
+    <circle cx="150" cy="250" r="29" fill="currentColor"/>
+  </g>
+</svg>

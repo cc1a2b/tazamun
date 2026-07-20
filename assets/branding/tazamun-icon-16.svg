@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tazamun">
+  <title>tazamun — small-optimized icon (16–32 px)</title>
+  <!--
+    Reduced-detail variant of the interlock for 16–32 px (standard practice).
+    The thin clasp muddies at 16 px, so the two peer NODES carry the meaning:
+    two bold dots (gold + ivory) in 180° rotational symmetry, joined by a short
+    two-tone clasp — reads as "two peers, handing off" even at taskbar size.
+  -->
+  <rect width="512" height="512" rx="116" fill="#0E2A47"/>
+  <path d="M188 196 C240 222 256 250 258 270" fill="none" stroke="#C8A24B" stroke-width="48" stroke-linecap="round"/>
+  <path d="M324 316 C272 290 256 262 254 242" fill="none" stroke="#F3EDDD" stroke-width="48" stroke-linecap="round"/>
+  <circle cx="188" cy="196" r="66" fill="#C8A24B"/>
+  <circle cx="324" cy="316" r="66" fill="#F3EDDD"/>
+</svg>

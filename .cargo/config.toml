@@ -1,0 +1,13 @@
+# Keep development runs out of the developer's real configuration directory.
+#
+# `tazamun init` and `tazamun join` register the session they create in
+# `<config-base>/tazamun/sessions.json`. The integration tests call both against
+# temporary folders, so before this every `cargo test` left dead session entries
+# pointing at deleted `/tmp` directories in the contributor's own registry — and
+# the GUI would then list them as broken sessions.
+#
+# Anything cargo launches (`cargo test`, `cargo run`) now keeps its registry and
+# its GUI preferences under `target/`. Installed binaries are unaffected: cargo
+# is not involved when the shipped executable runs.
+[env]
+TAZAMUN_CONFIG_DIR = { value = "target/dev-config", relative = true }
