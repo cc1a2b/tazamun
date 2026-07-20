@@ -3024,6 +3024,38 @@ mod tests {
         }
     }
 
+    /// A real 148-byte method-8 (DEFLATE) zip holding `payload.txt`. Feeding it
+    /// through self_update's own extractor proves the compression-zip-deflate
+    /// feature is compiled in — without it, extraction fails with the exact
+    /// "Compression method not supported" a Windows user hit.
+    #[rustfmt::skip]
+    const DEFLATE_ZIP_FIXTURE: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 22, 182, 244, 92, 115, 63, 90, 192, 28, 0, 0, 0,
+        248, 2, 0, 0, 11, 0, 0, 0, 112, 97, 121, 108, 111, 97, 100, 46, 116, 120, 116, 43,
+        73, 172, 74, 204, 45, 205, 211, 77, 73, 77, 203, 73, 44, 73, 213, 205, 207, 230, 42,
+        25, 21, 26, 21, 26, 238, 66, 0, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 22, 182,
+        244, 92, 115, 63, 90, 192, 28, 0, 0, 0, 248, 2, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 128, 1, 0, 0, 0, 0, 112, 97, 121, 108, 111, 97, 100, 46, 116, 120, 116, 80,
+        75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 57, 0, 0, 0, 69, 0, 0, 0, 0, 0,
+    ];
+
+    /// The Windows release zip is DEFLATE. Extract it through the exact library
+    /// the updater uses; if `compression-zip-deflate` is ever dropped from the
+    /// self_update features, this fails the way `tazamun update` did on Windows.
+    #[test]
+    fn self_update_extracts_a_deflate_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("release.zip");
+        std::fs::write(&zip, DEFLATE_ZIP_FIXTURE).unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        self_update::Extract::from_source(&zip)
+            .extract_file(&out, "payload.txt")
+            .expect("DEFLATE zip must extract (compression-zip-deflate feature)");
+        let got = std::fs::read_to_string(out.join("payload.txt")).unwrap();
+        assert!(got.starts_with("tazamun-deflate-ok"));
+    }
+
     /// The managed-install note fires for npm and Homebrew layouts — including
     /// the exact path a real npm-on-Windows install reported — and stays quiet
     /// for plain installs.

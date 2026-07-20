@@ -94,6 +94,23 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## The Windows updater needed BOTH compression features (v0.1.4)
+
+- **`archive-zip` opens a zip; it does not decompress one.** self_update's
+  `archive-zip` pulls in the `zip` crate with no compression backend, so a
+  DEFLATE entry — which is every entry in a cargo-dist Windows zip — fails
+  with "Compression method not supported". The build had `compression-flate2`,
+  which is the gzip decoder for the unix tar.gz and does nothing for zip. The
+  fix is `compression-zip-deflate` (it adds `zip/deflate`); both compression
+  features are required and a Cargo.toml comment says so.
+- **This was invisible from Linux, and that is the lesson.** The zip path is
+  Windows-only (`cfg!(windows)`), and the earlier archive-path fix was
+  unit-tested by string, not by extraction — so v0.1.2 and v0.1.3 shipped a
+  decompressor that could not decompress, twice. The guard now extracts a real
+  148-byte DEFLATE zip through `self_update::Extract` itself: proven to pass
+  with the feature and fail with the exact user error without it, so the whole
+  extraction path is exercised on every `cargo test`, on any host.
+
 ## WSL `/mnt` drives refuse the daemon, loudly now (v0.1.3)
 
 - **A session on a Windows drive mounted in WSL could be created but never

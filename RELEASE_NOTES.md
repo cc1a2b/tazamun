@@ -1,3 +1,25 @@
+# Tazamun v0.1.4
+
+The second half of the Windows self-update fix. v0.1.2 taught the updater
+where the binary lives inside the zip; this teaches it to decompress the zip
+at all. A Windows `tazamun update` downloaded the release, found the binary,
+and then died with `ZipError: Compression method not supported` — because the
+updater was built to handle zip archives but without the DEFLATE decompressor,
+and every release zip is DEFLATE (the universal zip compression).
+
+- Added the `compression-zip-deflate` feature to `self_update`. The build
+  already had `compression-flate2` — but that is the gzip decoder for the unix
+  `.tar.gz`, not the DEFLATE decoder for the Windows `.zip`. Both are needed;
+  a Cargo.toml comment now says so, and a test extracts a real DEFLATE zip
+  through self_update's own extractor so the feature can't silently regress.
+
+Windows binaries at v0.1.0–v0.1.3 cannot self-update past this: their updater
+still lacks the decompressor. Reinstall once — `npm update -g tazamun`, re-run
+the installer, or grab the zip — to reach v0.1.4, and every later update works
+in place. No engine changes.
+
+---
+
 # Tazamun v0.1.3
 
 The WSL drive-mount fix. `tazamun init` inside a Windows drive mounted in WSL
