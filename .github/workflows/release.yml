@@ -295,7 +295,11 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    # Hand edit (preserved via allow-dirty = ["ci"] in the dist config): also
+    # require the tap token to exist, so a release without it shows this job
+    # as skipped rather than failed. After adding the secret, `gh run rerun`
+    # the release to publish the formula.
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       - uses: actions/checkout@v6
         with:

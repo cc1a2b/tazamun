@@ -892,20 +892,27 @@ fn self_update_run(
         return Ok(());
     }
 
+    let _ = yes; // kept for compatibility: updates no longer prompt
     let mut builder = github::Update::configure();
     builder
         .repo_owner("cc1a2b")
         .repo_name("tazamun")
         .bin_name("tazamun")
-        // dist archives are not flat: the binary sits one directory down, in
-        // `tazamun-<target>/`. self_update's default looks for it at the
-        // archive root, which downloads the right asset and then fails to
-        // extract — on every platform. The template's `{{ bin }}` carries the
-        // platform exe suffix, so this one path is right everywhere.
-        .bin_path_in_archive(UPDATE_BIN_PATH_IN_ARCHIVE)
+        // The two archive formats have two different layouts, verified against
+        // live release assets: the unix tar.gz nests the binary one directory
+        // down in `tazamun-<target>/`, while the Windows zip is flat with
+        // `tazamun.exe` at the root. Guessing one shape for both is exactly
+        // the bug that shipped in v0.1.0 (the zip lookup died with "specified
+        // file not found in archive"). `{{ bin }}` carries the exe suffix.
+        .bin_path_in_archive(update_bin_path_in_archive())
         .target(update_target())
         .current_version(current)
-        .no_confirm(yes)
+        // No questions, no chatter: the surrounding command already says what
+        // it found and what it did, and a confirm prompt in the middle of an
+        // update is friction with no safety — the swap is atomic and the old
+        // binary is what you already had.
+        .no_confirm(true)
+        .show_output(false)
         .show_download_progress(true);
     if let Some(t) = &token {
         builder.auth_token(t);
@@ -928,17 +935,68 @@ fn self_update_run(
     if status.updated() {
         println!("\u{2714} updated to {}", status.version());
         println!("Restart any running `tazamun` daemons to pick up the new binary.");
+        // A package manager that owns this install keeps its own books; the
+        // binary is now newer than the manager believes, and its next
+        // operation may quietly roll this file back.
+        if let Some((mgr, cmd)) = managed_by() {
+            println!(
+                "note: this install is managed by {mgr}, whose records still name the old \
+                 version — prefer `{cmd}` next time, or a future {mgr} operation may revert it."
+            );
+        }
     } else {
         println!("Already up to date ({}).", status.version());
     }
     Ok(())
 }
 
-/// Where the binary lives inside a dist release archive, as a self_update
-/// template: `tazamun-x86_64-unknown-linux-gnu/tazamun`, and the `.exe` form
-/// on Windows. Pinned by a test so the archive layout and this path cannot
-/// drift apart silently.
-const UPDATE_BIN_PATH_IN_ARCHIVE: &str = "tazamun-{{ target }}/{{ bin }}";
+/// Which package manager owns the running executable, judged from its path,
+/// with the command that updates it properly. `None` for a plain install —
+/// the self-updater's home turf.
+fn managed_by() -> Option<(&'static str, &'static str)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    managed_by_path(&exe)
+}
+
+/// Split on both separators rather than `components()`: `components()` cannot
+/// see the segments of a Windows path on a Unix host, which would make this
+/// untestable for the exact layouts users report. A Unix filename containing a
+/// literal backslash could over-split, but the cost is at worst one advisory
+/// line.
+fn managed_by_path(exe: &std::path::Path) -> Option<(&'static str, &'static str)> {
+    let s = exe.to_string_lossy();
+    for part in s.split(['/', '\\']) {
+        match part {
+            "node_modules" => return Some(("npm", "npm update -g tazamun")),
+            "Cellar" | "homebrew" | "Homebrew" => {
+                return Some(("Homebrew", "brew upgrade tazamun"));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the binary lives inside a dist `.tar.gz`: nested one directory down.
+/// Verified against the live v0.1.1 linux asset, and pinned by a test.
+const UPDATE_BIN_PATH_TAR: &str = "tazamun-{{ target }}/{{ bin }}";
+
+/// Where the binary lives inside a dist `.zip`: at the root. Verified against
+/// the live v0.1.1 windows asset (`LICENSE`, `README.md`, `tazamun.exe`), and
+/// pinned by a test.
+const UPDATE_BIN_PATH_ZIP: &str = "{{ bin }}";
+
+/// Windows releases ship as flat zips; everything else as nested tarballs.
+/// `cfg!` rather than `#[cfg]` so both constants stay compiled (and testable)
+/// on every platform.
+fn update_bin_path_in_archive() -> &'static str {
+    if cfg!(windows) {
+        UPDATE_BIN_PATH_ZIP
+    } else {
+        UPDATE_BIN_PATH_TAR
+    }
+}
 
 /// The release-asset target this build should update from. Releases ship MSVC
 /// on Windows, so a locally cross-built GNU binary must look for the MSVC
@@ -2926,29 +2984,65 @@ mod tests {
     use crate::net::endpoint::RelayChoice;
     use crate::state::SessionConfig;
 
-    /// Pins the updater's archive-path contract to dist's real layout. If the
-    /// archive format changes (say, back to a flat root), this fails before a
-    /// release ships an updater that cannot extract what it downloads.
+    /// Pins the updater's archive-path contract to dist's real layouts — which
+    /// DIFFER by format: tar.gz nests `tazamun-<target>/`, zip is flat. The
+    /// first shipped guess used the tar shape for both, and every Windows
+    /// update died with "specified file not found in archive". Layouts here
+    /// were read from the live v0.1.1 assets.
     #[test]
     fn update_bin_path_matches_the_dist_archive_layout() {
-        let expand = |target: &str, bin: &str| {
-            UPDATE_BIN_PATH_IN_ARCHIVE
-                .replace("{{ target }}", target)
-                .replace("{{ bin }}", bin)
+        let expand = |t: &str, target: &str, bin: &str| {
+            t.replace("{{ target }}", target).replace("{{ bin }}", bin)
         };
         assert_eq!(
-            expand("x86_64-unknown-linux-gnu", "tazamun"),
+            expand(UPDATE_BIN_PATH_TAR, "x86_64-unknown-linux-gnu", "tazamun"),
             "tazamun-x86_64-unknown-linux-gnu/tazamun"
         );
+        // The real zip holds exactly LICENSE, README.md, tazamun.exe — no dir.
         assert_eq!(
-            expand("x86_64-pc-windows-msvc", "tazamun.exe"),
-            "tazamun-x86_64-pc-windows-msvc/tazamun.exe"
+            expand(UPDATE_BIN_PATH_ZIP, "x86_64-pc-windows-msvc", "tazamun.exe"),
+            "tazamun.exe"
         );
         // Exactly one space inside the braces — self_update's substitution is
         // whitespace-tolerant, but the plain-replace form above is not, so the
-        // template must stay in this spelling for the test to mean anything.
-        assert!(UPDATE_BIN_PATH_IN_ARCHIVE.contains("{{ target }}"));
-        assert!(UPDATE_BIN_PATH_IN_ARCHIVE.contains("{{ bin }}"));
+        // templates must stay in this spelling for the test to mean anything.
+        assert!(UPDATE_BIN_PATH_TAR.contains("{{ target }}"));
+        assert!(UPDATE_BIN_PATH_TAR.contains("{{ bin }}"));
+        assert!(UPDATE_BIN_PATH_ZIP.contains("{{ bin }}"));
+        // And the picker chooses the zip shape exactly on Windows.
+        if cfg!(windows) {
+            assert_eq!(update_bin_path_in_archive(), UPDATE_BIN_PATH_ZIP);
+        } else {
+            assert_eq!(update_bin_path_in_archive(), UPDATE_BIN_PATH_TAR);
+        }
+    }
+
+    /// The managed-install note fires for npm and Homebrew layouts — including
+    /// the exact path a real npm-on-Windows install reported — and stays quiet
+    /// for plain installs.
+    #[test]
+    fn managed_installs_are_recognized_from_the_exe_path() {
+        use std::path::Path;
+        let npm_win = Path::new(
+            r"C:\Users\cc1a2b\AppData\Roaming\npm\node_modules\tazamun\node_modules\.bin_real\tazamun.exe",
+        );
+        assert_eq!(managed_by_path(npm_win).map(|(m, _)| m), Some("npm"));
+        let npm_unix = Path::new("/usr/local/lib/node_modules/tazamun/bin/tazamun");
+        assert_eq!(managed_by_path(npm_unix).map(|(m, _)| m), Some("npm"));
+        let brew_mac = Path::new("/opt/homebrew/Cellar/tazamun/0.1.2/bin/tazamun");
+        assert_eq!(managed_by_path(brew_mac).map(|(m, _)| m), Some("Homebrew"));
+        let brew_linux = Path::new("/home/linuxbrew/.linuxbrew/Cellar/tazamun/0.1.2/bin/tazamun");
+        assert_eq!(
+            managed_by_path(brew_linux).map(|(m, _)| m),
+            Some("Homebrew")
+        );
+        for plain in [
+            "/home/user/.cargo/bin/tazamun",
+            "/usr/local/bin/tazamun",
+            r"C:\Users\me\.cargo\bin\tazamun.exe",
+        ] {
+            assert_eq!(managed_by_path(Path::new(plain)), None, "{plain}");
+        }
     }
 
     /// A hand-built Windows GNU binary must update from the MSVC release asset

@@ -1,6 +1,6 @@
 [package]
 name = "tazamun"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -138,6 +138,9 @@ install-path = "CARGO_HOME"
 checksum = "sha256"
 # Which actions to run on pull requests
 pr-run-mode = "skip"
+# The generated CI carries one deliberate hand edit (the homebrew token gate);
+# do not let `dist generate` flag or overwrite it.
+allow-dirty = ["ci"]
 # The archive format to use for non-windows builds (defaults .tar.xz)
 unix-archive = ".tar.gz"
 # The archive format to use for windows builds (defaults .zip)

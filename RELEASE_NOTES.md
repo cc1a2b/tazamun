@@ -1,3 +1,29 @@
+# Tazamun v0.1.2
+
+The Windows self-update fix. If you are on Windows with v0.1.0 or v0.1.1,
+`tazamun update` cannot carry you here — reinstall once
+(`npm update -g tazamun`, or re-run the installer, or grab the zip) and every
+later update works in place.
+
+- **`tazamun update` on Windows died extracting** ("specified file not found
+  in archive"). The two archive formats have different layouts — the unix
+  tar.gz nests the binary under `tazamun-<target>/`, the Windows zip is flat —
+  and the updater assumed the tar shape for both. Each format now gets its own
+  path, pinned by tests against the live release layouts.
+- **Updates no longer stop to ask.** The confirm prompt and the step-by-step
+  chatter are gone: `tazamun update` states what it found, shows the download,
+  and reports the swap. The old `-y` flag remains accepted.
+- **Package-manager installs are recognised.** When the running binary lives
+  inside npm's or Homebrew's tree, a successful self-update now says so and
+  names the manager's own command — the manager's records still hold the old
+  version, and its next operation may roll the file back.
+- **A release without the Homebrew tap token now skips the formula job**
+  instead of failing it.
+
+No engine changes.
+
+---
+
 # Tazamun v0.1.1
 
 A plumbing release, one day after v0.1.0 — no engine changes. Its purpose is
