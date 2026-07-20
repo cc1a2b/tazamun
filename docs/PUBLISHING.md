@@ -14,9 +14,11 @@ proven in production (a released v0.1.1 updated itself to v0.1.2 in place).
 `npm install -g tazamun` is live. Three things remain, and each needs the
 maintainer's own accounts:
 
-1. **Rotate the npm token.** The token currently in the `NPM_TOKEN` secret
-   was exposed in a chat transcript. Revoke it on npmjs.com, mint a fresh
-   Automation token, then
+1. **npm token: exposure risk accepted by the owner (2026-07-20).** The
+   token in the `NPM_TOKEN` secret appeared in a chat transcript; the owner
+   was advised to rotate and chose to keep it. It publishes correctly
+   (v0.1.1 and v0.1.2 shipped with it). If that stance ever changes: revoke
+   on npmjs.com, mint a fresh Automation token, then
    `printf '%s' 'NEW' | gh secret set NPM_TOKEN --repo cc1a2b/tazamun`.
 2. **Mint the Homebrew tap PAT** (fine-grained, only `cc1a2b/homebrew-tap`,
    Contents: read-and-write), set it as `HOMEBREW_TAP_TOKEN`, then re-run the
