@@ -1,3 +1,24 @@
+# Tazamun v0.1.3
+
+The WSL drive-mount fix. `tazamun init` inside a Windows drive mounted in WSL
+(`/mnt/c`, `/mnt/e`, …) used to succeed, mint a real invite, and then `tazamun
+start` failed with a bare `ipc io: Operation not supported (os error 95)` and
+no explanation. Those 9p mounts support neither Unix sockets nor reliable
+change events, so a session there can never run.
+
+- **`init` now refuses up front**, before writing any session state, when the
+  folder's filesystem cannot host the daemon — it probes by binding a
+  throwaway socket and removing it. The message names the cause and two real
+  fixes: keep the session on your native Linux home, or sync the Windows drive
+  with the native Windows build as its own peer.
+- **`start` gives the same clear message** instead of the raw errno, so an
+  older session created before this release explains itself too.
+
+If you have a session stranded on a `/mnt` drive: re-init it under your Linux
+home (`~/tazamun/<folder>`) and re-share the invite. No engine changes.
+
+---
+
 # Tazamun v0.1.2
 
 The Windows self-update fix. If you are on Windows with v0.1.0 or v0.1.1,

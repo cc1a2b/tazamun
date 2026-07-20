@@ -163,6 +163,15 @@ pub enum IpcError {
     NoDaemon,
     #[error("a daemon is already running for this folder")]
     AlreadyRunning,
+    #[error(
+        "this folder is on a filesystem that cannot host the sync daemon: \
+         binding its control socket was refused.\n  On WSL this means a Windows \
+         drive mounted over 9p (/mnt/c, /mnt/e, …), which supports neither Unix \
+         sockets nor reliable change events.\n  Fix: keep the session on your \
+         native Linux home (e.g. ~/tazamun/<folder>), or sync the Windows drive \
+         with the native Windows build of tazamun as its own peer."
+    )]
+    Unsupported,
     #[error("ipc io: {0}")]
     Io(#[from] std::io::Error),
     #[error("ipc line exceeds {IPC_LINE_MAX} bytes")]
@@ -285,8 +294,61 @@ pub async fn bind(dir: &Path) -> Result<IpcListener, IpcError> {
     }
     let listener = ListenerOptions::new()
         .name(socket_name(dir)?)
-        .create_tokio()?;
+        .create_tokio()
+        .map_err(map_bind_error)?;
     Ok(IpcListener { listener })
+}
+
+/// A socket bind refused with `EOPNOTSUPP`/`ENOTSUP` (errno 95 on Linux) means
+/// the underlying filesystem does not support Unix domain sockets at all —
+/// 9p/drvfs (WSL's `/mnt/*`) being the case users actually hit. Turn the raw
+/// errno into the guidance in [`IpcError::Unsupported`]; pass everything else
+/// through unchanged.
+fn map_bind_error(err: std::io::Error) -> IpcError {
+    if socket_unsupported(&err) {
+        IpcError::Unsupported
+    } else {
+        IpcError::Io(err)
+    }
+}
+
+/// True when the error is the filesystem refusing a socket bind outright.
+/// `EOPNOTSUPP` and `ENOTSUP` share value 95 on Linux; a few kernels report
+/// `EPERM` (1) for the same condition on 9p, so both are treated as terminal.
+pub fn socket_unsupported(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(95) | Some(1))
+}
+
+/// Probes whether `dir`'s filesystem can host the daemon's control socket, by
+/// binding a throwaway socket beside where the real one would live and
+/// immediately dropping it. `Ok(())` when the daemon can run here;
+/// [`IpcError::Unsupported`] when the filesystem refuses. Cheap, side-effect
+/// free (the probe file is removed), and the one honest way to tell a user at
+/// `init` time that a session created here could never start.
+pub fn probe_can_host(dir: &Path) -> Result<(), IpcError> {
+    #[cfg(unix)]
+    {
+        let meta = crate::state::AppState::meta_dir(dir);
+        std::fs::create_dir_all(&meta)?;
+        let probe = meta.join(".daemon.sock.probe");
+        let _ = std::fs::remove_file(&probe);
+        let name = probe.as_os_str().to_fs_name::<GenericFilePath>()?;
+        // The bind is what the probe tests; the listener is dropped here at end
+        // of scope, releasing it, before the socket file is unlinked below.
+        let outcome = match ListenerOptions::new().name(name).create_sync() {
+            Ok(_listener) => Ok(()),
+            Err(e) => Err(map_bind_error(e)),
+        };
+        let _ = std::fs::remove_file(&probe);
+        outcome
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows named pipes live in the kernel namespace, never on the
+        // folder's filesystem, so there is nothing to probe.
+        let _ = dir;
+        Ok(())
+    }
 }
 
 pub struct IpcListener {
@@ -364,6 +426,38 @@ async fn serve_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_unsupported_recognizes_the_filesystem_refusals() {
+        // 9p/drvfs (WSL /mnt/*) reports EOPNOTSUPP == 95; a few kernels report
+        // EPERM == 1 for the same condition. Both mean "no socket here".
+        for errno in [95, 1] {
+            assert!(socket_unsupported(&std::io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        // Ordinary errors are not this condition and must pass through as Io.
+        for errno in [
+            2,  /* ENOENT */
+            13, /* EACCES */
+            98, /* EADDRINUSE */
+        ] {
+            assert!(!socket_unsupported(&std::io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!socket_unsupported(&std::io::Error::other(
+            "not an os error"
+        )));
+    }
+
+    #[test]
+    fn a_normal_temp_dir_can_host_the_daemon() {
+        // The probe must succeed on tmpfs/ext4 — the whole test suite runs on
+        // one, so a false positive here would be caught immediately.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(probe_can_host(dir.path()).is_ok());
+    }
 
     #[test]
     fn request_wire_format_matches_spec() {

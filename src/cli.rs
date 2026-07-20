@@ -1668,6 +1668,13 @@ pub fn init(dir: &Path) -> Result<(), CliError> {
         ));
     }
     std::fs::create_dir_all(dir).map_err(crate::state::StateError::Io)?;
+    // Refuse before writing any session state if the daemon could never run
+    // here. Otherwise `init` succeeds, mints a real invite, and only `start`
+    // discovers the folder is unusable — the confusing sequence a WSL user on
+    // a /mnt drive hits every time.
+    if let Err(e) = crate::ipc::probe_can_host(dir) {
+        return Err(CliError::Refused(e.to_string()));
+    }
     let secret_key = iroh::SecretKey::generate();
     let session_secret: [u8; 32] = rand::random();
     // P17: the founder is the session admin/editor. Generate the admin Ed25519

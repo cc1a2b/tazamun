@@ -94,6 +94,26 @@ file whenever a dependency is added or a load-bearing design decision is made.
   all derive from the secret, so any member can mint a valid invite and the
   ticket stays short.
 
+## WSL `/mnt` drives refuse the daemon, loudly now (v0.1.3)
+
+- **A session on a Windows drive mounted in WSL could be created but never
+  run.** `/mnt/c`, `/mnt/e` … are 9p/drvfs: no Unix domain sockets (the IPC
+  socket bind returns `EOPNOTSUPP`, errno 95) and no reliable inotify. `init`
+  happily wrote state and minted an invite; `start` then failed with a bare
+  `os error 95`. For a tool whose whole voice is "a refusal names the cause
+  and the fix", that was a bug, not just rough edges.
+- **The probe binds a throwaway socket rather than sniffing the mount type.**
+  `ipc::probe_can_host` creates a real listener beside where the daemon's
+  socket would live and drops it — filesystem-agnostic, so it catches any
+  filesystem that refuses `AF_UNIX`, not just the two WSL cases we know to
+  name. `init` calls it before writing any state and refuses cleanly; `start`
+  maps the same errno on the real bind to the same guidance.
+- **Relocating the socket to `XDG_RUNTIME_DIR` was rejected.** It would have
+  let `start` run, but the watcher uses inotify (`notify::RecommendedWatcher`)
+  which 9p does not serve — so edits would go unnoticed and sync would be
+  silently broken. A clear refusal beats a daemon that runs and quietly does
+  nothing.
+
 ## Release engineering (v0.1.0 – v0.1.2)
 
 - **The public history is one root commit, deliberately.** The 99-commit
