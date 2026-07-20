@@ -1,3 +1,20 @@
+# Tazamun v0.1.1
+
+A plumbing release, one day after v0.1.0 — no engine changes. Its purpose is
+to exercise the one path a first release cannot prove about itself:
+`tazamun update` from an installed v0.1.0 to a newer version, end to end.
+
+- The Homebrew tap is initialized, so the formula publish lands once the tap
+  token is in place; `npm install -g tazamun` and both one-line installers are
+  already live and verified against v0.1.0.
+- Release automation runs entirely on GitHub-hosted runners; every platform
+  archive carries a `.sha256` and a build-provenance attestation, as before.
+
+Nothing about the sync engine, the protocol, the CLI surface, or the desktop
+app changed. If you are on v0.1.0: `tazamun update`.
+
+---
+
 # Tazamun v0.1.0
 
 **Strict-checkout P2P folder sync. No server ever reads your files.**
