@@ -225,23 +225,84 @@ What that buys you, and what it deliberately doesn't:
 
 ## Install
 
-**From source** — one self-contained binary, no runtime dependencies:
+Pick whichever tool you already live in — every route below delivers the same
+single, self-contained binary. Nothing else is installed: no runtime, no
+services, no browser engine. The binary carries its own fonts, icon, man page
+and shell completions.
+
+**One line** (Linux and macOS):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cc1a2b/tazamun/releases/latest/download/tazamun-installer.sh | sh
+```
+
+**One line** (Windows PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/cc1a2b/tazamun/releases/latest/download/tazamun-installer.ps1 | iex"
+```
+
+**Homebrew** (macOS and Linux):
+
+```bash
+brew install cc1a2b/tap/tazamun
+```
+
+**npm** — useful when a JS toolchain is what a team already has:
+
+```bash
+npm install -g tazamun
+```
+
+**Cargo** — builds from the published crate with your own toolchain:
+
+```bash
+cargo install tazamun            # from crates.io
+cargo install --git https://github.com/cc1a2b/tazamun   # straight from main
+```
+
+**By hand** — grab the archive for your platform from
+[Releases](https://github.com/cc1a2b/tazamun/releases), unpack, and put
+`tazamun` somewhere on your `PATH`. Builds ship for
+x86_64 Linux, Intel and Apple-silicon macOS, and x86_64 Windows.
+
+Every release artifact carries a `.sha256` checksum and a SLSA build-provenance
+attestation — proof the binary was built by this repository's release workflow
+from a public commit, not on somebody's laptop:
+
+```bash
+sha256sum -c tazamun-x86_64-unknown-linux-gnu.tar.gz.sha256
+gh attestation verify tazamun-x86_64-unknown-linux-gnu.tar.gz --repo cc1a2b/tazamun
+```
+
+**From source** — the whole project is one `cargo build`:
 
 ```bash
 git clone https://github.com/cc1a2b/tazamun && cd tazamun
-cargo build --release          # → target/release/tazamun
+cargo build --release            # → target/release/tazamun
 ```
 
-Requires the Rust stable toolchain (edition 2024, MSRV **1.91**). End users install nothing else; the binary carries its own icon, man page, and shell completions.
+Requires the Rust stable toolchain (edition 2024, MSRV **1.91**).
 
-**Keep it current** — once releases are published, tazamun updates itself:
+### Staying current
+
+The binary updates itself — it finds the release for this platform, verifies it
+is newer, downloads, and swaps itself in place:
 
 ```bash
-tazamun update --check         # is a newer build out?
-tazamun update                 # download this platform's build and self-replace
+tazamun update --check           # is a newer build out?
+tazamun update                   # fetch and self-replace
 ```
 
-> **WSL users:** keep your session folder on the **native Linux filesystem** (`~/projects/…`), not a `/mnt/c` or `/mnt/e` Windows mount. Those mounts speak 9p — no Unix sockets, no reliable change events — so the daemon can't run there. To sync a Windows drive, run the native Windows build as its own peer and let the two nodes sync over the network, not across the mount.
+If a package manager put tazamun on your machine, let it do the updating
+instead, so its records stay true: `brew upgrade tazamun`,
+`npm update -g tazamun`, or `cargo install tazamun` again.
+
+> **WSL users:** keep your session folder on the **native Linux filesystem**
+> (`~/projects/…`), not a `/mnt/c` or `/mnt/e` Windows mount. Those mounts
+> speak 9p — no Unix sockets, no reliable change events — so the daemon can't
+> run there. To sync a Windows drive, run the native Windows build as its own
+> peer and let the two nodes sync over the network, not across the mount.
 
 ---
 

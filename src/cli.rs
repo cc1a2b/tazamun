@@ -897,6 +897,13 @@ fn self_update_run(
         .repo_owner("cc1a2b")
         .repo_name("tazamun")
         .bin_name("tazamun")
+        // dist archives are not flat: the binary sits one directory down, in
+        // `tazamun-<target>/`. self_update's default looks for it at the
+        // archive root, which downloads the right asset and then fails to
+        // extract — on every platform. The template's `{{ bin }}` carries the
+        // platform exe suffix, so this one path is right everywhere.
+        .bin_path_in_archive(UPDATE_BIN_PATH_IN_ARCHIVE)
+        .target(update_target())
         .current_version(current)
         .no_confirm(yes)
         .show_download_progress(true);
@@ -925,6 +932,27 @@ fn self_update_run(
         println!("Already up to date ({}).", status.version());
     }
     Ok(())
+}
+
+/// Where the binary lives inside a dist release archive, as a self_update
+/// template: `tazamun-x86_64-unknown-linux-gnu/tazamun`, and the `.exe` form
+/// on Windows. Pinned by a test so the archive layout and this path cannot
+/// drift apart silently.
+const UPDATE_BIN_PATH_IN_ARCHIVE: &str = "tazamun-{{ target }}/{{ bin }}";
+
+/// The release-asset target this build should update from. Releases ship MSVC
+/// on Windows, so a locally cross-built GNU binary must look for the MSVC
+/// asset — it graduates to the released ABI on its first update. Every other
+/// triple is its own asset name.
+fn update_target() -> &'static str {
+    normalize_update_target(self_update::get_target())
+}
+
+fn normalize_update_target(target: &'static str) -> &'static str {
+    match target {
+        "x86_64-pc-windows-gnu" => "x86_64-pc-windows-msvc",
+        t => t,
+    }
 }
 
 /// Maps a self_update error string to a message that names the likely cause —
@@ -2897,6 +2925,51 @@ mod tests {
     use super::*;
     use crate::net::endpoint::RelayChoice;
     use crate::state::SessionConfig;
+
+    /// Pins the updater's archive-path contract to dist's real layout. If the
+    /// archive format changes (say, back to a flat root), this fails before a
+    /// release ships an updater that cannot extract what it downloads.
+    #[test]
+    fn update_bin_path_matches_the_dist_archive_layout() {
+        let expand = |target: &str, bin: &str| {
+            UPDATE_BIN_PATH_IN_ARCHIVE
+                .replace("{{ target }}", target)
+                .replace("{{ bin }}", bin)
+        };
+        assert_eq!(
+            expand("x86_64-unknown-linux-gnu", "tazamun"),
+            "tazamun-x86_64-unknown-linux-gnu/tazamun"
+        );
+        assert_eq!(
+            expand("x86_64-pc-windows-msvc", "tazamun.exe"),
+            "tazamun-x86_64-pc-windows-msvc/tazamun.exe"
+        );
+        // Exactly one space inside the braces — self_update's substitution is
+        // whitespace-tolerant, but the plain-replace form above is not, so the
+        // template must stay in this spelling for the test to mean anything.
+        assert!(UPDATE_BIN_PATH_IN_ARCHIVE.contains("{{ target }}"));
+        assert!(UPDATE_BIN_PATH_IN_ARCHIVE.contains("{{ bin }}"));
+    }
+
+    /// A hand-built Windows GNU binary must update from the MSVC release asset
+    /// (there is no GNU asset), and every released triple maps to itself.
+    #[test]
+    fn update_target_normalizes_windows_gnu_to_msvc() {
+        assert_eq!(
+            normalize_update_target("x86_64-pc-windows-gnu"),
+            "x86_64-pc-windows-msvc"
+        );
+        for released in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+        ] {
+            assert_eq!(normalize_update_target(released), released);
+        }
+        // The live value is one of the released assets after normalization.
+        assert!(!update_target().contains("windows-gnu"));
+    }
 
     fn flags(relay: Option<&str>, no_relay: bool, no_lan: bool, airgap: bool) -> NetFlags {
         NetFlags {

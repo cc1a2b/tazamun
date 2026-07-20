@@ -43,8 +43,10 @@ overwrite each other.
 
 ## Platforms
 
-Prebuilt binaries for Linux and Windows. macOS builds from source with
-`cargo build --release` — the one platform this project cannot cross-compile.
+Prebuilt binaries for x86_64 Linux, Intel and Apple-silicon macOS, and x86_64
+Windows — plus a one-line installer for each, a Homebrew tap
+(`brew install cc1a2b/tap/tazamun`), an npm package (`npm install -g tazamun`),
+and the crate on crates.io (`cargo install tazamun`).
 
 Release artifacts carry **SLSA build-provenance attestations**; verify with
 `gh attestation verify <file> --repo cc1a2b/tazamun`. They are not

@@ -7,6 +7,24 @@ license = "MIT"
 description = "Tazamun — strict-checkout P2P folder sync over iroh. No server ever reads your files."
 repository = "https://github.com/cc1a2b/tazamun"
 homepage = "https://github.com/cc1a2b/tazamun"
+readme = "README.md"
+keywords = ["sync", "p2p", "encrypted", "file-locking", "iroh"]
+categories = ["command-line-utilities", "filesystem", "network-programming"]
+# What `cargo publish` ships. The compile needs assets/fonts, assets/gui and
+# the .ico + mono svg out of assets/branding — everything else under assets is
+# documentation weight (screenshots, brand PNG renders) that would push the
+# crate toward the registry size limit for nothing. Fuzz corpora, CI, and the
+# demo material stay out for the same reason.
+exclude = [
+    "/assets/screenshots",
+    "/assets/branding/png",
+    "/assets/branding/previews",
+    "/fuzz",
+    "/deploy",
+    "/.github",
+    "/docs",
+    "/SMOKE.md",
+]
 
 [lib]
 name = "tazamun"
@@ -84,6 +102,11 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 # The `fuzz/` crate (cargo-fuzz + libFuzzer) is its own detached crate, excluded
 # from this workspace so `cargo build/test/clippy` and the release build never
 # touch it (it needs nightly + a sanitizer). Build/run it with `cargo +nightly
@@ -91,34 +114,36 @@ opt-level = 2
 [workspace]
 exclude = ["fuzz"]
 
-# cargo-dist drives .github/workflows/release.yml (regenerate with `dist generate`).
-# pr-run-mode = "skip" keeps release.yml triggered ONLY on version tags — never
-# on pushes/PRs — so no release machinery runs until the single v0.1.0 tag.
+# Config for 'dist'
 [workspace.metadata.dist]
-cargo-dist-version = "0.28.0"
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
 ci = "github"
-# Build-provenance attestations over all artifacts at tag time (free).
+# Whether to enable GitHub Attestations
 github-attestations = true
-# Signing placeholders — post-v0.1 purchase decisions; see docs/SIGNING.md.
-# ssldotcom-windows-sign = "prod"
-# macos-sign = true
+# The installers to generate for each app
 installers = ["shell", "powershell", "npm", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
 tap = "cc1a2b/homebrew-tap"
-publish-jobs = ["homebrew"]
-npm-scope = "@cc1a2b"
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-]
+# Publish jobs to run in CI
+publish-jobs = ["homebrew", "npm"]
+# The npm package should have this name
+npm-package = "tazamun"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# Checksums to generate for each App
 checksum = "sha256"
+# Which actions to run on pull requests
 pr-run-mode = "skip"
-# Archives that self_update (behind `tazamun update`) can extract: gzip'd tar on
-# unix, zip on windows. cargo-dist's default `.tar.xz` is not self_update-readable.
+# The archive format to use for non-windows builds (defaults .tar.xz)
 unix-archive = ".tar.gz"
+# The archive format to use for windows builds (defaults .zip)
 windows-archive = ".zip"
+# Whether to install an updater program
+install-updater = false
 
 [build-dependencies]
 # Windows-target only (build-dep; no runtime cost): embeds the app icon,
