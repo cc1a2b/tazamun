@@ -223,6 +223,12 @@ resolve `releases/latest`, and old binaries update by finding newer tags.
 - **npm publish fails with E403** — the token is not an Automation token, or
   the name was claimed between check and publish. `npm view tazamun` to see
   who holds it.
+- **npm warns about allowScripts on install** — expected: the package's
+  postinstall downloads the platform binary, and npm 11.6+ flags install
+  scripts by default. Not a failure — the run shim downloads on first use if
+  the script was blocked (`binary-install.js` `run()` calls `install()` when
+  the binary is absent). Users can silence it with
+  `npm config set allow-scripts=tazamun --location=user`.
 - **Homebrew job fails to push** — the PAT lacks Contents write on the tap
   repo, or the secret name is not exactly `HOMEBREW_TAP_TOKEN`.
 - **`tazamun update` says 404** — no releases yet, or the repo went private

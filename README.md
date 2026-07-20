@@ -254,6 +254,13 @@ brew install cc1a2b/tap/tazamun
 npm install -g tazamun
 ```
 
+Recent npm versions may warn that tazamun has an install script "not yet
+covered by allowScripts" — that script downloads the platform binary at
+install time, and npm's new supply-chain guard flags every package that has
+one. Harmless either way: if npm blocked it, the first `tazamun` run fetches
+the binary itself. To keep the warning quiet:
+`npm config set allow-scripts=tazamun --location=user`.
+
 **Cargo** — builds from the published crate with your own toolchain:
 
 ```bash
