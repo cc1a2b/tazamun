@@ -152,6 +152,14 @@ pub enum Cmd {
     },
     /// Publish your edits and release the lease
     Unlock { path: String },
+    /// Rename or move a synced file so the change propagates cleanly
+    ///
+    /// A plain `mv` looks like a delete of the old name plus a create of the
+    /// new one, and tazamun reverts an un-leased delete on purpose — so a bare
+    /// rename leaves the old name behind on every peer. This does it right:
+    /// leases the old name, renames on disk, and publishes the removal, while
+    /// the new name syncs on its own. No duplicate, no manual lock.
+    Mv { from: String, to: String },
     /// List kept versions of a path, with tags, pins and disk usage
     Versions { path: String },
     /// Restore version N of a path (needs a held lease)
@@ -496,6 +504,7 @@ pub async fn run(cli: Cli, ui: Ui) -> Result<(), CliError> {
             println!("✔ {path} synced and read-only again");
             Ok(())
         }
+        Cmd::Mv { from, to } => handle_mv_cli(&dir, &from, &to).await,
         Cmd::Versions { path } => {
             let data = request(&dir, IpcRequest::Versions { path }).await?;
             print_versions(&data);
@@ -1105,6 +1114,81 @@ async fn handle_lock_cli(
             message: err.message,
         });
     }
+}
+
+/// What (if anything) is wrong with moving `from` to `to`, given the on-disk
+/// facts. Pure, so the refusal rules are unit-tested without a daemon.
+fn check_mv_paths(
+    from: &str,
+    to: &str,
+    from_exists: bool,
+    from_is_file: bool,
+    to_exists: bool,
+) -> Result<(), String> {
+    if to.trim().is_empty() {
+        return Err("the destination name is empty".into());
+    }
+    if from == to {
+        return Err("the source and destination names are the same".into());
+    }
+    if !from_exists {
+        return Err(format!("{from} does not exist"));
+    }
+    if !from_is_file {
+        return Err(format!("{from} is not a file — only files can be moved"));
+    }
+    if to_exists {
+        return Err(format!(
+            "{to} already exists — pick a name that does not, or remove it first"
+        ));
+    }
+    Ok(())
+}
+
+/// `tazamun mv from to`: lease the old name, rename on disk, publish the new
+/// name, then publish the removal of the old one. Doing it under a lease is
+/// what makes the delete propagate (a bare rename's delete-half is reverted by
+/// design), so the peers end up with only the new name — no duplicate, and no
+/// manual lock/unlock dance.
+async fn handle_mv_cli(dir: &Path, from: &str, to: &str) -> Result<(), CliError> {
+    let from_abs = dir.join(from);
+    let to_abs = dir.join(to);
+    check_mv_paths(
+        from,
+        to,
+        from_abs.exists(),
+        from_abs.is_file(),
+        to_abs.exists(),
+    )
+    .map_err(CliError::Refused)?;
+
+    // Lease the old name so its removal is published rather than reverted.
+    let resp = ipc::request(dir, &IpcRequest::Lock { path: from.into() }).await?;
+    if !resp.ok {
+        let why = resp
+            .error
+            .map(|e| e.message)
+            .unwrap_or_else(|| "could not lease the file".into());
+        return Err(CliError::Refused(format!("cannot move {from}: {why}")));
+    }
+    // Rename on disk. On failure, release the lease we just took.
+    if let Err(e) = std::fs::rename(&from_abs, &to_abs) {
+        let _ = ipc::request(dir, &IpcRequest::Unlock { path: from.into() }).await;
+        return Err(CliError::Refused(format!("could not rename on disk: {e}")));
+    }
+    // Publish the new name (works in strict mode; a no-op-ish lock in easy
+    // mode where it also auto-publishes), then publish the removal of the old.
+    // Best-effort on `to`: even if it cannot be leased right now it exists
+    // locally and will publish later; the removal of `from` is the part that
+    // must land, so it is not best-effort.
+    if let Ok(r) = ipc::request(dir, &IpcRequest::Lock { path: to.into() }).await
+        && r.ok
+    {
+        let _ = ipc::request(dir, &IpcRequest::Unlock { path: to.into() }).await;
+    }
+    ipc::request(dir, &IpcRequest::Unlock { path: from.into() }).await?;
+    println!("✔ moved {from} → {to}");
+    Ok(())
 }
 
 /// Best-effort pre-acquire advisory: warn if a peer that would be consulted
@@ -3044,6 +3128,22 @@ mod tests {
         0, 0, 128, 1, 0, 0, 0, 0, 112, 97, 121, 108, 111, 97, 100, 46, 116, 120, 116, 80,
         75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 57, 0, 0, 0, 69, 0, 0, 0, 0, 0,
     ];
+
+    #[test]
+    fn mv_precheck_refuses_the_unsafe_cases() {
+        // Happy path: from is an existing file, to is free.
+        assert!(check_mv_paths("a.pdf", "b.pdf", true, true, false).is_ok());
+        // Same name, empty destination, missing source, non-file source, and a
+        // destination that already exists are each refused (never clobbered).
+        assert!(check_mv_paths("a", "a", true, true, false).is_err());
+        assert!(check_mv_paths("a", "  ", true, true, false).is_err());
+        assert!(check_mv_paths("a", "b", false, false, false).is_err());
+        assert!(check_mv_paths("a", "b", true, false, false).is_err());
+        assert!(
+            check_mv_paths("a", "b", true, true, true).is_err(),
+            "must not overwrite an existing destination"
+        );
+    }
 
     /// The Windows release zip is DEFLATE. Extract it through the exact library
     /// the updater uses; if `compression-zip-deflate` is ever dropped from the

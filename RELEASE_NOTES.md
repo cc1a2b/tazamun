@@ -1,3 +1,24 @@
+# Tazamun v0.1.8
+
+A one-command rename: `tazamun mv <old> <new>`. Renaming a synced file with a
+plain `mv` leaves the old name behind on every peer, because a rename is a
+delete plus a create and tazamun reverts an un-leased delete on purpose (so an
+accidental `rm` can't wipe a file off every peer). This does the safe dance for
+you in one step.
+
+- `tazamun mv a.pdf b.pdf` leases the old name, renames on disk, publishes the
+  new name, and publishes the removal of the old — so peers end up with only
+  `b.pdf`, no duplicate, and you never touch `lock`/`unlock` yourself.
+- It refuses to clobber: an existing destination, a missing or non-file source,
+  and a same-name move are all rejected. Verified by a two-peer test that
+  renames a file and asserts the peer gains the new name and loses the old.
+
+Plain shell `mv` still reverts by design — deletes need a lease. `tazamun mv`
+is the safe way to rename without that being manual. No engine changes; the
+delete-protection core is untouched.
+
+---
+
 # Tazamun v0.1.7
 
 Clearer messaging when a synced file is deleted or renamed without a lease.

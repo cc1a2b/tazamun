@@ -190,3 +190,48 @@ async fn delta_edit_transfers_under_20_percent() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// A rename done under a lease on the old name propagates as a clean move: the
+/// peer gains the new name and loses the old one, with no duplicate. This is
+/// the mechanism `tazamun mv` automates — lock old, rename on disk, unlock old
+/// (which tombstones it) while the new file publishes on its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_under_lease_propagates_as_a_move() {
+    let dir = TestNode::init_dir();
+    std::fs::write(dir.path().join("old.txt"), b"the same bytes").unwrap();
+    // Default (strict) mode — the harder case: the new name must be published
+    // explicitly, exactly the sequence `tazamun mv` runs.
+    let a = TestNode::start(dir).await;
+    let b = TestNode::join(&a.invite().await).await;
+
+    assert!(
+        wait_until(|| async { b.read_file("old.txt").is_some() }, WAIT).await,
+        "initial sync of old.txt did not reach B"
+    );
+
+    // `tazamun mv old new`: lease old, rename on disk, publish new, tombstone old.
+    a.lock_ok("old.txt").await;
+    std::fs::rename(a.abs("old.txt"), a.abs("new.txt")).unwrap();
+    a.lock_ok("new.txt").await;
+    a.unlock_ok("new.txt").await;
+    a.unlock_ok("old.txt").await;
+
+    assert!(
+        wait_until(
+            || async { b.read_file("new.txt").is_some() && b.read_file("old.txt").is_none() },
+            WAIT
+        )
+        .await,
+        "rename did not propagate as a move (new missing or old not deleted on the peer)"
+    );
+    assert_eq!(b.read_file("new.txt").unwrap(), b"the same bytes");
+    // And no duplicate lingered on the origin either.
+    assert!(
+        a.read_file("old.txt").is_none(),
+        "old name still present on origin"
+    );
+    assert!(a.read_file("new.txt").is_some());
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
