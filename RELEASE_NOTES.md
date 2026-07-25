@@ -1,3 +1,24 @@
+# Tazamun v0.1.6
+
+`tazamun send <folder>` no longer aborts when the folder carries tazamun's own
+metadata. A folder that was ever `tazamun init`'d keeps a `.tazamun/` directory
+(state, audit log, history); `send` was scooping that into the transfer
+manifest, and the receiver correctly refused it — `.tazamun` is reserved and
+accepting untrusted paths there would be a security hole — which killed the
+whole transfer with "manifest has a hostile path: .tazamun/audit.jsonl".
+
+- The send walk now skips `.tazamun` (and the receiver-staging `.tazamun-recv`)
+  the same way the session sync does — it is tooling metadata, not your files.
+- Fixed the underlying logic error too: the manifest filter *included* any path
+  its own sanitizer rejected, instead of dropping it. A send can now never
+  offer a path the receiver will refuse. Both are covered by a test that
+  reproduces the exact folder-with-`.tazamun` case, Arabic filenames and all.
+
+The receiver's strict rejection is unchanged — it stays as a security backstop
+against a hostile sender. No engine changes.
+
+---
+
 # Tazamun v0.1.5
 
 `tazamun doctor` now names the one environment where a healthy daemon still

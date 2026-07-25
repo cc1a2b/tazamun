@@ -588,9 +588,15 @@ fn build_entries(path: &Path) -> Result<Vec<SendEntry>, String> {
     collect_files(path, path, &mut files)?;
     files.sort();
     for rel in files {
-        if let Ok(sane) = sanitize_rel_path(&rel)
-            && !ignore.verdict(&sane, None).is_sync()
-        {
+        // A send must never offer a path the receiver's gate will refuse: one
+        // rejected path aborts the *entire* transfer. So drop anything
+        // `sanitize_rel_path` rejects (the reserved `.tazamun`, `..` traversal,
+        // absolute/drive paths) — the previous form fell through and INCLUDED
+        // them — then drop editor junk, and offer the rest.
+        let Ok(sane) = sanitize_rel_path(&rel) else {
+            continue;
+        };
+        if !ignore.verdict(&sane, None).is_sync() {
             continue;
         }
         out.push(entry_for(&path.join(fs_rel(&rel)), &rel)?);
@@ -625,7 +631,13 @@ fn collect_files(root: &Path, cur: &Path, out: &mut Vec<String>) -> Result<(), S
     let entries = std::fs::read_dir(cur).map_err(|e| format!("{}: {e}", cur.display()))?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.file_name().and_then(|n| n.to_str()) == Some(".tazamun-recv") {
+        // Skip tazamun's own reserved directories: `.tazamun` (session
+        // metadata a folder keeps after `init` — the receiver rejects it) and
+        // `.tazamun-recv` (a receiver's own staging). Neither is user content.
+        if matches!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some(".tazamun") | Some(".tazamun-recv")
+        ) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -730,6 +742,35 @@ fn progress_bar(total: u64, verb: &str) -> indicatif::ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported bug: a folder that was once `tazamun init`'d keeps a
+    /// `.tazamun/` metadata directory, and `send` scooped it into the manifest
+    /// — which the receiver rejected as a hostile path, aborting the whole
+    /// transfer. The metadata must be excluded, real content (Arabic names and
+    /// spaces included) must be offered, and the result must pass the receiver
+    /// gate.
+    #[test]
+    fn send_manifest_excludes_reserved_metadata_and_stays_receivable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("report.pdf"), b"content").unwrap();
+        // Non-ASCII and spaces are user content, not hostile.
+        std::fs::write(root.join("التظلم.pdf"), b"arabic").unwrap();
+        std::fs::write(root.join("scan copy.jpeg"), b"spaces").unwrap();
+        // Leftover session metadata (post-`init`) and receiver staging.
+        std::fs::create_dir_all(root.join(".tazamun")).unwrap();
+        std::fs::write(root.join(".tazamun/audit.jsonl"), b"{}\n").unwrap();
+        std::fs::write(root.join(".tazamun/state.json"), b"{}").unwrap();
+        std::fs::create_dir_all(root.join(".tazamun-recv/abc")).unwrap();
+        std::fs::write(root.join(".tazamun-recv/abc/part"), b"stale").unwrap();
+
+        let entries = build_entries(root).unwrap();
+        let mut paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["report.pdf", "scan copy.jpeg", "التظلم.pdf"]);
+        // The crux: nothing offered trips the receiver's path gate.
+        validate_manifest(&entries).expect("a fixed manifest has no hostile paths");
+    }
 
     fn entry(path: &str, lens: &[u32]) -> SendEntry {
         let chunks: Vec<ChunkRef> = lens
