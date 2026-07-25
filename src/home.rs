@@ -507,11 +507,11 @@ mod tests {
 
     #[test]
     fn greeting_tracks_the_clock() {
-        assert_eq!(greeting(6, "Hussain"), "Good morning, Hussain");
-        assert_eq!(greeting(13, "Hussain"), "Good afternoon, Hussain");
-        assert_eq!(greeting(19, "Hussain"), "Good evening, Hussain");
-        assert_eq!(greeting(23, "Hussain"), "Good night, Hussain");
-        assert_eq!(greeting(3, "Hussain"), "Good night, Hussain");
+        assert_eq!(greeting(6, "Sam"), "Good morning, Sam");
+        assert_eq!(greeting(13, "Sam"), "Good afternoon, Sam");
+        assert_eq!(greeting(19, "Sam"), "Good evening, Sam");
+        assert_eq!(greeting(23, "Sam"), "Good night, Sam");
+        assert_eq!(greeting(3, "Sam"), "Good night, Sam");
         // Boundaries.
         assert!(greeting(5, "x").starts_with("Good morning"));
         assert!(greeting(11, "x").starts_with("Good morning"));
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn display_name_capitalizes_and_falls_back() {
-        assert_eq!(capitalize("hussain"), "Hussain");
+        assert_eq!(capitalize("sam"), "Sam");
         assert_eq!(capitalize("cc1a2b"), "Cc1a2b");
         assert_eq!(capitalize(""), "");
         // display_name never panics and is non-empty regardless of environment.

@@ -1,3 +1,22 @@
+# Tazamun v0.1.5
+
+`tazamun doctor` now names the one environment where a healthy daemon still
+cannot reach its peers: **WSL2 in the default NAT networking mode**. Two WSL
+machines there each sit on their own isolated `172.16/12` subnet, so neither a
+session join nor a one-shot `send`/`receive` can connect — both just time out,
+with nothing explaining why.
+
+- Doctor detects WSL2 NAT mode (WSL kernel plus a `172.16/12` outbound address)
+  and prints the fix inline: enable WSL **mirrored networking** on both
+  machines (`networkingMode=mirrored` in `.wslconfig`, then `wsl --shutdown`),
+  which needs Windows 11 22H2+; on Windows 10, run the native Windows build
+  rather than the one inside WSL. The check is pure and unit-tested.
+
+If your peers won't connect, run `tazamun doctor` — it will now tell you
+whether this is why. No engine changes.
+
+---
+
 # Tazamun v0.1.4
 
 The second half of the Windows self-update fix. v0.1.2 taught the updater

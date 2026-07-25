@@ -2811,6 +2811,12 @@ async fn handle_doctor_cli(dir: &Path, json: bool) -> Result<(), CliError> {
         sections.push(s);
     }
 
+    // (c2) networking environment: WSL2 NAT mode makes peers unreachable even
+    // when everything else is healthy, and the fix is Windows-side.
+    if let Some(s) = crate::doctor::network_env_section() {
+        sections.push(s);
+    }
+
     // (d) filesystem sanity (local probe).
     sections.push(filesystem_section(dir, classify_mount(dir)));
     if let Some(s) = crate::doctor::long_paths_section(dir) {

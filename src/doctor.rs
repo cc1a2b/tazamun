@@ -136,6 +136,80 @@ pub fn classify_mount(path: &Path) -> MountKind {
     }
 }
 
+/// True when this looks like WSL2 in its default **NAT** networking mode: the
+/// kernel is WSL and the address the kernel picks to reach the internet is in
+/// the `172.16.0.0/12` range WSL's virtual switch hands out. In that mode each
+/// WSL machine sits on its own isolated subnet and cannot reach another WSL
+/// machine directly; P2P then leans entirely on a relay, which the double NAT
+/// frequently defeats — the exact "connect timed out" a user hits with `send`,
+/// `receive`, or a session join. Mirrored networking mode puts WSL on the
+/// host's real LAN and resolves it. Pure and unit-tested; the section below
+/// supplies the live inputs.
+pub fn is_wsl_nat(is_wsl: bool, default_ipv4: Option<std::net::Ipv4Addr>) -> bool {
+    is_wsl
+        && default_ipv4.is_some_and(|ip| {
+            let o = ip.octets();
+            o[0] == 172 && (16..=31).contains(&o[1])
+        })
+}
+
+fn running_under_wsl() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/version")
+            .map(|v| v.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// The IPv4 address the kernel would use to reach the internet, learned from a
+/// UDP `connect` (which sends no packets). `None` when there is no route.
+fn default_outbound_ipv4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((std::net::Ipv4Addr::new(1, 1, 1, 1), 80))
+        .ok()?;
+    match sock.local_addr().ok()? {
+        std::net::SocketAddr::V4(a) => Some(*a.ip()),
+        std::net::SocketAddr::V6(_) => None,
+    }
+}
+
+/// Networking-environment section. WSL2 NAT mode is the one setup where a
+/// perfectly healthy daemon still cannot reach its peers, and the fix is
+/// Windows-side (the daemon cannot apply it) — so the least the tool can do is
+/// name it. `None` off WSL, where this never applies.
+pub fn network_env_section() -> Option<Section> {
+    if !running_under_wsl() {
+        return None;
+    }
+    let ip = default_outbound_ipv4();
+    if is_wsl_nat(true, ip) {
+        let ips = ip.map(|i| i.to_string()).unwrap_or_else(|| "?".into());
+        return Some(
+            Section::new("networking (WSL)", Verdict::Warn)
+                .line(format!(
+                    "mode               : NAT — this WSL is isolated at {ips}"
+                ))
+                .line("peer reach         : two WSL machines here cannot reach each other,")
+                .line("                     and relay-only P2P across two WSL NATs often times out")
+                .action(
+                    "enable WSL mirrored networking on BOTH machines: put a line `[wsl2]` and \
+                     below it `networkingMode=mirrored` in C:\\Users\\<you>\\.wslconfig, then \
+                     `wsl --shutdown` and reopen (needs Windows 11 22H2+). On Windows 10, run \
+                     the native Windows tazamun build instead of the one inside WSL.",
+                ),
+        );
+    }
+    Some(
+        Section::from_ok("networking (WSL)")
+            .line("mode               : mirrored or bridged (not isolated NAT) — peer reach OK"),
+    )
+}
+
 /// Windows long-path section: the embedded `longPathAware` manifest status,
 /// the `LongPathsEnabled` registry switch, and a live >260-char probe with
 /// plain (non-`\\?\`) APIs. tazamun itself is immune either way — every fs
@@ -412,10 +486,31 @@ pub fn relay_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn wsl_nat_is_the_isolated_172_range_and_only_on_wsl() {
+        // The condition that strands two WSL peers: WSL + a 172.16/12 address.
+        // Generic representatives — the range and its two boundaries, no real
+        // machine's address.
+        assert!(is_wsl_nat(true, Some(Ipv4Addr::new(172, 20, 0, 10))));
+        assert!(is_wsl_nat(true, Some(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_wsl_nat(true, Some(Ipv4Addr::new(172, 31, 255, 254))));
+        // Not WSL — never flagged, whatever the address.
+        assert!(!is_wsl_nat(false, Some(Ipv4Addr::new(172, 22, 41, 207))));
+        // Mirrored mode / a real LAN — WSL, but the host's own address.
+        assert!(!is_wsl_nat(true, Some(Ipv4Addr::new(192, 168, 1, 40))));
+        assert!(!is_wsl_nat(true, Some(Ipv4Addr::new(10, 0, 0, 5))));
+        // 172.15 and 172.32 are outside the private /12, so not the NAT range.
+        assert!(!is_wsl_nat(true, Some(Ipv4Addr::new(172, 15, 0, 1))));
+        assert!(!is_wsl_nat(true, Some(Ipv4Addr::new(172, 32, 0, 1))));
+        // No route at all — cannot claim NAT mode.
+        assert!(!is_wsl_nat(true, None));
+    }
 
     #[test]
     fn mount_classifier() {
-        assert_eq!(classify_mount(Path::new("/mnt/e/Programming/x")), {
+        assert_eq!(classify_mount(Path::new("/mnt/c/work/x")), {
             #[cfg(target_os = "linux")]
             {
                 MountKind::DrvFs
