@@ -2500,12 +2500,28 @@ impl Actor {
                         let q = quarantined
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "-".to_string());
-                        warn!(
-                            path = %rel,
-                            quarantine = %q,
-                            "VIOLATION: un-leased change reverted; offending bytes quarantined. \
-                             Lease the file first: tazamun lock {rel}"
-                        );
+                        // `preserve_required` is false only for a delete, where
+                        // there are no offending bytes to quarantine — so the
+                        // old "bytes quarantined" wording was wrong there, and a
+                        // rename (delete-then-create) landed here for its delete
+                        // half, which is why renaming looked like it duplicated.
+                        if preserve_required {
+                            warn!(
+                                path = %rel,
+                                quarantine = %q,
+                                "VIOLATION: un-leased edit reverted; your bytes are safe in \
+                                 quarantine. To edit a synced file: tazamun lock {rel}"
+                            );
+                        } else {
+                            warn!(
+                                path = %rel,
+                                "un-leased delete reverted; the file was restored. To delete or \
+                                 rename a synced file, lock it first, then delete/rename, then \
+                                 unlock — e.g. `tazamun lock {rel}`, remove or rename it, \
+                                 `tazamun unlock {rel}`. A bare delete is refused so an accidental \
+                                 removal cannot wipe the file from every peer."
+                            );
+                        }
                         if had_quarantine {
                             self.observe(
                                 "quarantine",

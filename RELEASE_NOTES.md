@@ -1,3 +1,23 @@
+# Tazamun v0.1.7
+
+Clearer messaging when a synced file is deleted or renamed without a lease.
+Renaming a synced file looked like it duplicated it: a rename is a delete of
+the old name plus a create of the new one, and tazamun reverts an un-leased
+delete on purpose (the Golden Invariant — a bare `rm` must not silently wipe a
+file from every peer), so the old name came back while the new one published.
+
+- The revert message now tells the truth for a delete. It no longer claims
+  "offending bytes quarantined" (a delete has none) and instead explains the
+  file was restored and gives the exact way to delete or rename a synced file:
+  lock it, delete/rename, unlock — the unlock publishes the removal to peers.
+
+This is a message-only change; the delete-protection behaviour is unchanged and
+deliberate. To rename `a` to `b` so it propagates cleanly:
+`tazamun lock a`, `mv a b`, `tazamun unlock a` (and `b` auto-publishes). No
+engine changes.
+
+---
+
 # Tazamun v0.1.6
 
 `tazamun send <folder>` no longer aborts when the folder carries tazamun's own
