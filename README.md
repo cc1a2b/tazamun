@@ -17,9 +17,9 @@
 
 <br><br>
 
-<video src="https://github.com/cc1a2b/tazamun/raw/main/assets/demos/tazamun-cli-real-full.mp4" poster="assets/demos/tazamun-cli-real-full-poster.png" width="820" controls muted playsinline></video>
+<a href="assets/demos/tazamun-cli-real-full.mp4"><img src="assets/demos/tazamun-cli-real-full-poster.png" alt="A real tazamun terminal session — click to play" width="820"></a>
 
-<sub>A real, unedited terminal session — two peers on one machine: <code>init</code> · <code>invite</code> (with a scannable QR) · <code>join</code> · <code>status</code> · the strict-checkout refusal · <code>diff</code>/<code>versions</code> · a one-shot <code>send</code>/<code>receive</code> · <code>doctor</code>. If the player doesn't load, <a href="assets/demos/tazamun-cli-real-full.mp4">watch the mp4</a>.</sub>
+<sub>A real, unedited terminal session (click to play) — two peers on one machine: <code>init</code> · <code>invite</code> with a scannable QR · <code>join</code> · <code>status</code> · the strict-checkout refusal · <code>diff</code>/<code>versions</code> · a one-shot <code>send</code>/<code>receive</code> · <code>doctor</code>.</sub>
 
 </div>
 
