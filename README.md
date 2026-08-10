@@ -15,13 +15,11 @@
 
 <img src="assets/screenshots/home.png" alt="The tazamun desktop app: every session on this machine in one window" width="820">
 
-<br><br>
-
-<a href="assets/demos/tazamun-cli-real-full.mp4"><img src="assets/demos/tazamun-cli-real-full-poster.png" alt="A real tazamun terminal session — click to play" width="820"></a>
-
-<sub>A real, unedited terminal session (click to play) — two peers on one machine: <code>init</code> · <code>invite</code> with a scannable QR · <code>join</code> · <code>status</code> · the strict-checkout refusal · <code>diff</code>/<code>versions</code> · a one-shot <code>send</code>/<code>receive</code> · <code>doctor</code>.</sub>
-
 </div>
+
+https://github.com/user-attachments/assets/1a61f45c-ebfa-4a26-9ce3-81d8157b4f5c
+
+<div align="center"><sub>A real, unedited terminal session — two peers on one machine: <code>init</code> · <code>invite</code> with a scannable QR · <code>join</code> · <code>status</code> · the strict-checkout refusal · <code>diff</code>/<code>versions</code> · a one-shot <code>send</code>/<code>receive</code> · <code>doctor</code>.</sub></div>
 
 ---
 
