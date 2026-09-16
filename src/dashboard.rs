@@ -213,12 +213,61 @@ async fn route(server: &Server, req: &Request) -> Vec<u8> {
         ("POST", "/api/conflict/discard") => {
             guarded(server, req, parse_conflict_discard(&req.body)).await
         }
+        // P36 queries. These are reads, but they go behind the token like the
+        // writes do: `/api/state` only exposes the capped prefix of the index,
+        // whereas these answer against the whole of it — the full path list,
+        // the whole audit ledger, and every quarantined copy. That is strictly
+        // more than the open endpoint gives away, so it is not offered on the
+        // strength of the loopback check alone.
+        ("POST", "/api/files") => guarded(server, req, parse_files_query(&req.body)).await,
+        ("POST", "/api/audit") => guarded(server, req, parse_audit_query(&req.body)).await,
+        ("POST", "/api/conflicts/prunable") => {
+            guarded(server, req, parse_prunable(&req.body)).await
+        }
         _ => json_response(
             "404 Not Found",
             &serde_json::json!({"api": 1, "ok": false,
                 "error": {"code": "not_found", "message": "no such endpoint"}}),
         ),
     }
+}
+
+/// `POST /api/files` → [`IpcRequest::Files`]. An absent or empty body is the
+/// default query, so `{}` means "the first page of everything".
+fn parse_files_query(body: &[u8]) -> ParsedReq {
+    Ok(IpcRequest::Files(parse_query_args(body)?))
+}
+
+/// `POST /api/audit` → [`IpcRequest::Audit`].
+fn parse_audit_query(body: &[u8]) -> ParsedReq {
+    Ok(IpcRequest::Audit(parse_query_args(body)?))
+}
+
+/// `POST /api/conflicts/prunable` → [`IpcRequest::ConflictsPrunable`]. Selection
+/// only: this never deletes a copy.
+fn parse_prunable(body: &[u8]) -> ParsedReq {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        older_than_ms: u64,
+    }
+    // Deliberately NOT defaulted: an absent cutoff would read as zero, and a
+    // zero cutoff selects every preserved copy in the folder. A caller that
+    // wants everything has to say so.
+    let a: Args =
+        serde_json::from_slice(body).map_err(|e| format!("older_than_ms is required: {e}"))?;
+    Ok(IpcRequest::ConflictsPrunable {
+        older_than_ms: a.older_than_ms,
+    })
+}
+
+/// Decodes a query body, treating empty as the type's default. Every query
+/// argument is `#[serde(default)]`, so the daemon applies its own caps to
+/// whatever arrives; this only has to reject malformed JSON.
+fn parse_query_args<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Result<T, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|e| format!("invalid query body: {e}"))
 }
 
 enum PathOp {
@@ -605,5 +654,97 @@ mod tests {
         let svg = render_qr_svg("tzm1abcdef").expect("qr renders");
         assert!(svg.contains("<svg"));
         assert!(render_qr_svg("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod query_route_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_files_body_is_the_default_query() {
+        for body in [b"".as_slice(), b"  \n".as_slice(), b"{}".as_slice()] {
+            let r = parse_files_query(body).expect("empty body is the default query");
+            let IpcRequest::Files(q) = r else {
+                panic!("wrong variant")
+            };
+            assert!(q.pattern.is_none());
+            assert_eq!(q.offset, 0);
+        }
+    }
+
+    #[test]
+    fn a_files_query_round_trips_its_arguments() {
+        let r =
+            parse_files_query(br#"{"pattern":"docs/*.md","sort":"size","desc":true,"offset":50}"#)
+                .expect("valid query");
+        let IpcRequest::Files(q) = r else {
+            panic!("wrong variant")
+        };
+        assert_eq!(q.pattern.as_deref(), Some("docs/*.md"));
+        assert_eq!(q.sort.as_deref(), Some("size"));
+        assert!(q.desc);
+        assert_eq!(q.offset, 50);
+    }
+
+    #[test]
+    fn malformed_json_is_refused_rather_than_defaulted() {
+        assert!(parse_files_query(b"{not json").is_err());
+        assert!(parse_audit_query(b"{\"kinds\":5}").is_err());
+        assert!(parse_files_query(b"7").is_err());
+    }
+
+    /// Serde will fill an all-defaulted struct from an empty sequence, so `[]`
+    /// is accepted and means the default query. Harmless, but surprising
+    /// enough to pin: it must yield defaults, never a partly-filled query.
+    #[test]
+    fn an_empty_sequence_is_the_default_query_not_an_error() {
+        let IpcRequest::Audit(q) = parse_audit_query(b"[]").expect("serde accepts an empty seq")
+        else {
+            panic!("wrong variant")
+        };
+        assert!(q.kinds.is_empty());
+        assert_eq!(q.offset, 0);
+        assert!(q.path.is_none());
+    }
+
+    /// A missing cutoff must not read as zero: a zero cutoff selects every
+    /// preserved copy in the folder, which is the opposite of what an absent
+    /// argument should mean.
+    #[test]
+    fn prunable_refuses_an_absent_cutoff() {
+        assert!(parse_prunable(b"").is_err());
+        assert!(parse_prunable(b"{}").is_err());
+        let r = parse_prunable(br#"{"older_than_ms":604800000}"#).expect("explicit cutoff");
+        assert!(matches!(
+            r,
+            IpcRequest::ConflictsPrunable {
+                older_than_ms: 604_800_000
+            }
+        ));
+    }
+
+    /// An explicit zero is allowed — the caller said so — which is exactly the
+    /// distinction the missing-argument refusal exists to preserve.
+    #[test]
+    fn prunable_accepts_an_explicit_zero() {
+        let r = parse_prunable(br#"{"older_than_ms":0}"#).expect("explicit zero");
+        assert!(matches!(
+            r,
+            IpcRequest::ConflictsPrunable { older_than_ms: 0 }
+        ));
+    }
+
+    #[test]
+    fn an_audit_query_round_trips_its_filters() {
+        let r =
+            parse_audit_query(br#"{"kinds":["lock","unlock"],"limit":25,"newest_first":false}"#)
+                .expect("valid query");
+        let IpcRequest::Audit(q) = r else {
+            panic!("wrong variant")
+        };
+        assert_eq!(q.kinds, vec!["lock".to_string(), "unlock".to_string()]);
+        assert_eq!(q.limit, Some(25));
+        assert_eq!(q.newest_first, Some(false));
     }
 }

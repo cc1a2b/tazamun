@@ -1,11 +1,12 @@
 //! Window-level preferences that outlive a run.
 //!
 //! The window forgets everything on exit: text scale returns to 100%, the
+//! palette returns to Night, the register returns to its default pitch, the
 //! Files view returns to name order, the tab bar returns to the first tab.
-//! That is merely annoying for sort order and genuinely hostile for text
-//! scale — the one setting a reader who needs it must re-apply every single
-//! launch. This module owns that small set of values and the one file they
-//! live in: `<config-base>/tazamun/gui.json`, a sibling of the session
+//! That is merely annoying for sort order and genuinely hostile for the
+//! appearance settings — the ones a reader who needs them must re-apply every
+//! single launch. This module owns that small set of values and the one file
+//! they live in: `<config-base>/tazamun/gui.json`, a sibling of the session
 //! registry's `sessions.json` and written the same atomic way.
 //!
 //! Preferences are advisory in the strongest sense. Nothing here is on the
@@ -30,6 +31,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::a11y;
+use super::theme::{Density, Mode};
 
 // ─── bounds ──────────────────────────────────────────────────────────────────
 
@@ -77,6 +79,20 @@ pub struct Prefs {
     /// Text scale, in [`a11y`]'s range. Sanitized through
     /// [`a11y::clamp_scale`] rather than against numbers copied to here.
     pub text_scale: f32,
+    /// Palette, as a [`Mode::key`].
+    ///
+    /// A `String` and not [`Mode`] itself, for the reason spelled out on
+    /// [`Prefs::last_tab`]: a palette this build has never heard of must cost
+    /// the file nothing but the palette. `sanitize` resolves it through
+    /// [`Mode::from_key`], which is the single owner of that mapping.
+    pub mode: String,
+    /// Register pitch, as a [`Density::key`]. A `String` for the same reason
+    /// as [`Prefs::mode`].
+    pub density: String,
+    /// Whether animation is suppressed. Set by the reader, and on the same
+    /// footing as text scale: a setting someone needs is a setting they must
+    /// not have to re-apply each launch.
+    pub reduced_motion: bool,
     /// Files view ordering: `true` is `SortMode::Size`, `false` is
     /// `SortMode::Name`. Stored as a bool because
     /// [`SortMode`](super::grouping::SortMode) is a pure view type with no
@@ -108,6 +124,9 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             text_scale: a11y::SCALE_DEFAULT,
+            mode: String::from(Mode::default().key()),
+            density: String::from(Density::default().key()),
+            reduced_motion: false,
             sort_by_size: false,
             last_tab: DEFAULT_TAB.to_string(),
             last_session: None,
@@ -121,12 +140,19 @@ impl Prefs {
     /// Forces every field into a sane range. Always call this after loading:
     /// the file is user-editable and may be hand-edited, truncated, or
     /// corrupted, and a hostile or absurd value must never reach the window.
-    pub fn sanitize(&mut self) {
+    fn sanitize(&mut self) {
         // `clamp_scale` screens non-finite input *before* it reaches
         // `f32::clamp` — which panics on a NaN bound and returns NaN for a NaN
         // input — and is the single owner of the scale range, so the numbers
         // are never copied to here where they could drift apart.
         self.text_scale = a11y::clamp_scale(self.text_scale);
+
+        // Parsing and re-keying is what coerces an unrecognised palette or
+        // pitch back to the default, without a list of valid keys being copied
+        // to here: the theme's own parser decides, and this stores what it
+        // decided so the next load reads a key rather than the garbage.
+        self.mode = String::from(Mode::from_key(&self.mode).key());
+        self.density = String::from(Density::from_key(&self.density).key());
 
         self.window = self.window.and_then(sane_window);
 
@@ -178,7 +204,7 @@ fn is_session_path(s: &str) -> bool {
 // ─── persistence ─────────────────────────────────────────────────────────────
 
 /// `<config-base>/tazamun/gui.json`.
-pub fn path() -> PathBuf {
+fn path() -> PathBuf {
     crate::registry::config_base()
         .join("tazamun")
         .join("gui.json")
@@ -284,6 +310,8 @@ mod tests {
             Some([10.0, 10.0]),
             Some([1180.0, 760.0]),
         ];
+        let modes: [&str; 5] = ["", "night", "PAPER", "midnight", "contrast"];
+        let densities: [&str; 5] = ["", "compact", "Regular", "airy", "relaxed"];
         let long_tab = "x".repeat(4096);
         let tabs: [&str; 5] = ["", "files", "\u{7}bell", "tab\nname", &long_tab];
         let sessions = [
@@ -300,6 +328,9 @@ mod tests {
             for (j, window) in windows.iter().enumerate() {
                 out.push(Prefs {
                     text_scale: *scale,
+                    mode: modes[(i + j) % modes.len()].to_string(),
+                    density: densities[(i + j) % densities.len()].to_string(),
+                    reduced_motion: (i + j) % 2 == 0,
                     sort_by_size: i % 2 == 0,
                     last_tab: tabs[(i + j) % tabs.len()].to_string(),
                     last_session: sessions[(i + j) % sessions.len()].clone(),
@@ -324,9 +355,15 @@ mod tests {
         let d = Prefs::default();
         assert_eq!(sanitized(&d), d);
         assert!(approx(d.text_scale, SCALE_DEFAULT));
+        // Spelled out rather than taken from `Mode::default()`: these two are a
+        // wire format, and a later change of taste about the opening palette
+        // must not silently change what an existing `gui.json` means.
+        assert_eq!(d.mode, "night");
+        assert_eq!(d.density, "regular");
         assert_eq!(d.last_tab, DEFAULT_TAB);
         assert_eq!(d.last_session, None);
         assert_eq!(d.window, None);
+        assert!(!d.reduced_motion);
         assert!(!d.sort_by_size);
         assert!(!d.maximized);
     }
@@ -343,17 +380,24 @@ mod tests {
     #[test]
     fn sanitize_leaves_the_booleans_alone() {
         // Nothing about a bool can be out of range; the invariant is that
-        // sanitizing never quietly flips a user's choice.
+        // sanitizing never quietly flips a user's choice, even when it is
+        // busy repairing every other field around it.
         for (sort, max) in [(true, true), (true, false), (false, true), (false, false)] {
-            let p = Prefs {
-                sort_by_size: sort,
-                maximized: max,
-                text_scale: f32::NAN,
-                ..Prefs::default()
-            };
-            let c = sanitized(&p);
-            assert_eq!(c.sort_by_size, sort);
-            assert_eq!(c.maximized, max);
+            for motion in [true, false] {
+                let p = Prefs {
+                    sort_by_size: sort,
+                    maximized: max,
+                    reduced_motion: motion,
+                    text_scale: f32::NAN,
+                    mode: "midnight".to_string(),
+                    density: "airy".to_string(),
+                    ..Prefs::default()
+                };
+                let c = sanitized(&p);
+                assert_eq!(c.sort_by_size, sort);
+                assert_eq!(c.maximized, max);
+                assert_eq!(c.reduced_motion, motion);
+            }
         }
     }
 
@@ -387,7 +431,7 @@ mod tests {
 
     #[test]
     fn text_scale_absurdly_large_clamps_to_max() {
-        for bad in [2.0, 1e6, 1e30, f32::MAX] {
+        for bad in [3.0, 1e6, 1e30, f32::MAX] {
             let c = sanitized(&Prefs {
                 text_scale: bad,
                 ..Prefs::default()
@@ -404,6 +448,52 @@ mod tests {
                 ..Prefs::default()
             });
             assert!(approx(c.text_scale, good));
+        }
+    }
+
+    // ─── mode and density ────────────────────────────────────────────────────
+
+    #[test]
+    fn every_mode_and_density_survives_sanitize() {
+        for m in Mode::ALL {
+            let c = sanitized(&Prefs {
+                mode: m.key().to_string(),
+                ..Prefs::default()
+            });
+            assert_eq!(c.mode, m.key());
+            assert_eq!(Mode::from_key(&c.mode), m);
+        }
+        for d in Density::ALL {
+            let c = sanitized(&Prefs {
+                density: d.key().to_string(),
+                ..Prefs::default()
+            });
+            assert_eq!(c.density, d.key());
+            assert_eq!(Density::from_key(&c.density), d);
+        }
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_to_the_default() {
+        // Including a key that differs only in case: `from_key` is exact, and
+        // sanitize must store what it decided rather than what was written.
+        for bad in ["", "midnight", "NIGHT", "night ", "\u{0}paper", "papier"] {
+            let c = sanitized(&Prefs {
+                mode: bad.to_string(),
+                ..Prefs::default()
+            });
+            assert_eq!(c.mode, "night", "{bad:?} survived");
+        }
+    }
+
+    #[test]
+    fn unknown_density_falls_back_to_the_default() {
+        for bad in ["", "airy", "COMPACT", "relaxed!", "\u{1b}[31mcompact"] {
+            let c = sanitized(&Prefs {
+                density: bad.to_string(),
+                ..Prefs::default()
+            });
+            assert_eq!(c.density, "regular", "{bad:?} survived");
         }
     }
 
@@ -630,6 +720,67 @@ mod tests {
     }
 
     #[test]
+    fn a_file_from_the_build_before_appearance_still_loads() {
+        // Byte for byte what the previous version wrote: every key it knew,
+        // pretty-printed the way `save_to` prints, and not one of the three
+        // appearance keys. Every setting in it must arrive intact, and the
+        // three it cannot know must arrive as defaults rather than as empty
+        // strings the theme would then have to reject.
+        let p = parse(
+            r#"{
+  "text_scale": 1.25,
+  "sort_by_size": true,
+  "last_tab": "files",
+  "last_session": "/home/u/proj",
+  "window": [
+    1400.0,
+    900.0
+  ],
+  "maximized": true
+}
+"#,
+        );
+        assert!(approx(p.text_scale, 1.25));
+        assert!(p.sort_by_size);
+        assert_eq!(p.last_tab, "files");
+        assert_eq!(p.last_session.as_deref(), Some("/home/u/proj"));
+        assert_eq!(p.window, Some([1400.0, 900.0]));
+        assert!(p.maximized);
+        assert_eq!(p.mode, "night");
+        assert_eq!(p.density, "regular");
+        assert!(!p.reduced_motion);
+    }
+
+    #[test]
+    fn garbage_appearance_in_the_file_sanitizes_to_the_defaults() {
+        let p = parse(r#"{"mode":"midnight","density":"airy","reduced_motion":true}"#);
+        assert_eq!(p.mode, "night");
+        assert_eq!(p.density, "regular");
+        // A bool has no invalid value, so this one is kept as written.
+        assert!(p.reduced_motion);
+    }
+
+    #[test]
+    fn every_mode_and_density_round_trips_through_json() {
+        for m in Mode::ALL {
+            for d in Density::ALL {
+                let p = Prefs {
+                    mode: m.key().to_string(),
+                    density: d.key().to_string(),
+                    reduced_motion: m == Mode::Contrast,
+                    ..Prefs::default()
+                };
+                let text = serde_json::to_string(&p).expect("serializes");
+                let back = parse(&text);
+                assert_eq!(back, p, "{} / {} did not survive", m.key(), d.key());
+                assert_eq!(Mode::from_key(&back.mode), m);
+                assert_eq!(Density::from_key(&back.density), d);
+                assert_eq!(back.reduced_motion, m == Mode::Contrast);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_extra_field_is_ignored() {
         // A file from a newer build must not cost this one every other setting.
         let p = parse(r#"{"text_scale":1.15,"theme_variant":"midnight","future":{"a":[1,2]}}"#);
@@ -652,6 +803,9 @@ mod tests {
             r#"{"window":[1180.0]}"#,
             r#"{"last_tab":42}"#,
             r#"{"sort_by_size":"yes"}"#,
+            r#"{"mode":42}"#,
+            r#"{"density":["compact"]}"#,
+            r#"{"reduced_motion":"yes"}"#,
         ] {
             assert_eq!(parse(bad), Prefs::default(), "{bad} did not fall back");
         }
@@ -679,6 +833,9 @@ mod tests {
     fn valid_values_round_trip_through_json() {
         let p = Prefs {
             text_scale: 1.25,
+            mode: "paper".to_string(),
+            density: "compact".to_string(),
+            reduced_motion: true,
             sort_by_size: true,
             last_tab: "conflicts".to_string(),
             last_session: Some("/home/u/proj".to_string()),
@@ -704,6 +861,9 @@ mod tests {
         let file = dir.path().join("gui.json");
         let p = Prefs {
             text_scale: 1.35,
+            mode: "contrast".to_string(),
+            density: "relaxed".to_string(),
+            reduced_motion: true,
             sort_by_size: true,
             last_tab: "history".to_string(),
             last_session: Some("/tmp/proj".to_string()),
@@ -713,6 +873,25 @@ mod tests {
         save_to(&file, &p).expect("writes");
         let text = std::fs::read_to_string(&file).expect("reads");
         assert_eq!(parse(&text), p);
+    }
+
+    #[test]
+    fn every_appearance_setting_survives_a_write_and_a_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("gui.json");
+        for m in Mode::ALL {
+            for d in Density::ALL {
+                let p = Prefs {
+                    mode: m.key().to_string(),
+                    density: d.key().to_string(),
+                    reduced_motion: d == Density::Compact,
+                    ..Prefs::default()
+                };
+                save_to(&file, &p).expect("writes");
+                let text = std::fs::read_to_string(&file).expect("reads");
+                assert_eq!(parse(&text), p, "{} / {} did not survive", m.key(), d.key());
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use eframe::egui;
 use egui::text::LayoutJob;
-use egui::{Align, Color32, FontFamily, FontId, RichText, Sense};
+use egui::{Align, Color32, RichText, Sense};
 use egui::{pos2, vec2};
 
 use super::{controls, ornament, theme};
@@ -19,24 +19,24 @@ use super::{controls, ornament, theme};
 pub fn colophon(ui: &mut egui::Ui, version: &str) {
     ui.vertical_centered(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-        ornament::khatam(ui.painter(), rect.center(), 15.0, theme::GOLD, false);
-        ui.add_space(2.0);
-        super::chrome::wordmark(ui, 26.0);
+        ornament::khatam(ui.painter(), rect.center(), 15.0, theme::gold(), false);
+        ui.add_space(theme::space::XS);
+        super::chrome::wordmark(ui, theme::sized(theme::step::DISPLAY));
     });
-    ui.add_space(6.0);
+    ui.add_space(theme::space::S);
     centered_text(
         ui,
         "strict-checkout folder sync between machines you trust — no server ever reads your files",
-        11.5,
-        theme::DIM,
+        theme::step::META,
+        theme::ink_muted(),
     );
 
-    ui.add_space(8.0);
-    ornament::rule_with_diamond(ui, theme::GOLD.linear_multiply(0.6));
-    ui.add_space(8.0);
+    ui.add_space(theme::space::M);
+    ornament::rule_with_diamond(ui, theme::alpha(theme::gold(), 153));
+    ui.add_space(theme::space::M);
 
     section_label(ui, "Build");
-    ui.add_space(2.0);
+    ui.add_space(theme::space::XS);
     controls::leader_row(ui, "version", version);
     controls::leader_row(
         ui,
@@ -51,60 +51,61 @@ pub fn colophon(ui: &mut egui::Ui, version: &str) {
     controls::leader_row(ui, "hashing", "BLAKE3 content addressing");
     controls::leader_row(ui, "chunking", "FastCDC content-defined chunks");
 
-    ui.add_space(8.0);
+    ui.add_space(theme::space::M);
     section_label(ui, "Type");
-    ui.add_space(2.0);
-    controls::leader_row(ui, "Inter", "SIL Open Font License 1.1");
-    controls::leader_row(ui, "Noto Sans Arabic", "SIL Open Font License 1.1");
-    controls::leader_row(ui, "Hack", "MIT-style license, with Bitstream Vera terms");
-    ui.add_space(4.0);
+    ui.add_space(theme::space::XS);
+    controls::leader_row(ui, "IBM Plex Sans", "SIL Open Font License 1.1");
+    controls::leader_row(ui, "IBM Plex Sans Arabic", "SIL Open Font License 1.1");
+    controls::leader_row(ui, "IBM Plex Serif", "SIL Open Font License 1.1");
+    controls::leader_row(ui, "IBM Plex Mono", "SIL Open Font License 1.1");
+    ui.add_space(theme::space::S);
     centered_text(
         ui,
         "license texts ship inside the repository under assets/fonts",
-        10.5,
-        theme::FAINT,
+        theme::step::META,
+        theme::ink_faint(),
     );
 
-    ui.add_space(8.0);
-    ornament::rule_with_diamond(ui, theme::GOLD.linear_multiply(0.6));
-    ui.add_space(8.0);
+    ui.add_space(theme::space::M);
+    ornament::rule_with_diamond(ui, theme::alpha(theme::gold(), 153));
+    ui.add_space(theme::space::M);
 
     // Closing seal: a small filled khatam over the Golden Invariant promise.
     ui.vertical_centered(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-        ornament::khatam(ui.painter(), rect.center(), 6.0, theme::GOLD, true);
+        ornament::khatam(ui.painter(), rect.center(), 6.0, theme::gold(), true);
     });
-    ui.add_space(6.0);
+    ui.add_space(theme::space::S);
     centered_text(
         ui,
         "Nothing here is ever overwritten unseen, and nothing is deleted unless you choose it. Every ambiguous moment keeps both copies and says so.",
-        11.5,
-        theme::DIM,
+        theme::step::META,
+        theme::ink_muted(),
     );
-    ui.add_space(2.0);
+    ui.add_space(theme::space::XS);
 }
 
-/// A left-aligned section label in the book-section weight (semibold INK).
+/// A left-aligned section label in the engraved voice this page is set in.
 fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
-            .size(12.5)
-            .family(theme::fam_semibold())
-            .color(theme::INK),
+            .size(theme::sized(theme::step::LABEL))
+            .family(theme::fam_serif())
+            .color(theme::ink()),
     );
 }
 
 /// Center-aligned, width-wrapped body text: each wrapped row is centered
 /// (halign) so a broken line stays symmetric on the page rather than ragged
 /// against a centered block. Fills the width and allocates the galley's height.
-fn centered_text(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) {
+fn centered_text(ui: &mut egui::Ui, text: &str, step: f32, color: Color32) {
     let width = ui.available_width().max(0.0);
     if width < 1.0 {
         return;
     }
     let mut job = LayoutJob::simple(
         text.to_owned(),
-        FontId::new(size, FontFamily::Proportional),
+        theme::font(step, theme::fam_serif_text()),
         color,
         width,
     );

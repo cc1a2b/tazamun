@@ -119,6 +119,83 @@ pub enum IpcRequest {
     /// — the programmatic equivalent of Ctrl-C, used by `tazamun gui`'s Stop
     /// button. The reply is sent before the shutdown begins.
     Shutdown,
+    /// P22: ask a *question* of the whole file index instead of reading the
+    /// fixed prefix embedded in `status`/`dashboardstate`. Matching, sorting
+    /// and paging all happen in the daemon, so a path that sorts past
+    /// [`FILES_LIST_MAX`](crate::consts::FILES_LIST_MAX) is still reachable
+    /// from a UI. Additive: the snapshot's `files` map is unchanged.
+    Files(FilesQuery),
+    /// P22: the audit ledger with the same filters `tazamun log` offers
+    /// (`--path --peer --since --kind`) applied server-side, plus paging and
+    /// an honest match total. Read-only.
+    Audit(AuditQuery),
+    /// P22: which quarantined copies a `conflicts prune --older-than` *would*
+    /// delete, and what that would cost — selection only. This request never
+    /// deletes a byte; it exists so a UI can show the user exactly what is
+    /// about to go before asking them to confirm.
+    ConflictsPrunable {
+        older_than_ms: u64,
+    },
+}
+
+/// Arguments for [`IpcRequest::Files`]. Every field is optional, so
+/// `{"op":"files","args":{}}` asks for the first page of everything, by path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilesQuery {
+    /// Case-insensitive filter over the whole relative path. Without `*`/`?`
+    /// it is a substring match; with either it is a whole-path glob. Empty or
+    /// absent matches every file. Validated server-side: it may not name an
+    /// absolute path, a drive, a `..` segment or the `.tazamun` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// `path` (or `name`) — the default — or `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    /// Reverse the chosen order (Z→A, largest first).
+    #[serde(default)]
+    pub desc: bool,
+    /// Index of the first matching row to return.
+    #[serde(default)]
+    pub offset: usize,
+    /// Rows wanted, clamped to
+    /// [`FILE_QUERY_LIMIT_MAX`](crate::consts::FILE_QUERY_LIMIT_MAX); absent
+    /// means [`FILE_QUERY_LIMIT_DEFAULT`](crate::consts::FILE_QUERY_LIMIT_DEFAULT).
+    /// Zero is legal and means "just count the matches".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Include tombstoned paths (deleted files still carried in the index).
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+/// Arguments for [`IpcRequest::Audit`] — the `tazamun log` filters, plus paging.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuditQuery {
+    /// Exact relative path, as `tazamun log --path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Peer id prefix, as `tazamun log --peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Lower bound on `ts_ms`, as `tazamun log --since` resolved to an instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Event kinds to keep (empty = all), as `tazamun log --kind`. Bounded by
+    /// [`AUDIT_QUERY_KINDS_MAX`](crate::consts::AUDIT_QUERY_KINDS_MAX).
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Index of the first matching event to return.
+    #[serde(default)]
+    pub offset: usize,
+    /// Rows wanted, clamped to
+    /// [`AUDIT_QUERY_LIMIT_MAX`](crate::consts::AUDIT_QUERY_LIMIT_MAX); absent
+    /// means [`AUDIT_QUERY_LIMIT_DEFAULT`](crate::consts::AUDIT_QUERY_LIMIT_DEFAULT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Newest event first — what a ledger view wants — defaulting to true.
+    /// `false` gives write order, the order `tazamun log` prints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_first: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +548,50 @@ mod tests {
         let back: IpcRequest =
             serde_json::from_str(r#"{"op":"restore","args":{"path":"x","n":2}}"#).unwrap();
         assert!(matches!(back, IpcRequest::Restore { n: 2, .. }));
+    }
+
+    #[test]
+    fn query_wire_format_is_flat_under_args() {
+        // Every field defaults, so "first page of everything, by path" is an
+        // empty `args` object — the adjacent tagging still requires the key.
+        let back: IpcRequest = serde_json::from_str(r#"{"op":"files","args":{}}"#).unwrap();
+        let IpcRequest::Files(q) = back else {
+            panic!("files op must decode to a FilesQuery")
+        };
+        assert!(q.pattern.is_none() && q.limit.is_none() && q.offset == 0);
+        assert!(!q.desc && !q.include_deleted);
+
+        let s = serde_json::to_string(&IpcRequest::Files(FilesQuery {
+            pattern: Some("docs/*.md".into()),
+            sort: Some("size".into()),
+            desc: true,
+            offset: 50,
+            limit: Some(25),
+            include_deleted: false,
+        }))
+        .unwrap();
+        assert_eq!(
+            s,
+            r#"{"op":"files","args":{"pattern":"docs/*.md","sort":"size","desc":true,"offset":50,"limit":25,"include_deleted":false}}"#
+        );
+
+        let back: IpcRequest =
+            serde_json::from_str(r#"{"op":"audit","args":{"kinds":["lock"],"limit":10}}"#).unwrap();
+        let IpcRequest::Audit(q) = back else {
+            panic!("audit op must decode to an AuditQuery")
+        };
+        assert_eq!(q.kinds, vec!["lock".to_string()]);
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.newest_first, None, "absent means the daemon's default");
+
+        let s = serde_json::to_string(&IpcRequest::ConflictsPrunable {
+            older_than_ms: 604_800_000,
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            r#"{"op":"conflictsprunable","args":{"older_than_ms":604800000}}"#
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tazamun"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -46,7 +46,11 @@ console = "0.16.4"
 data-encoding = "2.11.0"
 # Native GUI (`tazamun gui`). glow (OpenGL) rather than the new wgpu default: the
 # widest compatibility across Windows/macOS/Linux (and WSLg), no Vulkan needed.
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+# `accesskit` is in eframe's DEFAULT feature set, so `default-features = false`
+# silently switched it off — and with it every `widget_info` call in the GUI,
+# because `Context::enable_accesskit` is only reached from the accesskit-gated
+# winit path. Naming it here is what makes the window speak to a screen reader.
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "glow", "default_fonts", "wayland", "x11"] }
 fastcdc = "4.0.1"
 hkdf = "0.13.0"
 hmac = "0.13.0"

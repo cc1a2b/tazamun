@@ -1,5 +1,5 @@
 //! Focus visibility and keyboard navigation for the native GUI: the layer
-//! that puts the corner-ticked gold ring (`fields::focus_ring`) on every
+//! that puts the corner-ticked focus ring (`fields::focus_ring`) on every
 //! focusable widget, Enter/Space activation for painter-drawn rows,
 //! Arrow/Home/End navigation for the sidebar and Files lists, and a
 //! skip-to-content link that exists only while it holds keyboard focus.
@@ -8,21 +8,22 @@
 
 use eframe::egui;
 use egui::vec2;
-use egui::{CornerRadius, FontId, Key, Modifiers, Sense};
+use egui::{CornerRadius, Key, Modifiers, Sense};
 
 use super::{fields, theme};
 
-const RING_FADE_S: f32 = 0.12;
 const SKIP_W: f32 = 128.0;
 const SKIP_H: f32 = 22.0;
 
-/// Draws the crafted focus ring around `resp` when it holds keyboard focus,
-/// fading in over ~0.12s. Call immediately after creating any focusable
-/// widget; a no-op when the widget is not focused.
+/// Draws the crafted focus ring around `resp` when it holds keyboard focus.
+/// Call immediately after creating any focusable widget; a no-op when the
+/// widget is not focused.
 pub fn ring(ui: &egui::Ui, resp: &egui::Response) {
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("focus"), resp.has_focus(), RING_FADE_S);
+    let t = ui.ctx().animate_bool_with_time(
+        resp.id.with("focus"),
+        resp.has_focus(),
+        theme::dur(theme::motion::STATE),
+    );
     if t <= 0.0 {
         return;
     }
@@ -71,20 +72,24 @@ pub fn list_nav(ui: &egui::Ui, len: usize, sel: &mut usize) -> bool {
 }
 
 /// A "skip to content" affordance: invisible until it takes keyboard focus,
-/// at which point it appears as a small gold-ringed chip at the given
-/// position. Returns true when activated.
+/// at which point it appears as a small ringed chip at the given position.
+/// Returns true when activated.
 pub fn skip_link(ui: &mut egui::Ui, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(SKIP_W, SKIP_H), Sense::click());
     // Unfocused it paints nothing; the reserved space keeps layout still.
     if resp.has_focus() {
         let p = ui.painter();
-        p.rect_filled(rect, CornerRadius::same(theme::R_BUTTON), theme::BG3);
+        p.rect_filled(
+            rect,
+            CornerRadius::same(theme::R_CONTROL),
+            theme::bg_raise(),
+        );
         let galley = p.layout_no_wrap(
             label.to_owned(),
-            FontId::new(11.5, theme::fam_medium()),
-            theme::INK,
+            theme::font(theme::step::META, theme::fam_medium()),
+            theme::ink(),
         );
-        p.galley(rect.center() - galley.size() * 0.5, galley, theme::INK);
+        p.galley(rect.center() - galley.size() * 0.5, galley, theme::ink());
         ring(ui, &resp);
     }
     resp.clicked() || key_activated(ui, &resp)

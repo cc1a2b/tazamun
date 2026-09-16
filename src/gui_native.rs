@@ -29,9 +29,11 @@ mod folderpick;
 mod grouping;
 mod health;
 mod marginalia;
+mod model;
 mod onboarding;
 mod ornament;
 mod prefs;
+mod register;
 mod rhythm;
 mod selection;
 mod shortcuts;
@@ -40,6 +42,7 @@ mod sysopen;
 mod telemetry;
 mod theme;
 mod toasts;
+mod worker;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,11 +55,8 @@ use tokio::sync::mpsc;
 
 use crate::cli::CliError;
 use crate::daemon::DaemonHandle;
-use crate::ipc::{self, IpcRequest};
-use crate::registry::{Registry, SessionKind};
-use crate::state::AppState;
-
-use theme::{BAD, DIM, GOLD as ACCENT, GOOD, INK, WARN};
+use model::*;
+use worker::worker;
 
 const REFRESH: Duration = Duration::from_millis(1500);
 
@@ -68,241 +68,165 @@ const SKY_REVEAL: f64 = 0.5;
 /// Upper bound on any single graceful-shutdown await, so a wedged actor cannot
 /// freeze the worker (on stop) or hang process exit (on teardown).
 const GUI_SHUTDOWN: Duration = Duration::from_secs(10);
+/// Most version entries the History register assembles. Past this the view says
+/// so, rather than silently rendering a prefix as if it were the whole ledger.
+const HISTORY_MAX: usize = 200;
+/// The same promise for the Audit ledger.
+const AUDIT_MAX: usize = 200;
+/// How long a typed pattern must settle before it is sent. The query runs on
+/// the daemon's single actor, so a round trip per keystroke would put the whole
+/// session behind the user's typing.
+const SEARCH_DEBOUNCE: f64 = 0.12;
+/// How long a command may run before the window remarks on it. Below this a
+/// note would be noise; above it, silence reads as a hang.
+const SLOW_AFTER: f64 = 4.0;
 
-// ─── typed data model (worker → UI snapshot) ─────────────────────────────────
-
-#[derive(Clone, Default)]
-struct Overview {
-    version: String,
-    supervisor: bool,
-    sessions: Vec<SessionRow>,
+/// One line of the Files register. Groups, files and the versions of an opened
+/// file share one row stream so every line is the same height and the whole
+/// register stays virtualised.
+enum FileLine<'a> {
+    Group(&'a grouping::Group),
+    /// The file, and its folio — its ordinal among the files on screen, which
+    /// is not its row index because groups and versions share the row stream.
+    File(&'a FileRow, usize),
+    Version(&'a str, &'a VersionRow),
 }
 
-#[derive(Clone)]
-struct SessionRow {
-    path: String,
-    name: String,
-    running: bool,
-    paused: bool,
-    hosted_by_gui: bool,
-    readable: bool,
-    role: String,
-    strict: bool,
-    files: usize,
-    total_bytes: u64,
-    conflicts: usize,
-    peers_online: usize,
-    peers_total: usize,
-    id_short: String,
+/// Per-peer figures sampled once, before the register draws, so the row
+/// closure needs no borrow of the telemetry store.
+struct PeerRow {
+    rtt: Option<u64>,
+    series: Vec<f32>,
+    lit: u8,
 }
 
-#[derive(Clone, Default)]
-struct Detail {
-    dir: String,
-    running: bool,
-    role: String,
-    strict: bool,
-    invite: Option<String>,
-    members: Vec<Member>,
-    files: Vec<FileRow>,
-    files_total: usize,
-    files_truncated: bool,
-    conflicts: Vec<ConflictRow>,
-    leases: Vec<LeaseRow>,
-    audit: Vec<AuditRow>,
-    config: Option<ConfigView>,
-    versions: BTreeMap<String, Vec<VersionRow>>,
-    pulls: Vec<PullRow>,
-    backlog: usize,
-    resuming: usize,
-    download_limit_bps: u64,
-    events: Vec<EventRow>,
-    error: Option<String>,
+/// What the file row's context menu asked for.
+enum FileMenu {
+    Rename,
+    Diff,
+    CopyPath,
 }
 
-/// The daemon's config summary (from the DashboardState payload).
-#[derive(Clone, Default)]
-struct ConfigView {
-    autolock: bool,
-    strict: bool,
-    role: String,
-    update_channel: String,
-    lease_ttl_ms: u64,
-    acquire_timeout_ms: u64,
-    wait_timeout_ms: u64,
-    dashboard_port: u16,
-    relay: Option<String>,
-    lan: bool,
-    max_down: u64,
+/// Whether a ledger entry survives the Audit tab's filters. Pure so the
+/// matching rule is testable without a window: a filter that quietly drops
+/// entries is indistinguishable on screen from a ledger that never had them.
+fn audit_matches(a: &AuditRow, kind: Option<&str>, needle: &str) -> bool {
+    if kind.is_some_and(|k| a.kind != k) {
+        return false;
+    }
+    if needle.is_empty() {
+        return true;
+    }
+    let hit = |f: &Option<String>| {
+        f.as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(needle))
+    };
+    hit(&a.path) || hit(&a.peer) || hit(&a.detail)
 }
 
-#[derive(Clone)]
-struct VersionRow {
-    n: u64,
-    ts_ms: u64,
-    size: u64,
-    tag: Option<String>,
-    pinned: bool,
+/// The preserved copies older than `older_than_ms`, and what deleting them
+/// would reclaim. Pure, because the user confirms against these exact numbers
+/// and an off-by-one here deletes bytes nobody agreed to.
+fn prunable(rows: &[ConflictRow], now_ms: u64, older_than_ms: u64) -> (Vec<String>, u64) {
+    let doomed = rows
+        .iter()
+        .filter(|c| now_ms.saturating_sub(c.ts_ms) >= older_than_ms);
+    let mut names = Vec::new();
+    let mut bytes = 0u64;
+    for c in doomed {
+        names.push(c.name.clone());
+        bytes = bytes.saturating_add(c.size);
+    }
+    (names, bytes)
 }
 
-#[derive(Clone)]
-struct PullRow {
-    path: String,
-    percent: u64,
-    bytes_done: u64,
-    bytes_total: u64,
-    rate: u64,
+/// The frame's clock, read through an entry's own context.
+fn ui_time(e: &register::Entry<'_>) -> f64 {
+    e.response().ctx.input(|i| i.time)
 }
 
-#[derive(Clone)]
-struct EventRow {
-    text: String,
+/// One line of the History register.
+enum HistoryLine<'a> {
+    Day(String),
+    Version(&'a String, &'a VersionRow),
 }
 
-#[derive(Clone)]
-struct Member {
-    id_short: String,
-    name: Option<String>,
-    online: bool,
-    grade: String,
-    conn: String,
-    rtt_ms: Option<u64>,
-    via_lan: bool,
-    jitter_ms: f64,
-    rate_tx: u64,
-    rate_rx: u64,
-    bytes_tx: u64,
-    bytes_rx: u64,
-    relay_url: Option<String>,
-    ttd_ms: Option<u64>,
-    flaps: u64,
+/// Who holds a file, in the palette's custody vocabulary. A stopped session
+/// cannot grant anything, so its files read as refused rather than free.
+fn file_custody(f: &FileRow, running: bool) -> theme::Custody {
+    if !running {
+        return theme::Custody::Blocked;
+    }
+    match (&f.locked_by, f.mine_lock) {
+        (Some(_), true) => theme::Custody::Mine,
+        (Some(_), false) => theme::Custody::Peer,
+        (None, _) => theme::Custody::Free,
+    }
 }
 
-#[derive(Clone)]
-struct FileRow {
-    path: String,
-    size: u64,
-    locked_by: Option<String>,
-    mine_lock: bool,
+/// A setting's name over its one-line explanation. Every appearance and config
+/// row uses this so the left column reads as one column.
+fn setting_label(ui: &mut egui::Ui, name: &str, hint: &str) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(name)
+                .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                .color(theme::ink()),
+        );
+        ui.label(
+            egui::RichText::new(hint)
+                .font(theme::font(
+                    theme::step::META,
+                    egui::FontFamily::Proportional,
+                ))
+                .color(theme::ink_faint()),
+        );
+    });
 }
 
-#[derive(Clone)]
-struct ConflictRow {
-    name: String,
-    path: String,
-    reason: String,
-    ts_ms: u64,
-    size: u64,
+/// One option of a small exclusive choice. The selected option is stated in
+/// ink on a gold wash rather than by a stock `selectable_label`, which was the
+/// last piece of unstyled egui left in the window.
+fn choice(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let text = egui::RichText::new(label)
+        .font(theme::font(theme::step::META, theme::fam_medium()))
+        .color(if selected {
+            theme::ink()
+        } else {
+            theme::ink_muted()
+        });
+    let fill = if selected {
+        theme::wash::of(theme::gold(), theme::wash::SELECT)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let stroke = egui::Stroke::new(
+        theme::RULE_W,
+        if selected {
+            theme::gold()
+        } else {
+            theme::rule_divider()
+        },
+    );
+    let r = ui.add(
+        egui::Button::new(text)
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(theme::R_CONTROL),
+    );
+    a11y::label_selectable(&r, label, selected);
+    if r.has_focus() {
+        register::focus_ring(ui.painter(), r.rect);
+    }
+    r.clicked()
 }
 
-#[derive(Clone)]
-struct LeaseRow {
-    path: String,
-    holder: String,
-    mine: bool,
-    expires_in_ms: u64,
-}
-
-#[derive(Clone)]
-struct AuditRow {
-    ts_ms: u64,
-    kind: String,
-    path: Option<String>,
-    peer: Option<String>,
-    detail: Option<String>,
-}
-
-/// The worker → UI snapshot, plus any toasts the UI has not drained yet.
-#[derive(Default)]
-struct Shared {
-    overview: Option<Overview>,
-    detail: Option<Detail>,
-    /// A queue, not a slot: a bulk action produces several messages between
-    /// two UI frames, and a slot would keep only the last of them.
-    toasts: Vec<Toast>,
-    picked: Option<(PickTarget, String)>,
-    /// Bumped once per completed refresh so the UI can sample telemetry
-    /// per poll, not per frame.
-    tick: u64,
-    busy: bool,
-}
-
-#[derive(Clone)]
-struct Toast {
-    text: String,
-    error: bool,
-}
-
-/// Which text field a native folder-picker result lands in.
-#[derive(Clone, Copy)]
-enum PickTarget {
-    Init,
-    Join,
-}
-
-// ─── commands (UI → worker) ──────────────────────────────────────────────────
-
-enum Cmd {
-    Refresh,
-    Select(Option<PathBuf>),
-    Lock {
-        dir: PathBuf,
-        path: String,
-    },
-    Unlock {
-        dir: PathBuf,
-        path: String,
-    },
-    ConfigSet {
-        dir: PathBuf,
-        key: String,
-        value: String,
-    },
-    /// keep-mine: the guided lock → apply → unlock → discard sequence (the
-    /// daemon's ConflictApply needs a self-held lease, so a bare apply won't do).
-    ResolveMine {
-        dir: PathBuf,
-        id: String,
-        target: String,
-    },
-    /// Restore version `n`: guided lock → restore → unlock (the daemon's
-    /// Restore needs a self-held lease; the replaced content is pushed to
-    /// history first, so nothing is lost).
-    Restore {
-        dir: PathBuf,
-        path: String,
-        n: usize,
-    },
-    Tag {
-        dir: PathBuf,
-        path: String,
-        n: usize,
-        name: Option<String>,
-    },
-    Pin {
-        dir: PathBuf,
-        path: String,
-        n: usize,
-        pinned: bool,
-    },
-    ConflictDiscard {
-        dir: PathBuf,
-        id: String,
-    },
-    PeerName {
-        dir: PathBuf,
-        id: String,
-        name: Option<String>,
-    },
-    Start(PathBuf),
-    Stop(PathBuf),
-    Pause(PathBuf),
-    Resume(PathBuf),
-    Init(PathBuf),
-    Join(PathBuf, String),
-    /// Open the OS folder picker; the chosen path lands in `Shared.picked`.
-    PickFolder(PickTarget),
-    Quit,
+/// Whether this session's role may take a lease at all. The daemon refuses
+/// every lock, unlock, restore and conflict-apply on a viewer or archive
+/// folder, so the interface must disable those verbs rather than offer them and
+/// let the refusal arrive as an error.
+fn role_can_edit(role: &str) -> bool {
+    !matches!(role, "viewer" | "archive")
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
@@ -399,1036 +323,6 @@ pub fn run() -> Result<(), CliError> {
     })
 }
 
-// ─── async worker ────────────────────────────────────────────────────────────
-
-async fn worker(
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-    shared: Arc<Mutex<Shared>>,
-    started: Arc<tokio::sync::Mutex<BTreeMap<String, DaemonHandle>>>,
-    ctx: egui::Context,
-) {
-    let mut selected: Option<PathBuf> = None;
-    let picking = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Prime the overview immediately so the window isn't blank on first paint.
-    refresh(&shared, &started, &selected).await;
-    ctx.request_repaint();
-
-    loop {
-        let cmd = tokio::select! {
-            c = rx.recv() => match c { Some(c) => c, None => break },
-            _ = tokio::time::sleep(REFRESH) => Cmd::Refresh,
-        };
-
-        set_busy(&shared, true);
-        ctx.request_repaint();
-
-        match cmd {
-            Cmd::Quit => break,
-            Cmd::Refresh => {}
-            Cmd::Select(d) => selected = d,
-            Cmd::Lock { dir, path } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::Lock { path },
-                    "locked",
-                    "lock refused",
-                )
-                .await
-            }
-            Cmd::Unlock { dir, path } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::Unlock { path },
-                    "unlocked (published)",
-                    "unlock failed",
-                )
-                .await
-            }
-            Cmd::ConfigSet { dir, key, value } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::ConfigSet { key, value },
-                    "setting saved",
-                    "could not set",
-                )
-                .await
-            }
-            Cmd::ResolveMine { dir, id, target } => {
-                resolve_keep_mine(&shared, &dir, &id, &target).await
-            }
-            Cmd::Restore { dir, path, n } => restore_guided(&shared, &dir, &path, n).await,
-            Cmd::Tag { dir, path, n, name } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::Tag { path, n, name },
-                    "tag saved",
-                    "tag failed",
-                )
-                .await
-            }
-            Cmd::Pin {
-                dir,
-                path,
-                n,
-                pinned,
-            } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::Pin { path, n, pinned },
-                    if pinned { "pinned" } else { "unpinned" },
-                    "pin failed",
-                )
-                .await
-            }
-            Cmd::ConflictDiscard { dir, id } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::ConflictDiscard { id },
-                    "discarded",
-                    "discard failed",
-                )
-                .await
-            }
-            Cmd::PeerName { dir, id, name } => {
-                ipc_action(
-                    &shared,
-                    &dir,
-                    IpcRequest::PeerName { id, name },
-                    "peer name saved",
-                    "could not name peer",
-                )
-                .await
-            }
-            Cmd::Start(dir) => start_session(&shared, &started, &dir).await,
-            Cmd::Stop(dir) => stop_session(&shared, &started, &dir).await,
-            Cmd::Pause(dir) => set_paused(&shared, &dir, true).await,
-            Cmd::Resume(dir) => set_paused(&shared, &dir, false).await,
-            Cmd::Init(dir) => match crate::cli::init(&dir) {
-                Ok(()) => {
-                    selected = Some(absolute(&dir));
-                    toast(&shared, format!("created {}", dir.display()), false);
-                }
-                Err(e) => toast(&shared, format!("init failed: {e}"), true),
-            },
-            Cmd::PickFolder(target) => {
-                // The portal/native dialog is blocking — run it on a DETACHED
-                // std thread, not the runtime's blocking pool: dropping a tokio
-                // runtime waits indefinitely for spawn_blocking tasks, so a
-                // dialog left open would hang process exit. A plain thread dies
-                // with the process. One dialog at a time (double-click guard).
-                if picking
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_ok()
-                {
-                    let shared2 = shared.clone();
-                    let ctx2 = ctx.clone();
-                    let picking2 = picking.clone();
-                    std::thread::spawn(move || {
-                        match folderpick::pick("Choose a folder to sync") {
-                            Ok(p) => {
-                                if let Ok(mut s) = shared2.lock() {
-                                    s.picked = Some((target, p.to_string_lossy().into_owned()));
-                                }
-                            }
-                            // Closing the dialog is not an error.
-                            Err(folderpick::PickError::Cancelled) => {}
-                            // Anything else must be said out loud: a dialog that
-                            // cannot open looks exactly like a broken button.
-                            Err(folderpick::PickError::NoBackend(why)) => {
-                                toast(&shared2, why, true);
-                            }
-                        }
-                        picking2.store(false, std::sync::atomic::Ordering::SeqCst);
-                        ctx2.request_repaint();
-                    });
-                }
-            }
-            Cmd::Join(dir, ticket) => match crate::cli::join(&dir, ticket.trim()) {
-                Ok(()) => {
-                    selected = Some(absolute(&dir));
-                    toast(&shared, format!("joined into {}", dir.display()), false);
-                }
-                Err(e) => toast(&shared, format!("join failed: {e}"), true),
-            },
-        }
-
-        refresh(&shared, &started, &selected).await;
-        set_busy(&shared, false);
-        ctx.request_repaint();
-    }
-}
-
-fn set_busy(shared: &Arc<Mutex<Shared>>, busy: bool) {
-    if let Ok(mut s) = shared.lock() {
-        s.busy = busy;
-    }
-}
-
-/// Bound on the worker-side backlog. Reached only if the UI stops draining
-/// (a frozen or minimised window); dropping the oldest keeps the newest, which
-/// is what a user coming back to the window wants to see.
-const TOAST_BACKLOG: usize = 32;
-
-fn toast(shared: &Arc<Mutex<Shared>>, text: String, error: bool) {
-    if let Ok(mut s) = shared.lock() {
-        s.toasts.push(Toast { text, error });
-        let excess = s.toasts.len().saturating_sub(TOAST_BACKLOG);
-        s.toasts.drain(..excess);
-    }
-}
-
-/// Forward an IPC request to a folder's daemon and toast the outcome.
-async fn ipc_action(
-    shared: &Arc<Mutex<Shared>>,
-    dir: &Path,
-    req: IpcRequest,
-    ok_msg: &str,
-    err_prefix: &str,
-) {
-    match ipc::request(dir, &req).await {
-        Ok(r) if r.ok => toast(shared, ok_msg.to_string(), false),
-        Ok(r) => {
-            let msg = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| err_prefix.to_string());
-            toast(shared, format!("{err_prefix}: {msg}"), true);
-        }
-        Err(e) => toast(shared, format!("{err_prefix}: {e}"), true),
-    }
-}
-
-/// keep-mine: the guided lock → apply → unlock → discard sequence. The
-/// quarantined copy is discarded ONLY after the apply AND its publish succeed, so
-/// a failure at any step leaves the preserved copy untouched (Golden Invariant).
-/// The daemon's `ConflictApply` refuses without a self-held lease, hence the
-/// explicit lock/unlock around it — exactly the CLI's `resolve --keep mine` path.
-async fn resolve_keep_mine(shared: &Arc<Mutex<Shared>>, dir: &Path, id: &str, target: &str) {
-    // 1/4 lock
-    match ipc::request(
-        dir,
-        &IpcRequest::Lock {
-            path: target.to_string(),
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => {}
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "lock refused".into());
-            toast(
-                shared,
-                format!("keep-mine: lock refused ({m}). The copy is untouched."),
-                true,
-            );
-            return;
-        }
-        Err(e) => {
-            toast(
-                shared,
-                format!("keep-mine: lock failed ({e}). The copy is untouched."),
-                true,
-            );
-            return;
-        }
-    }
-    // 2/4 apply the preserved bytes
-    match ipc::request(
-        dir,
-        &IpcRequest::ConflictApply {
-            id: id.to_string(),
-            target: target.to_string(),
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => {}
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "apply failed".into());
-            let held = !unlock_ok(dir, target).await;
-            let note = if held {
-                format!(" The lease on {target} may still be held — release it from Files.")
-            } else {
-                String::new()
-            };
-            toast(
-                shared,
-                format!("keep-mine: apply failed ({m}). The copy is untouched.{note}"),
-                true,
-            );
-            return;
-        }
-        Err(e) => {
-            let held = !unlock_ok(dir, target).await;
-            let note = if held {
-                format!(" The lease on {target} may still be held — release it from Files.")
-            } else {
-                String::new()
-            };
-            toast(
-                shared,
-                format!("keep-mine: apply failed ({e}). The copy is untouched.{note}"),
-                true,
-            );
-            return;
-        }
-    }
-    // 3/4 unlock (publish)
-    match ipc::request(
-        dir,
-        &IpcRequest::Unlock {
-            path: target.to_string(),
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => {}
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "publish failed".into());
-            toast(
-                shared,
-                format!(
-                    "keep-mine: publish failed ({m}). Bytes applied but not published and the lease is still held — retry unlock from Files. The copy is untouched."
-                ),
-                true,
-            );
-            return;
-        }
-        Err(e) => {
-            toast(
-                shared,
-                format!(
-                    "keep-mine: publish failed ({e}). The lease is still held — retry unlock from Files. The copy is untouched."
-                ),
-                true,
-            );
-            return;
-        }
-    }
-    // 4/4 discard the (now-superseded) quarantined copy
-    match ipc::request(dir, &IpcRequest::ConflictDiscard { id: id.to_string() }).await {
-        Ok(r) if r.ok => toast(shared, format!("resolved into {target}"), false),
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "discard failed".into());
-            toast(
-                shared,
-                format!(
-                    "keep-mine: published, but the copy discard failed ({m}) — it is still in quarantine."
-                ),
-                true,
-            );
-        }
-        Err(e) => toast(
-            shared,
-            format!(
-                "keep-mine: published, but the copy discard failed ({e}) — it is still in quarantine."
-            ),
-            true,
-        ),
-    }
-}
-
-/// Best-effort unlock used on a rollback path; returns whether the lease is now
-/// released (so the caller can warn the user if it is still held).
-async fn unlock_ok(dir: &Path, target: &str) -> bool {
-    matches!(
-        ipc::request(dir, &IpcRequest::Unlock { path: target.to_string() }).await,
-        Ok(r) if r.ok
-    )
-}
-
-/// Guided restore: lock → restore → unlock. The daemon refuses Restore without
-/// a self-held lease; on success it pushes the replaced content to history
-/// FIRST, so a restore never loses bytes. Failure branches release the lease
-/// best-effort and say so honestly when they cannot.
-async fn restore_guided(shared: &Arc<Mutex<Shared>>, dir: &Path, path: &str, n: usize) {
-    match ipc::request(
-        dir,
-        &IpcRequest::Lock {
-            path: path.to_string(),
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => {}
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "lock refused".into());
-            toast(
-                shared,
-                format!("restore: lock refused ({m}). Nothing changed."),
-                true,
-            );
-            return;
-        }
-        Err(e) => {
-            toast(
-                shared,
-                format!("restore: lock failed ({e}). Nothing changed."),
-                true,
-            );
-            return;
-        }
-    }
-    match ipc::request(
-        dir,
-        &IpcRequest::Restore {
-            path: path.to_string(),
-            n,
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => {}
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "restore failed".into());
-            let held = !unlock_ok(dir, path).await;
-            let note = if held {
-                format!(" The lease on {path} may still be held — release it from Files.")
-            } else {
-                String::new()
-            };
-            toast(
-                shared,
-                format!("restore failed ({m}). Nothing changed.{note}"),
-                true,
-            );
-            return;
-        }
-        Err(e) => {
-            let held = !unlock_ok(dir, path).await;
-            let note = if held {
-                format!(" The lease on {path} may still be held — release it from Files.")
-            } else {
-                String::new()
-            };
-            toast(
-                shared,
-                format!("restore failed ({e}). Nothing changed.{note}"),
-                true,
-            );
-            return;
-        }
-    }
-    match ipc::request(
-        dir,
-        &IpcRequest::Unlock {
-            path: path.to_string(),
-        },
-    )
-    .await
-    {
-        Ok(r) if r.ok => toast(
-            shared,
-            format!("restored version {n} of {path} (previous content kept in history)"),
-            false,
-        ),
-        Ok(r) => {
-            let m = r
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "publish failed".into());
-            toast(
-                shared,
-                format!(
-                    "restored, but publish failed ({m}) — the lease is still held; retry unlock from Files."
-                ),
-                true,
-            );
-        }
-        Err(e) => toast(
-            shared,
-            format!(
-                "restored, but publish failed ({e}) — the lease is still held; retry unlock from Files."
-            ),
-            true,
-        ),
-    }
-}
-
-async fn start_session(
-    shared: &Arc<Mutex<Shared>>,
-    started: &Arc<tokio::sync::Mutex<BTreeMap<String, DaemonHandle>>>,
-    dir: &Path,
-) {
-    let key = dir.to_string_lossy().to_string();
-    // Hold the map lock across check→spawn→insert so two starts can't both spawn
-    // and orphan a handle (DaemonHandle has no Drop).
-    let mut hosted = started.lock().await;
-    if hosted.contains_key(&key) || ipc::daemon_alive(dir).await {
-        toast(shared, copy::TOAST_ALREADY_RUNNING.into(), true);
-        return;
-    }
-    let saved = match AppState::load(dir) {
-        Ok(st) => st.config,
-        Err(e) => {
-            toast(shared, format!("cannot start: {e}"), true);
-            return;
-        }
-    };
-    let net = match crate::cli::resolve_net_config(&saved, &crate::cli::NetFlags::default()) {
-        Ok(n) => n,
-        Err(e) => {
-            toast(shared, format!("network config error: {e}"), true);
-            return;
-        }
-    };
-    let cfg = crate::daemon::DaemonConfig {
-        dir: dir.to_path_buf(),
-        net,
-        timings: crate::locks::LockTimings {
-            ttl: saved.lease_ttl(),
-            renew: saved.lease_renew(),
-            acquire_timeout: saved.acquire_timeout(),
-        },
-        ui: crate::ui::progress::Ui::disabled(),
-    };
-    match crate::daemon::spawn(cfg).await {
-        Ok(handle) => {
-            hosted.insert(key, handle);
-            toast(shared, copy::TOAST_STARTED_HOSTED.into(), false);
-        }
-        Err(e) => toast(shared, format!("could not start: {e}"), true),
-    }
-}
-
-async fn stop_session(
-    shared: &Arc<Mutex<Shared>>,
-    started: &Arc<tokio::sync::Mutex<BTreeMap<String, DaemonHandle>>>,
-    dir: &Path,
-) {
-    let key = dir.to_string_lossy().to_string();
-    if let Some(handle) = started.lock().await.remove(&key) {
-        // Bounded so a wedged actor can't freeze the single worker task forever.
-        if tokio::time::timeout(GUI_SHUTDOWN, handle.shutdown())
-            .await
-            .is_err()
-        {
-            toast(shared, copy::TOAST_STOP_TIMEOUT.into(), true);
-        } else {
-            toast(shared, "stopped".into(), false);
-        }
-        return;
-    }
-    if !ipc::daemon_alive(dir).await {
-        toast(shared, copy::TOAST_NOT_RUNNING.into(), true);
-        return;
-    }
-    match ipc::request(dir, &IpcRequest::Shutdown).await {
-        Ok(r) if r.ok => toast(shared, copy::TOAST_STOPPED.into(), false),
-        Ok(r) => toast(
-            shared,
-            r.error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "shutdown refused".into()),
-            true,
-        ),
-        Err(e) => toast(shared, format!("stop failed: {e}"), true),
-    }
-}
-
-async fn set_paused(shared: &Arc<Mutex<Shared>>, dir: &Path, pause: bool) {
-    if AppState::load(dir).is_err() {
-        toast(shared, copy::TOAST_NOT_SESSION_FOLDER.into(), true);
-        return;
-    }
-    let abs = absolute(dir);
-    {
-        let mut reg = Registry::load();
-        if !reg.sessions.iter().any(|s| s.path == abs.to_string_lossy()) {
-            reg.register(dir, SessionKind::Init, crate::now_ms());
-            let _ = reg.save();
-        }
-    }
-    let path = abs.to_string_lossy().to_string();
-    if crate::supervisor::control_alive().await {
-        let req = if pause {
-            crate::supervisor::ControlRequest::Pause { path }
-        } else {
-            crate::supervisor::ControlRequest::Resume { path }
-        };
-        match crate::supervisor::request(&req, Duration::from_secs(30)).await {
-            Ok(r) if r.ok => toast(
-                shared,
-                if pause {
-                    copy::TOAST_PAUSED_LIVE
-                } else {
-                    copy::TOAST_RESUMED_LIVE
-                }
-                .into(),
-                false,
-            ),
-            Ok(r) => toast(
-                shared,
-                r.error
-                    .map(|e| e.message)
-                    .unwrap_or_else(|| "supervisor refused".into()),
-                true,
-            ),
-            Err(e) => toast(shared, format!("failed: {e}"), true),
-        }
-    } else {
-        let mut reg = Registry::load();
-        let _ = reg.set_paused(dir, pause);
-        let _ = reg.save();
-        toast(shared, copy::toast_paused_deferred(pause), false);
-    }
-}
-
-/// Rebuild the overview + the selected session's detail and publish the snapshot.
-async fn refresh(
-    shared: &Arc<Mutex<Shared>>,
-    started: &Arc<tokio::sync::Mutex<BTreeMap<String, DaemonHandle>>>,
-    selected: &Option<PathBuf>,
-) {
-    let hosted: std::collections::HashSet<String> = started.lock().await.keys().cloned().collect();
-    let overview = fetch_overview(&hosted).await;
-    // Reuse the previous ticket for the same running folder: every v2 mint
-    // carries a fresh invite id, so re-minting per poll would make the visible
-    // ticket (and its QR) churn every 1.5s. NB: this lock lives in a match
-    // scrutinee, so the guard drops at this statement's semicolon — keep the
-    // `.await` below in its own statement or the guard would span an await.
-    let prior_invite = match (selected, shared.lock()) {
-        (Some(dir), Ok(s)) => s
-            .detail
-            .as_ref()
-            .filter(|d| d.running && d.dir == dir.to_string_lossy())
-            .and_then(|d| d.invite.clone()),
-        _ => None,
-    };
-    let detail = match selected {
-        Some(dir) => Some(fetch_detail(dir, prior_invite).await),
-        None => None,
-    };
-    if let Ok(mut s) = shared.lock() {
-        s.overview = Some(overview);
-        s.detail = detail;
-        s.tick = s.tick.wrapping_add(1);
-    }
-}
-
-async fn fetch_overview(hosted: &std::collections::HashSet<String>) -> Overview {
-    // NB: do NOT prune+save the registry here. This runs every ~1.5s, so a
-    // transiently unavailable volume (a network share or USB hiccup) would make
-    // `AppState::exists` momentarily false and permanently unregister the session.
-    // Unreadable sessions are shown with `readable: false` and simply reappear
-    // when the volume returns; the CLI's explicit commands do the real pruning.
-    let reg = Registry::load();
-    let supervisor = crate::supervisor::control_alive().await;
-    let mut sessions = Vec::with_capacity(reg.sessions.len());
-    for s in &reg.sessions {
-        let dir = PathBuf::from(&s.path);
-        let st = AppState::load(&dir).ok();
-        let readable = st.is_some();
-        let (files, total_bytes, role, strict, id_short) = match &st {
-            Some(st) => (
-                st.files.values().filter(|f| !f.deleted).count(),
-                st.files
-                    .values()
-                    .filter(|f| !f.deleted)
-                    .map(|f| f.size)
-                    .sum::<u64>(),
-                st.config.role.as_str().to_string(),
-                st.config.strict,
-                st.node_id_short().unwrap_or_else(|| "?".into()),
-            ),
-            None => (0, 0, "?".into(), true, "-".into()),
-        };
-        let conflicts = crate::conflicts::list(&dir).len();
-        let running = ipc::daemon_alive(&dir).await;
-        let (peers_online, peers_total) = if running {
-            match ipc::request(&dir, &IpcRequest::Status).await {
-                Ok(r) if r.ok => {
-                    let d = r.data.unwrap_or_default();
-                    let members = d.get("members").and_then(|v| v.as_array());
-                    let total = members.map(|m| m.len()).unwrap_or(0);
-                    let online = members
-                        .map(|m| {
-                            m.iter()
-                                .filter(|x| {
-                                    x.get("online").and_then(|b| b.as_bool()).unwrap_or(false)
-                                })
-                                .count()
-                        })
-                        .unwrap_or(0);
-                    (online, total)
-                }
-                _ => (0, 0),
-            }
-        } else {
-            (0, 0)
-        };
-        sessions.push(SessionRow {
-            name: base_name(&s.path),
-            path: s.path.clone(),
-            running,
-            paused: s.paused,
-            hosted_by_gui: hosted.contains(&s.path),
-            readable,
-            role,
-            strict,
-            files,
-            total_bytes,
-            conflicts,
-            peers_online,
-            peers_total,
-            id_short,
-        });
-    }
-    Overview {
-        version: env!("TAZAMUN_VERSION").to_string(),
-        supervisor,
-        sessions,
-    }
-}
-
-async fn fetch_detail(dir: &Path, prior_invite: Option<String>) -> Detail {
-    let conflicts: Vec<ConflictRow> = crate::conflicts::list(dir)
-        .into_iter()
-        .map(|c| ConflictRow {
-            name: c.name,
-            path: c.path.unwrap_or_default(),
-            reason: c.reason.unwrap_or_else(|| "conflicting copy".into()),
-            ts_ms: c.ts_ms,
-            size: c.size,
-        })
-        .collect();
-    let audit: Vec<AuditRow> = crate::audit::read(dir, &crate::audit::Filter::default())
-        .into_iter()
-        .rev()
-        .take(200)
-        .map(|e| AuditRow {
-            ts_ms: e.ts_ms,
-            kind: e.kind,
-            path: e.path,
-            peer: e.peer,
-            detail: e.detail,
-        })
-        .rev()
-        .collect();
-    let invite = crate::home::offline_invite(dir);
-
-    if ipc::daemon_alive(dir).await {
-        // A running daemon can mint a live ticket (carries current addresses —
-        // faster first connection than the offline fallback). Minted once per
-        // selection: the caller passes the prior ticket back in on later polls.
-        let live_invite = match prior_invite {
-            Some(t) => Some(t),
-            None => match ipc::request(
-                dir,
-                &IpcRequest::Invite {
-                    role: None,
-                    ttl_ms: None,
-                },
-            )
-            .await
-            {
-                Ok(r) if r.ok => r
-                    .data
-                    .and_then(|d| d.get("ticket").and_then(|t| t.as_str().map(String::from))),
-                _ => None,
-            },
-        };
-        let invite = live_invite.or(invite);
-        match ipc::request(dir, &IpcRequest::DashboardState).await {
-            Ok(r) if r.ok => {
-                let d = r.data.unwrap_or_default();
-                return parse_running_detail(dir, &d, conflicts, audit, invite);
-            }
-            Ok(r) => {
-                return Detail {
-                    dir: dir.to_string_lossy().into(),
-                    error: r.error.map(|e| e.message),
-                    conflicts,
-                    audit,
-                    invite,
-                    ..Default::default()
-                };
-            }
-            Err(e) => {
-                return Detail {
-                    dir: dir.to_string_lossy().into(),
-                    error: Some(e.to_string()),
-                    conflicts,
-                    audit,
-                    invite,
-                    ..Default::default()
-                };
-            }
-        }
-    }
-
-    // Offline: read what we can directly.
-    match AppState::load(dir) {
-        Ok(st) => {
-            let files = st
-                .files
-                .iter()
-                .filter(|(_, r)| !r.deleted)
-                .map(|(p, r)| FileRow {
-                    path: p.as_str().to_string(),
-                    size: r.size,
-                    locked_by: None,
-                    mine_lock: false,
-                })
-                .collect();
-            Detail {
-                dir: dir.to_string_lossy().into(),
-                running: false,
-                role: st.config.role.as_str().to_string(),
-                strict: st.config.strict,
-                invite,
-                files,
-                conflicts,
-                audit,
-                ..Default::default()
-            }
-        }
-        Err(e) => Detail {
-            dir: dir.to_string_lossy().into(),
-            error: Some(e.to_string()),
-            conflicts,
-            audit,
-            invite,
-            ..Default::default()
-        },
-    }
-}
-
-fn parse_running_detail(
-    dir: &Path,
-    d: &serde_json::Value,
-    conflicts: Vec<ConflictRow>,
-    audit: Vec<AuditRow>,
-    invite: Option<String>,
-) -> Detail {
-    let leases: Vec<LeaseRow> = d
-        .get("leases")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|l| LeaseRow {
-                    path: jstr(l, "path"),
-                    holder: jstr(l, "holder"),
-                    mine: l.get("mine").and_then(|b| b.as_bool()).unwrap_or(false),
-                    expires_in_ms: l.get("expires_in_ms").and_then(|n| n.as_u64()).unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let members: Vec<Member> = d
-        .get("members")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|m| Member {
-                    id_short: short(&jstr(m, "id")),
-                    name: m.get("name").and_then(|n| n.as_str()).map(str::to_string),
-                    online: m.get("online").and_then(|b| b.as_bool()).unwrap_or(false),
-                    grade: jstr(m, "grade"),
-                    conn: jstr(m, "conn"),
-                    rtt_ms: m.get("rtt_ms").and_then(|n| n.as_u64()),
-                    via_lan: m.get("via_lan").and_then(|b| b.as_bool()).unwrap_or(false),
-                    jitter_ms: m
-                        .get("rtt_jitter_ms")
-                        .and_then(|n| n.as_f64())
-                        .unwrap_or(0.0),
-                    rate_tx: m.get("rate_tx_bps").and_then(|n| n.as_f64()).unwrap_or(0.0) as u64,
-                    rate_rx: m.get("rate_rx_bps").and_then(|n| n.as_f64()).unwrap_or(0.0) as u64,
-                    bytes_tx: m.get("bytes_tx").and_then(|n| n.as_u64()).unwrap_or(0),
-                    bytes_rx: m.get("bytes_rx").and_then(|n| n.as_u64()).unwrap_or(0),
-                    relay_url: m
-                        .get("relay_url")
-                        .and_then(|r| r.as_str())
-                        .map(str::to_string),
-                    ttd_ms: m.get("time_to_direct_ms").and_then(|n| n.as_u64()),
-                    flaps: m.get("flaps_per_min").and_then(|n| n.as_u64()).unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let files: Vec<FileRow> = d
-        .get("files")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            let mut v: Vec<FileRow> = obj
-                .iter()
-                .map(|(path, meta)| {
-                    let lease = leases.iter().find(|l| &l.path == path);
-                    FileRow {
-                        path: path.clone(),
-                        size: meta.get("size").and_then(|n| n.as_u64()).unwrap_or(0),
-                        locked_by: lease.map(|l| l.holder.clone()),
-                        mine_lock: lease.map(|l| l.mine).unwrap_or(false),
-                    }
-                })
-                .collect();
-            v.sort_by(|a, b| a.path.cmp(&b.path));
-            v
-        })
-        .unwrap_or_default();
-    // The config summary rides in the payload (P10+): typed view for Settings.
-    let config = d
-        .get("config")
-        .and_then(|c| c.as_object())
-        .map(|c| ConfigView {
-            autolock: c.get("autolock").and_then(|b| b.as_bool()).unwrap_or(false),
-            strict: c.get("strict").and_then(|b| b.as_bool()).unwrap_or(true),
-            role: c
-                .get("role")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
-            update_channel: c
-                .get("update_channel")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
-            lease_ttl_ms: c.get("lease_ttl_ms").and_then(|n| n.as_u64()).unwrap_or(0),
-            acquire_timeout_ms: c
-                .get("acquire_timeout_ms")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0),
-            wait_timeout_ms: c
-                .get("wait_timeout_ms")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0),
-            dashboard_port: c
-                .get("dashboard_port")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0) as u16,
-            relay: c.get("relay").and_then(|s| s.as_str()).map(str::to_string),
-            lan: c.get("lan").and_then(|b| b.as_bool()).unwrap_or(true),
-            max_down: c.get("max_down").and_then(|n| n.as_u64()).unwrap_or(0),
-        });
-    let (role, strict) = config
-        .as_ref()
-        .map(|c| (c.role.clone(), c.strict))
-        .unwrap_or_else(|| (String::new(), true));
-    // Per-path version history (P14: tags + pins ride along).
-    let versions: BTreeMap<String, Vec<VersionRow>> = d
-        .get("versions")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(path, list)| {
-                    let rows = list
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|e| VersionRow {
-                                    n: e.get("n").and_then(|n| n.as_u64()).unwrap_or(0),
-                                    ts_ms: e.get("ts_ms").and_then(|n| n.as_u64()).unwrap_or(0),
-                                    size: e.get("size").and_then(|n| n.as_u64()).unwrap_or(0),
-                                    tag: e.get("tag").and_then(|t| t.as_str()).map(str::to_string),
-                                    pinned: e
-                                        .get("pinned")
-                                        .and_then(|b| b.as_bool())
-                                        .unwrap_or(false),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (path.clone(), rows)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let pulls: Vec<PullRow> = d
-        .get("pending_pulls")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|p| PullRow {
-                    path: jstr(p, "path"),
-                    percent: p.get("percent").and_then(|n| n.as_u64()).unwrap_or(0),
-                    bytes_done: p.get("bytes_done").and_then(|n| n.as_u64()).unwrap_or(0),
-                    bytes_total: p.get("bytes_total").and_then(|n| n.as_u64()).unwrap_or(0),
-                    rate: p
-                        .get("rate_bytes_per_sec")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let events: Vec<EventRow> = d
-        .get("events")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|e| EventRow {
-                    text: jstr(e, "text"),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let transfer = d.get("transfer");
-    Detail {
-        dir: dir.to_string_lossy().into(),
-        running: true,
-        role,
-        strict,
-        invite,
-        members,
-        files,
-        files_total: d.get("files_total").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
-        files_truncated: d
-            .get("files_truncated")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false),
-        conflicts,
-        leases,
-        audit,
-        config,
-        versions,
-        pulls,
-        backlog: transfer
-            .and_then(|t| t.get("backlog"))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as usize,
-        resuming: transfer
-            .and_then(|t| t.get("resuming"))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as usize,
-        download_limit_bps: transfer
-            .and_then(|t| t.get("download_limit_bps"))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0),
-        events,
-        error: None,
-    }
-}
-
 // ─── the eframe app ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1511,15 +405,61 @@ struct App {
     qr: Option<(String, egui::TextureHandle)>,
     colophon_open: bool,
     files_sort: grouping::SortMode,
+    /// Which preserved copy the conflict detail pane is weighing.
+    conflict_sel: usize,
+    /// Whether the Overview's invite disclosure is open.
+    invite_open: bool,
+    /// The path being renamed, and the buffer holding its new name.
+    rename: Option<(String, String)>,
+    /// Whether the rename field has already been handed focus. Re-requesting it
+    /// every frame pins the keyboard and makes Tab dead inside the dialog.
+    rename_focused: bool,
+    /// The same, for the command palette's query field.
+    palette_focused: bool,
+    /// Age cutoff the conflict prune control is set to.
+    prune_age_ms: u64,
+    /// Free-text filter over the audit ledger.
+    audit_query: String,
+    /// Kind the audit ledger is filtered to, or every kind.
+    audit_kind: Option<String>,
+    /// Role the next minted invite is scoped to.
+    invite_role: String,
+    /// Expiry of the next minted invite; `None` never expires.
+    invite_ttl_ms: Option<u64>,
+    /// The last refused edit, held until the user clears it or one succeeds.
+    refusal: Option<Refusal>,
+    /// Commands the worker has accepted and not finished, mirrored each frame.
+    inflight: Vec<InFlight>,
+    /// Per-session reachability of the poll itself.
+    reach: BTreeMap<String, Reach>,
+    /// When each session last answered, for the staleness line.
+    fetched_at: BTreeMap<String, f64>,
+    /// A long answer — a diff, a doctor report — waiting to be read.
+    report: Option<Report>,
+    /// The daemon's answer to the current file query.
+    file_page: Option<FilePage>,
+    /// The query already asked, so typing does not re-ask it every frame.
+    file_query: Option<(String, String, bool, usize)>,
+    /// Which page of a server-side file query is on screen.
+    file_offset: usize,
+    /// When the pending file query may go out. Typing moves it forward; a sort
+    /// or page change fires immediately.
+    file_query_due: Option<f64>,
     telemetry: telemetry::TelemetryStore,
     seen_tick: u64,
     toasts: toasts::Queue,
     shortcuts_open: bool,
     text_scale: f32,
-    /// Set to the scale that still needs pushing into the context; taken on the
-    /// next frame so `theme::install` (which also writes `text_styles`) can
-    /// never race ahead of it.
-    scale_dirty: Option<f32>,
+    /// Appearance, owned here and pushed into `theme`'s globals by
+    /// [`App::apply_style`]. Held rather than read back out of `theme` so the
+    /// preference file has one source of truth.
+    mode: theme::Mode,
+    density: theme::Density,
+    reduced_motion: bool,
+    /// Set whenever any of the four appearance values changes; consumed on the
+    /// next frame, because `theme::install` also writes the text table and a
+    /// style pushed at construction would be overwritten by it.
+    style_dirty: bool,
     /// One-shot: focus the file filter on the next frame that draws it.
     focus_filter: bool,
     /// Id of the selected tab, republished every frame so the skip link has a
@@ -1588,14 +528,42 @@ impl App {
             } else {
                 grouping::SortMode::Name
             },
+            conflict_sel: 0,
+            invite_open: false,
+            rename: None,
+            rename_focused: false,
+            palette_focused: false,
+            prune_age_ms: copy::PRUNE_AGE_DEFAULT,
+            audit_query: String::new(),
+            audit_kind: None,
+            invite_role: copy::INVITE_ROLE_DEFAULT.to_string(),
+            invite_ttl_ms: None,
+            refusal: None,
+            inflight: Vec::new(),
+            reach: BTreeMap::new(),
+            fetched_at: BTreeMap::new(),
+            report: None,
+            file_page: None,
+            file_query: None,
+            file_offset: 0,
+            file_query_due: None,
             telemetry: telemetry::TelemetryStore::default(),
             seen_tick: 0,
             toasts: toasts::Queue::default(),
             shortcuts_open: false,
             text_scale: saved.text_scale,
-            // Queued rather than applied: `theme::install` also writes
-            // `text_styles`, so the scale has to land after it.
-            scale_dirty: Some(saved.text_scale),
+            // The capture hook may override the appearance so a docs shot is
+            // reproducible whatever the last run left in prefs — same reason
+            // the tab and session are overridable.
+            mode: theme::Mode::from_key(
+                &std::env::var("TAZAMUN_GUI_SHOT_MODE").unwrap_or_else(|_| saved.mode.clone()),
+            ),
+            density: theme::Density::from_key(
+                &std::env::var("TAZAMUN_GUI_SHOT_DENSITY")
+                    .unwrap_or_else(|_| saved.density.clone()),
+            ),
+            reduced_motion: saved.reduced_motion,
+            style_dirty: true,
             focus_filter: false,
             skip_target: None,
             multi: selection::Selection::default(),
@@ -1615,6 +583,9 @@ impl App {
         });
         prefs::Prefs {
             text_scale: self.text_scale,
+            mode: self.mode.key().to_string(),
+            density: self.density.key().to_string(),
+            reduced_motion: self.reduced_motion,
             sort_by_size: self.files_sort == grouping::SortMode::Size,
             last_tab: self.tab.label().to_ascii_lowercase(),
             last_session: self.selected.clone(),
@@ -1643,6 +614,16 @@ impl App {
         prefs::save(&next);
         self.prefs_last = next;
         self.prefs_saved_at = now;
+    }
+
+    /// Pushes the four appearance values into `theme` and rebuilds the style.
+    fn apply_style(&self, ctx: &egui::Context) {
+        theme::set_mode(self.mode);
+        theme::set_density(self.density);
+        theme::set_reduced_motion(self.reduced_motion);
+        // `a11y` owns the clamping and ends in `theme::restyle`, so this is the
+        // one call that lands all four.
+        a11y::apply_text_scale(ctx, self.text_scale);
     }
 
     fn send(&self, cmd: Cmd) {
@@ -1681,10 +662,8 @@ impl eframe::App for App {
         // Keep timers/ages fresh even without a worker push.
         ui.ctx().request_repaint_after(REFRESH);
         let now = ui.input(|i| i.time);
-        // Applied here, never at construction: `theme::install` also writes
-        // `text_styles`, so the scale has to land after it, once per change.
-        if let Some(scale) = self.scale_dirty.take() {
-            a11y::apply_text_scale(ui.ctx(), scale);
+        if std::mem::take(&mut self.style_dirty) {
+            self.apply_style(ui.ctx());
         }
         self.flush_prefs(ui.ctx(), now, false);
 
@@ -1709,6 +688,16 @@ impl eframe::App for App {
                     PickTarget::Join => self.join_path = path,
                 }
             }
+            // Mirrored rather than moved: the worker overwrites it on the next
+            // refusal, and the view clears it when the user acts on it.
+            self.refusal = s.refusal.clone();
+            self.inflight = s.inflight.clone();
+            self.reach = s.reach.clone();
+            self.fetched_at = s.fetched_at.clone();
+            if s.report.is_some() {
+                self.report = s.report.take();
+            }
+            self.file_page = s.file_page.clone();
             (s.overview.clone(), s.detail.clone(), s.tick, s.busy)
         };
         let (overview, detail, tick, busy) = snapshot;
@@ -1767,23 +756,34 @@ impl eframe::App for App {
                 chrome::paint_sidebar_bg(ui, true);
                 egui::Frame::new()
                     .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 10,
-                        top: 10,
-                        bottom: 8,
+                        left: theme::space::L as i8,
+                        right: theme::space::M as i8,
+                        top: theme::space::L as i8,
+                        bottom: theme::space::M as i8,
                     })
                     .show(ui, |ui| self.sidebar(ui, &overview));
             });
         CentralPanel::default()
+            // The page margin, from the scale: a register is read across its
+            // full width, so the gutter is the only thing holding it off the
+            // window edge.
             .frame(egui::Frame::new().inner_margin(egui::Margin {
-                left: 18,
-                right: 18,
-                top: 12,
-                bottom: 12,
+                left: theme::space::XXL as i8,
+                right: theme::space::XXL as i8,
+                top: theme::space::L as i8,
+                bottom: theme::space::L as i8,
             }))
             .show(ui, |ui| match &self.selected {
                 None => self.home(ui, &overview),
-                Some(_) => self.session_view(ui, detail.as_ref()),
+                Some(sel) => {
+                    // The sidebar row carries the paused flag; the detail
+                    // payload does not, and offering Pause and Resume both
+                    // enabled meant one of them was always a no-op.
+                    let paused = overview
+                        .as_ref()
+                        .is_some_and(|o| o.sessions.iter().any(|r| &r.path == sel && r.paused));
+                    self.session_view(ui, detail.as_ref(), paused)
+                }
             });
 
         // Drag-a-folder-onto-the-window: overlay while hovering, route on drop.
@@ -1811,6 +811,8 @@ impl eframe::App for App {
         self.debug_screenshot(ui);
         self.palette_overlay(ui, &overview);
         self.shortcuts_overlay(ui);
+        self.report_overlay(ui);
+        self.rename_overlay(ui);
         self.confirm_overlay(ui);
         self.colophon_overlay(ui);
         self.toast_overlay(ui);
@@ -1833,8 +835,8 @@ impl App {
         chrome::titlebar_interactions(ui, bar);
         egui::Frame::new()
             .inner_margin(egui::Margin {
-                left: 16,
-                right: 8,
+                left: theme::space::XL as i8,
+                right: theme::space::M as i8,
                 top: 0,
                 bottom: 0,
             })
@@ -1842,25 +844,29 @@ impl App {
                 ui.set_min_height(bar.height());
                 ui.style_mut().interaction.selectable_labels = false;
                 ui.horizontal_centered(|ui| {
-                    chrome::wordmark(ui, 19.0);
+                    chrome::wordmark(ui, theme::sized(theme::step::DISPLAY));
                     if let Some(ov) = overview {
                         ui.add_space(8.0);
                         let running = ov.sessions.iter().filter(|s| s.running).count();
                         let conflicts: usize = ov.sessions.iter().map(|s| s.conflicts).sum();
                         let n = ov.sessions.len();
-                        theme::pill(
+                        register::tag(
                             ui,
                             &format!("{n} session{}", if n == 1 { "" } else { "s" }),
-                            DIM,
+                            theme::ink_muted(),
                         );
                         if running > 0 {
-                            theme::pill(ui, &format!("{running} running"), GOOD);
+                            register::tag(ui, &format!("{running} running"), theme::custody_good());
                         }
                         if conflicts > 0 {
-                            theme::pill(ui, &figures::count(conflicts, "conflict"), WARN);
+                            register::tag(
+                                ui,
+                                &figures::count(conflicts, "conflict"),
+                                theme::custody_stale(),
+                            );
                         }
                         if ov.supervisor {
-                            theme::pill(ui, "supervisor", theme::LAPIS);
+                            register::tag(ui, "supervisor", theme::custody_peer());
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1901,7 +907,9 @@ impl App {
                         ui.add_space(8.0);
                         let r = ui
                             .add(egui::Button::new(
-                                egui::RichText::new("⌘K").size(11.0).color(DIM),
+                                egui::RichText::new("⌘K")
+                                    .size(11.0)
+                                    .color(theme::ink_muted()),
                             ))
                             .on_hover_text("command palette (Ctrl+K)");
                         if r.clicked() {
@@ -1931,12 +939,16 @@ impl App {
                 egui::RichText::new(copy::SIDEBAR_HOME_TITLE)
                     .family(theme::fam_semibold())
                     .size(13.5)
-                    .color(if home_selected { ACCENT } else { INK }),
+                    .color(if home_selected {
+                        theme::gold()
+                    } else {
+                        theme::ink()
+                    }),
             );
             ui.label(
                 egui::RichText::new(copy::SIDEBAR_HOME_SUB)
                     .size(11.0)
-                    .color(DIM),
+                    .color(theme::ink_muted()),
             );
         });
         if home_hit {
@@ -1944,13 +956,13 @@ impl App {
             self.select(None);
         }
         ui.add_space(4.0);
-        theme::section(ui, copy::SESSIONS_SECTION);
+        register::heading(ui, copy::SESSIONS_SECTION);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(ov) = overview else {
                     for w in [180.0, 140.0, 160.0] {
-                        theme::skeleton(ui, w);
+                        register::skeleton_line(ui, w);
                     }
                     return;
                 };
@@ -1961,10 +973,12 @@ impl App {
                 self.multi.retain_existing(&all_keys);
                 if ov.sessions.is_empty() {
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new(copy::NO_SESSIONS_TITLE).color(DIM));
+                    ui.label(
+                        egui::RichText::new(copy::NO_SESSIONS_TITLE).color(theme::ink_muted()),
+                    );
                     ui.label(
                         egui::RichText::new(copy::NO_SESSIONS_HINT)
-                            .color(theme::FAINT)
+                            .color(theme::ink_faint())
                             .size(11.5),
                     );
                 } else {
@@ -2049,7 +1063,7 @@ impl App {
                 }
                 // Footer pinned under the list: version + supervisor state.
                 ui.add_space(8.0);
-                ornament::rule_with_diamond(ui, ACCENT);
+                ornament::rule_with_diamond(ui, theme::gold());
                 ui.horizontal(|ui| {
                     let (mark, _) =
                         ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -2057,19 +1071,19 @@ impl App {
                         ui.painter(),
                         mark.center(),
                         5.5,
-                        theme::GOLD.linear_multiply(0.8),
+                        theme::gold().linear_multiply(0.8),
                         true,
                     );
                     ui.label(
                         egui::RichText::new(format!("v{}", ov.version))
                             .size(10.5)
-                            .color(theme::FAINT),
+                            .color(theme::ink_faint()),
                     );
                     if ov.supervisor {
                         ui.label(
                             egui::RichText::new("· supervisor on")
                                 .size(10.5)
-                                .color(GOOD),
+                                .color(theme::custody_good()),
                         );
                     }
                 });
@@ -2095,12 +1109,12 @@ impl App {
                 let t =
                     ui.ctx()
                         .animate_bool_with_time(ui.response().id, hovered || selected, 0.12);
-                let fill = theme::lerp_color(egui::Color32::TRANSPARENT, theme::BG3, t * 0.9);
+                let fill = theme::mix(egui::Color32::TRANSPARENT, theme::bg_raise(), t * 0.9);
                 egui::Frame::new()
                     .fill(fill)
-                    .corner_radius(theme::R_CARD)
+                    .corner_radius(theme::R_NONE)
                     .stroke(if selected {
-                        egui::Stroke::new(1.0, ACCENT.linear_multiply(0.35))
+                        egui::Stroke::new(1.0, theme::gold().linear_multiply(0.35))
                     } else {
                         egui::Stroke::NONE
                     })
@@ -2118,7 +1132,7 @@ impl App {
                     egui::vec2(3.0, r.height() - 16.0),
                 ),
                 2.0,
-                ACCENT,
+                theme::gold(),
             );
         }
         a11y::label_selectable(&resp, label, selected);
@@ -2144,25 +1158,37 @@ impl App {
         }
         self.nav_card(ui, &label, selected, |ui| {
             ui.horizontal(|ui| {
-                theme::glow_dot(ui, dot_color);
+                register::status_mark(ui, dot_color);
                 ui.label(
                     egui::RichText::new(&s.name)
                         .family(theme::fam_medium())
                         .size(13.5)
-                        .color(if selected { ACCENT } else { INK }),
+                        .color(if selected {
+                            theme::gold()
+                        } else {
+                            theme::ink()
+                        }),
                 );
                 if s.conflicts > 0 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        theme::pill(ui, &format!("{}", s.conflicts), WARN);
+                        register::tag(ui, &format!("{}", s.conflicts), theme::custody_stale());
                     });
                 }
             });
-            ui.label(egui::RichText::new(status_text(s)).size(11.0).color(DIM));
+            ui.label(
+                egui::RichText::new(status_text(s))
+                    .size(11.0)
+                    .color(theme::ink_muted()),
+            );
             let mut meta = format!("{} · {}", s.id_short, human_bytes(s.total_bytes));
             if s.hosted_by_gui {
                 meta.push_str(" · hosted here");
             }
-            ui.label(egui::RichText::new(meta).size(10.0).color(theme::FAINT));
+            ui.label(
+                egui::RichText::new(meta)
+                    .size(10.0)
+                    .color(theme::ink_faint()),
+            );
         })
     }
 
@@ -2176,7 +1202,7 @@ impl App {
                     hero.right_top(),
                     egui::vec2(-1.0, 1.0),
                     110.0,
-                    theme::GOLD.linear_multiply(0.5),
+                    theme::gold().linear_multiply(0.5),
                 );
                 ui.add_space(4.0);
                 match overview {
@@ -2186,9 +1212,13 @@ impl App {
                             egui::RichText::new(copy::HOME_TITLE)
                                 .family(theme::fam_semibold())
                                 .size(18.0)
-                                .color(INK),
+                                .color(theme::ink()),
                         );
-                        ui.label(egui::RichText::new(copy::HOME_SUB).size(12.0).color(DIM));
+                        ui.label(
+                            egui::RichText::new(copy::HOME_SUB)
+                                .size(12.0)
+                                .color(theme::ink_muted()),
+                        );
                         ui.add_space(8.0);
                         let running = ov.sessions.iter().filter(|s| s.running).count();
                         let conflicts: usize = ov.sessions.iter().map(|s| s.conflicts).sum();
@@ -2207,28 +1237,36 @@ impl App {
                             ui.label(
                                 egui::RichText::new(copy::HOME_CONFLICTS_NOTE)
                                     .size(11.5)
-                                    .color(WARN),
+                                    .color(theme::custody_stale()),
                             );
                         }
                         ui.add_space(12.0);
-                        theme::section(ui, copy::CREATE_TITLE);
-                        components::notched_card(ui, Some(ACCENT), |ui| {
+                        register::heading(ui, copy::CREATE_TITLE);
+                        components::notched_card(ui, Some(theme::gold()), |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(copy::CREATE_HINT).size(11.5).color(DIM));
+                            ui.label(
+                                egui::RichText::new(copy::CREATE_HINT)
+                                    .size(11.5)
+                                    .color(theme::ink_muted()),
+                            );
                             self.create_form_row(ui);
                         });
                         ui.add_space(6.0);
-                        theme::section(ui, copy::JOIN_TITLE);
+                        register::heading(ui, copy::JOIN_TITLE);
                         components::notched_card(ui, None, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(copy::JOIN_HINT).size(11.5).color(DIM));
+                            ui.label(
+                                egui::RichText::new(copy::JOIN_HINT)
+                                    .size(11.5)
+                                    .color(theme::ink_muted()),
+                            );
                             self.join_form_row(ui);
                         });
                     }
                     None => {
                         ui.horizontal(|ui| {
                             for w in [96.0, 96.0, 96.0] {
-                                theme::skeleton(ui, w);
+                                register::skeleton_line(ui, w);
                             }
                         });
                     }
@@ -2247,53 +1285,134 @@ impl App {
     /// session's Settings tab: it is a property of the window, and Settings
     /// needs a running daemon it has no business requiring for this.
     fn display_section(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, copy::DISPLAY_TITLE);
-        components::notched_card(ui, None, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(copy::A11Y_TEXT_SIZE)
-                        .size(12.5)
-                        .family(theme::fam_medium())
-                        .color(INK),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Ends disable rather than vanish, so the row never reflows.
-                    let at_max = self.text_scale >= a11y::SCALE_MAX;
-                    let at_min = self.text_scale <= a11y::SCALE_MIN;
-                    let bigger = ui.add_enabled_ui(!at_max, |ui| controls::ghost_small(ui, "+"));
-                    a11y::label_button(&bigger.inner, copy::A11Y_BIGGER);
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(a11y::scale_label(self.text_scale))
-                            .size(11.5)
-                            .family(theme::fam_medium())
-                            .color(DIM),
-                    );
-                    ui.add_space(2.0);
-                    let smaller = ui.add_enabled_ui(!at_min, |ui| controls::ghost_small(ui, "-"));
-                    a11y::label_button(&smaller.inner, copy::A11Y_SMALLER);
-                    let step = if bigger.inner.clicked() {
-                        Some(a11y::step_scale(self.text_scale, true))
-                    } else if smaller.inner.clicked() {
-                        Some(a11y::step_scale(self.text_scale, false))
-                    } else {
-                        None
-                    };
-                    if let Some(next) = step
-                        && next != self.text_scale
-                    {
-                        self.text_scale = next;
-                        self.scale_dirty = Some(next);
+        register::heading(ui, copy::DISPLAY_TITLE);
+        let cols = [
+            register::Col::new("", register::ColW::Flex(2.0)),
+            register::Col::new("", register::ColW::Flex(3.0)),
+        ];
+        register::Register::new("display", &cols).no_margin().show(
+            ui,
+            register::Content::Entries(4),
+            |e| {
+                e.no_mark();
+                match e.index() {
+                    0 => {
+                        e.cell(|ui| {
+                            setting_label(ui, copy::A11Y_TEXT_SIZE, copy::A11Y_TEXT_SIZE_HINT)
+                        });
+                        let scale = self.text_scale;
+                        let mut step = None;
+                        e.cell(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Ends disable rather than vanish, so the row
+                                    // never reflows under the pointer.
+                                    let at_max = scale >= a11y::SCALE_MAX;
+                                    let at_min = scale <= a11y::SCALE_MIN;
+                                    let bigger = ui.add_enabled_ui(!at_max, |ui| {
+                                        controls::ghost_small(ui, "+")
+                                    });
+                                    a11y::label_button(&bigger.inner, copy::A11Y_BIGGER);
+                                    ui.add_space(theme::space::XS);
+                                    ui.label(
+                                        egui::RichText::new(a11y::scale_label(scale))
+                                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                                            .color(theme::ink_muted()),
+                                    );
+                                    ui.add_space(theme::space::XS);
+                                    let smaller = ui.add_enabled_ui(!at_min, |ui| {
+                                        controls::ghost_small(ui, "−")
+                                    });
+                                    a11y::label_button(&smaller.inner, copy::A11Y_SMALLER);
+                                    if bigger.inner.clicked() {
+                                        step = Some(a11y::step_scale(scale, true));
+                                    } else if smaller.inner.clicked() {
+                                        step = Some(a11y::step_scale(scale, false));
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(next) = step
+                            && next != self.text_scale
+                        {
+                            self.text_scale = next;
+                            self.style_dirty = true;
+                        }
                     }
-                });
-            });
-            ui.label(
-                egui::RichText::new(copy::A11Y_TEXT_SIZE_HINT)
-                    .size(11.0)
-                    .color(theme::FAINT),
-            );
-        });
+                    1 => {
+                        e.cell(|ui| setting_label(ui, copy::THEME_TITLE, copy::THEME_HINT));
+                        let cur = self.mode;
+                        let mut pick = None;
+                        e.cell(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for m in theme::Mode::ALL.iter().rev() {
+                                        if choice(ui, m.label(), *m == cur) {
+                                            pick = Some(*m);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(m) = pick
+                            && m != self.mode
+                        {
+                            self.mode = m;
+                            self.style_dirty = true;
+                        }
+                    }
+                    2 => {
+                        e.cell(|ui| setting_label(ui, copy::DENSITY_TITLE, copy::DENSITY_HINT));
+                        let cur = self.density;
+                        let mut pick = None;
+                        e.cell(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for dn in theme::Density::ALL.iter().rev() {
+                                        if choice(ui, dn.label(), *dn == cur) {
+                                            pick = Some(*dn);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(dn) = pick
+                            && dn != self.density
+                        {
+                            self.density = dn;
+                            self.style_dirty = true;
+                        }
+                    }
+                    _ => {
+                        e.cell(|ui| setting_label(ui, copy::MOTION_TITLE, copy::MOTION_HINT));
+                        let cur = self.reduced_motion;
+                        let mut pick = None;
+                        e.cell(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if choice(ui, copy::MOTION_REDUCED, cur) {
+                                        pick = Some(true);
+                                    }
+                                    if choice(ui, copy::MOTION_FULL, !cur) {
+                                        pick = Some(false);
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(v) = pick
+                            && v != self.reduced_motion
+                        {
+                            self.reduced_motion = v;
+                            self.style_dirty = true;
+                        }
+                    }
+                }
+            },
+        );
     }
 
     /// The zero-session opening page: three medallioned steps joined by a
@@ -2303,9 +1422,13 @@ impl App {
             egui::RichText::new(copy::FL_TITLE)
                 .family(theme::fam_semibold())
                 .size(20.0)
-                .color(INK),
+                .color(theme::ink()),
         );
-        ui.label(egui::RichText::new(copy::FL_SUB).size(12.0).color(DIM));
+        ui.label(
+            egui::RichText::new(copy::FL_SUB)
+                .size(12.0)
+                .color(theme::ink_muted()),
+        );
         ui.add_space(10.0);
         onboarding::first_light_frame(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2323,12 +1446,12 @@ impl App {
                         egui::RichText::new(copy::FL_STEP1_TITLE)
                             .family(theme::fam_semibold())
                             .size(14.5)
-                            .color(INK),
+                            .color(theme::ink()),
                     );
                     ui.label(
                         egui::RichText::new(copy::FL_STEP1_HINT)
                             .size(11.5)
-                            .color(DIM),
+                            .color(theme::ink_muted()),
                     );
                     ui.add_space(4.0);
                     self.create_form_row(ui);
@@ -2338,24 +1461,24 @@ impl App {
                         egui::RichText::new(copy::FL_STEP2_TITLE)
                             .family(theme::fam_semibold())
                             .size(13.0)
-                            .color(theme::FAINT),
+                            .color(theme::ink_faint()),
                     );
                     ui.label(
                         egui::RichText::new(copy::FL_STEP2_HINT)
                             .size(11.0)
-                            .color(theme::FAINT),
+                            .color(theme::ink_faint()),
                     );
                     ui.add_space(14.0);
                     ui.label(
                         egui::RichText::new(copy::FL_STEP3_TITLE)
                             .family(theme::fam_semibold())
                             .size(13.0)
-                            .color(theme::FAINT),
+                            .color(theme::ink_faint()),
                     );
                     ui.label(
                         egui::RichText::new(copy::FL_STEP3_HINT)
                             .size(11.0)
-                            .color(theme::FAINT),
+                            .color(theme::ink_faint()),
                     );
                 });
             });
@@ -2431,7 +1554,7 @@ impl App {
         });
     }
 
-    fn session_view(&mut self, ui: &mut egui::Ui, detail: Option<&Detail>) {
+    fn session_view(&mut self, ui: &mut egui::Ui, detail: Option<&Detail>, paused: bool) {
         let Some(sel) = self.selected.clone() else {
             return;
         };
@@ -2449,14 +1572,24 @@ impl App {
 
         // Header: name, path, lifecycle.
         ui.horizontal(|ui| {
-            theme::glow_dot(ui, if running { GOOD } else { DIM });
+            register::status_mark(
+                ui,
+                if running {
+                    theme::custody_good()
+                } else {
+                    theme::ink_muted()
+                },
+            );
             ui.label(
                 egui::RichText::new(base_name(&sel))
-                    .family(theme::fam_semibold())
-                    .size(18.0)
-                    .color(INK),
+                    .font(theme::font(theme::step::DISPLAY, theme::fam_serif()))
+                    .color(theme::ink()),
             );
-            ui.label(egui::RichText::new(&sel).color(theme::FAINT).size(11.5));
+            ui.label(
+                egui::RichText::new(&sel)
+                    .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                    .color(theme::ink_faint()),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
                     if controls::ghost_button(ui, "Stop").clicked() {
@@ -2465,13 +1598,20 @@ impl App {
                 } else if components::bevel_primary(ui, "Start").clicked() {
                     self.send(Cmd::Start(dir.clone()));
                 }
-                if controls::ghost_small(ui, "Pause").clicked() {
-                    self.send(Cmd::Pause(dir.clone()));
+                // Only the verb that applies: a session is either paused or
+                // it is not, and showing both made one of them a dead control.
+                if running {
+                    let (verb, cmd) = if paused {
+                        (copy::ACTION_RESUME, Cmd::Resume(dir.clone()))
+                    } else {
+                        (copy::ACTION_PAUSE, Cmd::Pause(dir.clone()))
+                    };
+                    if controls::ghost_small(ui, verb).clicked() {
+                        self.send(cmd);
+                    }
                 }
-                if controls::ghost_small(ui, "Resume").clicked() {
-                    self.send(Cmd::Resume(dir.clone()));
-                }
-                ui.add_space(6.0);
+                self.session_menu(ui, &dir, running);
+                ui.add_space(theme::space::S);
                 if controls::ghost_small(ui, "Open folder")
                     .on_hover_text(copy::OPEN_FOLDER_HOVER)
                     .clicked()
@@ -2512,7 +1652,11 @@ impl App {
                             egui::RichText::new(label)
                                 .family(theme::fam_medium())
                                 .size(13.0)
-                                .color(if selected { INK } else { DIM }),
+                                .color(if selected {
+                                    theme::ink()
+                                } else {
+                                    theme::ink_muted()
+                                }),
                         )
                         .sense(egui::Sense::click()),
                     );
@@ -2535,212 +1679,848 @@ impl App {
             })
             .inner;
         if let Some(r) = active_rect {
-            let x =
-                ui.ctx()
-                    .animate_value_with_time(egui::Id::new("tab-underline-x"), r.left(), 0.14);
-            let w =
-                ui.ctx()
-                    .animate_value_with_time(egui::Id::new("tab-underline-w"), r.width(), 0.14);
+            let x = ui.ctx().animate_value_with_time(
+                egui::Id::new("tab-underline-x"),
+                r.left(),
+                theme::dur(theme::motion::VIEW),
+            );
+            let w = ui.ctx().animate_value_with_time(
+                egui::Id::new("tab-underline-w"),
+                r.width(),
+                theme::dur(theme::motion::VIEW),
+            );
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(egui::pos2(x, bar_bottom + 4.0), egui::vec2(w, 2.0)),
                 1.0,
-                ACCENT,
+                theme::gold(),
             );
         }
         ui.add_space(8.0);
 
         let Some(d) = detail else {
-            for w in [260.0, 200.0, 230.0] {
-                theme::skeleton(ui, w);
-            }
+            self.tab_waiting(ui);
             return;
         };
+        // A failed load is stated once, at the top, with the way out. The tabs
+        // below then render their own `Content::Failed` rather than an empty
+        // state, so the window never reports "nothing here" about data it did
+        // not manage to read.
         if let Some(err) = &d.error {
-            ui.colored_label(BAD, format!("could not load this session: {err}"));
+            register::notice(ui, theme::Custody::Blocked, |ui| {
+                ui.label(
+                    egui::RichText::new(copy::SESSION_LOAD_FAILED)
+                        .font(theme::font(theme::step::BODY, theme::fam_semibold()))
+                        .color(theme::ink()),
+                );
+                ui.add_space(theme::space::XS);
+                ui.label(
+                    egui::RichText::new(err)
+                        .font(theme::font(theme::step::META, theme::fam_mono()))
+                        .color(theme::ink_muted()),
+                );
+                ui.add_space(theme::space::S);
+                if controls::ghost_small(ui, copy::ACTION_RETRY).clicked() {
+                    self.send(Cmd::Refresh);
+                }
+            });
+            ui.add_space(theme::space::M);
         }
 
+        let now = ui.input(|i| i.time);
+        self.staleness_line(ui, &d.dir, now);
+        self.working_band(ui, &d.dir, now);
+        self.refusal_notice(ui, d);
+
+        // Each tab owns its own scrolling: the register virtualises through its
+        // own `ScrollArea`, and nesting that inside a second one would give the
+        // tabular views two scrollbars and no virtualisation.
+        match self.tab {
+            Tab::Overview => self.scrolled(ui, "overview", |s, ui| s.tab_overview(ui, d)),
+            Tab::Peers => self.tab_peers(ui, d),
+            Tab::Files => self.tab_files(ui, &dir, d),
+            Tab::Conflicts => self.tab_conflicts(ui, &dir, d),
+            Tab::History => self.tab_history(ui, &dir, d),
+            Tab::Audit => self.tab_audit(ui, d),
+            Tab::Settings => self.scrolled(ui, "settings", |s, ui| s.tab_settings(ui, &dir, d)),
+        }
+    }
+
+    /// The refused-edit panel: which of the three lease preconditions blocked
+    /// the edit, why that rule exists, and what clears it. This is the whole
+    /// product in one panel, and it used to be a four-second toast carrying
+    /// only the daemon's one-line message.
+    fn refusal_notice(&mut self, ui: &mut egui::Ui, d: &Detail) {
+        let Some(r) = self.refusal.clone() else {
+            return;
+        };
+        let mut clear = false;
+        register::notice(ui, theme::Custody::Blocked, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(copy::precondition_title(&r.precondition))
+                        .font(theme::font(theme::step::TITLE, theme::fam_serif()))
+                        .color(theme::ink()),
+                );
+                if !r.precondition.is_empty() {
+                    register::tag(ui, &r.precondition, theme::custody_blocked());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if controls::ghost_small(ui, copy::REFUSED_DISMISS).clicked() {
+                        clear = true;
+                    }
+                });
+            });
+            ui.add_space(theme::space::XS);
+            ui.label(
+                egui::RichText::new(&r.path)
+                    .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                    .color(theme::ink_muted()),
+            );
+            ui.add_space(theme::space::S);
+            ui.label(
+                egui::RichText::new(&r.message)
+                    .font(theme::font(theme::step::BODY, theme::fam_medium()))
+                    .color(theme::ink()),
+            );
+            ui.add_space(theme::space::XS);
+            ui.label(
+                egui::RichText::new(copy::precondition_why(&r.precondition))
+                    .font(theme::font(
+                        theme::step::BODY,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_muted()),
+            );
+            if let Some(h) = &r.held_by {
+                ui.add_space(theme::space::S);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(copy::REFUSED_HELD_BY)
+                            .font(theme::font(
+                                theme::step::META,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_faint()),
+                    );
+                    register::tag(ui, h, theme::custody_peer());
+                });
+            }
+            if !r.peers.is_empty() {
+                ui.add_space(theme::space::S);
+                ui.label(
+                    egui::RichText::new(copy::REFUSED_PEERS)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_faint()),
+                );
+                for line in &r.peers {
+                    ui.label(
+                        egui::RichText::new(line)
+                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                            .color(theme::ink_muted()),
+                    );
+                }
+            }
+            if !r.hint.is_empty() {
+                ui.add_space(theme::space::S);
+                ui.label(
+                    egui::RichText::new(&r.hint)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::custody_stale()),
+                );
+            }
+            // The refusal names a remedy the user can act on from here: a
+            // FRESHNESS block clears itself once the pull finishes, and a
+            // REACHABILITY block is answered on the Peers tab.
+            ui.add_space(theme::space::M);
+            ui.horizontal(|ui| match r.precondition.as_str() {
+                "REACHABILITY" => {
+                    if controls::ghost_small(ui, copy::REFUSED_SEE_PEERS).clicked() {
+                        self.tab = Tab::Peers;
+                        clear = true;
+                    }
+                }
+                "FRESHNESS" => {
+                    let pulling = d.pulls.iter().find(|p| p.path == r.path);
+                    if let Some(p) = pulling {
+                        ui.label(
+                            egui::RichText::new(copy::refused_pull_progress(p.percent))
+                                .font(theme::font(theme::step::META, theme::fam_mono()))
+                                .color(theme::ink_muted()),
+                        );
+                    }
+                    if controls::ghost_small(ui, copy::REFUSED_RETRY).clicked() {
+                        clear = true;
+                    }
+                }
+                _ => {
+                    if controls::ghost_small(ui, copy::REFUSED_RETRY).clicked() {
+                        clear = true;
+                    }
+                }
+            });
+        });
+        ui.add_space(theme::space::M);
+        if clear {
+            self.refusal = None;
+            if let Ok(mut g) = self.shared.lock() {
+                g.refusal = None;
+            }
+        }
+    }
+
+    /// The session's less-used operations, every one of which the CLI has had
+    /// all along and the window had none of.
+    fn session_menu(&mut self, ui: &mut egui::Ui, dir: &Path, running: bool) {
+        let trigger = controls::ghost_small(ui, copy::MENU_MORE);
+        let mut chosen: Option<Cmd> = None;
+        let mut rekey = false;
+        egui::Popup::menu(&trigger).show(|ui| {
+            ui.set_min_width(200.0);
+            // Everything here needs a live daemon to answer, so the menu says
+            // so rather than offering verbs that can only fail.
+            ui.add_enabled_ui(running, |ui| {
+                if ui.button(copy::MENU_DOCTOR).clicked() {
+                    chosen = Some(Cmd::Doctor {
+                        dir: dir.to_path_buf(),
+                    });
+                    ui.close();
+                }
+                if ui.button(copy::MENU_DASHBOARD).clicked() {
+                    chosen = Some(Cmd::Dashboard {
+                        dir: dir.to_path_buf(),
+                    });
+                    ui.close();
+                }
+                if ui.button(copy::MENU_GC).clicked() {
+                    chosen = Some(Cmd::Gc {
+                        dir: dir.to_path_buf(),
+                    });
+                    ui.close();
+                }
+            });
+            ui.separator();
+            if ui.button(copy::MENU_REKEY).clicked() {
+                rekey = true;
+                ui.close();
+            }
+        });
+        if let Some(c) = chosen {
+            self.send(c);
+        }
+        if rekey {
+            self.ask(
+                copy::REKEY_TITLE,
+                copy::REKEY_BODY.to_string(),
+                copy::REKEY_VERB,
+                true,
+                Cmd::Rekey {
+                    dir: dir.to_path_buf(),
+                },
+            );
+        }
+    }
+
+    /// Everything the worker is doing for this session, with the step it has
+    /// reached and a way out. Before this, a click on Lock and a click on
+    /// nothing looked the same until a toast arrived seconds later.
+    fn working_band(&mut self, ui: &mut egui::Ui, dir: &str, now: f64) {
+        let mine: Vec<InFlight> = self
+            .inflight
+            .iter()
+            .filter(|f| f.dir == dir)
+            .cloned()
+            .collect();
+        if mine.is_empty() {
+            return;
+        }
+        let mut cancel = None;
+        register::notice(ui, theme::Custody::Mine, |ui| {
+            for f in &mine {
+                ui.horizontal(|ui| {
+                    ceremony::loading_mark(ui, theme::sized(theme::step::LABEL));
+                    ui.label(
+                        egui::RichText::new(copy::working_step(f.what, &f.subject, f.step))
+                            .font(theme::font(
+                                theme::step::BODY,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink()),
+                    );
+                    // A command that has run long enough to worry about says so
+                    // rather than leaving the reader to guess whether it hung.
+                    if now - f.started > SLOW_AFTER {
+                        register::tag(ui, copy::WORKING_SLOW, theme::custody_stale());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if f.cancelling {
+                            ui.label(
+                                egui::RichText::new(copy::WORKING_CANCEL)
+                                    .font(theme::font(
+                                        theme::step::META,
+                                        egui::FontFamily::Proportional,
+                                    ))
+                                    .color(theme::ink_faint()),
+                            );
+                        } else if controls::ghost_small(ui, copy::WORKING_CANCEL).clicked() {
+                            cancel = Some(f.id);
+                        }
+                    });
+                });
+            }
+        });
+        ui.add_space(theme::space::M);
+        if let Some(id) = cancel {
+            self.send(Cmd::Cancel(id));
+        }
+    }
+
+    /// Says how old the data on screen is when a session stops answering, so a
+    /// wedged daemon is never mistaken for a quiet one.
+    fn staleness_line(&mut self, ui: &mut egui::Ui, dir: &str, now: f64) {
+        match self.reach.get(dir).copied().unwrap_or_default() {
+            Reach::Live => {}
+            Reach::Slow => {
+                ui.label(
+                    egui::RichText::new(copy::REACH_SLOW)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_faint()),
+                );
+                ui.add_space(theme::space::S);
+            }
+            Reach::Stalled => {
+                let age = self
+                    .fetched_at
+                    .get(dir)
+                    .map(|t| (now - t).max(0.0) as u64)
+                    .unwrap_or(0);
+                register::notice(ui, theme::Custody::Stale, |ui| {
+                    ui.label(
+                        egui::RichText::new(copy::stale_for(age))
+                            .font(theme::font(
+                                theme::step::BODY,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_muted()),
+                    );
+                });
+                ui.add_space(theme::space::M);
+            }
+        }
+    }
+
+    /// Whether the worker is already acting on this path, so the view can
+    /// disable the control rather than let the user queue a second write.
+    fn busy_with(&self, dir: &str, subject: &str) -> bool {
+        self.inflight
+            .iter()
+            .any(|f| f.dir == dir && f.subject == subject)
+    }
+
+    /// Renaming a synced path. A rename in the file manager is half a delete,
+    /// and the delete half is reverted by design, so this is the only way to do
+    /// it — and it is a guided lease-move-publish, not a local file operation.
+    fn rename_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some((from, _)) = self.rename.clone() else {
+            return;
+        };
+        let Some(sel) = self.selected.clone() else {
+            self.rename = None;
+            return;
+        };
+        let mut go = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("rename"))
+            .backdrop_color(theme::scrim())
+            .frame(register::overlay())
+            .show(ui.ctx(), |ui| {
+                ui.set_width(460.0);
+                ui.label(
+                    egui::RichText::new(copy::RENAME_TITLE)
+                        .font(theme::font(theme::step::TITLE, theme::fam_serif()))
+                        .color(theme::ink()),
+                );
+                ui.add_space(theme::space::S);
+                ui.label(
+                    egui::RichText::new(copy::RENAME_BODY)
+                        .font(theme::font(
+                            theme::step::BODY,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+                ui.add_space(theme::space::M);
+                ui.label(
+                    egui::RichText::new(&from)
+                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                        .color(theme::ink_faint()),
+                );
+                ui.add_space(theme::space::S);
+                let valid = if let Some((_, to)) = self.rename.as_mut() {
+                    let trimmed = to.trim().to_string();
+                    let ok = !trimmed.is_empty() && trimmed != from;
+                    let state = if trimmed.is_empty() {
+                        fields::FieldState::Neutral
+                    } else if ok {
+                        fields::FieldState::Valid
+                    } else {
+                        fields::FieldState::Invalid
+                    };
+                    let r = fields::text_field(ui, to, copy::RENAME_TITLE, 400.0, state);
+                    if !self.rename_focused {
+                        r.request_focus();
+                        self.rename_focused = true;
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && ok {
+                        go = true;
+                    }
+                    ok
+                } else {
+                    false
+                };
+                ui.add_space(theme::space::M);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Disabled rather than silently doing nothing, which is
+                        // what an empty-name click used to do elsewhere.
+                        let r = ui
+                            .add_enabled_ui(valid, |ui| {
+                                components::bevel_primary(ui, copy::RENAME_VERB)
+                            })
+                            .inner;
+                        if r.clicked() {
+                            go = true;
+                        }
+                        if controls::ghost_button(ui, copy::ACTION_CANCEL).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if go && let Some((from, to)) = self.rename.take() {
+            self.rename_focused = false;
+            self.send(Cmd::Move {
+                dir: PathBuf::from(&sel),
+                from,
+                to: to.trim().to_string(),
+            });
+            return;
+        }
+        if close || modal.should_close() {
+            self.rename = None;
+            self.rename_focused = false;
+        }
+    }
+
+    /// A long answer — a diff, a doctor report, a dashboard address — shown as
+    /// a real modal rather than crammed into a four-second toast.
+    fn report_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(r) = self.report.clone() else {
+            return;
+        };
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("report"))
+            .backdrop_color(theme::scrim())
+            .frame(register::overlay())
+            .show(ui.ctx(), |ui| {
+                ui.set_width(640.0);
+                ui.label(
+                    egui::RichText::new(&r.title)
+                        .font(theme::font(theme::step::TITLE, theme::fam_serif()))
+                        .color(if r.failed {
+                            theme::custody_blocked()
+                        } else {
+                            theme::ink()
+                        }),
+                );
+                ui.add_space(theme::space::M);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&r.body)
+                                .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                                .color(theme::ink_muted()),
+                        );
+                    });
+                ui.add_space(theme::space::M);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if controls::ghost_button(ui, copy::REPORT_CLOSE).clicked() {
+                            close = true;
+                        }
+                        if controls::ghost_button(ui, copy::REPORT_COPY).clicked() {
+                            ui.ctx().copy_text(r.body.clone());
+                        }
+                        if let Some(link) = &r.link
+                            && components::bevel_primary(ui, copy::REPORT_OPEN).clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(link));
+                        }
+                    });
+                });
+            });
+        if close || modal.should_close() {
+            self.report = None;
+        }
+    }
+
+    /// The register a tab shows before its detail has arrived: the ruler the
+    /// real entries will land in, with blanks where they will be written.
+    fn tab_waiting(&mut self, ui: &mut egui::Ui) {
+        let cols = [
+            register::Col::new("", register::ColW::Flex(3.0)),
+            register::Col::new("", register::ColW::Fixed(78.0)).right(),
+            register::Col::new("", register::ColW::Fixed(132.0)),
+        ];
+        register::Register::new("waiting", &cols).show(ui, register::Content::Loading, |_| {});
+    }
+
+    /// Runs a narrative (non-tabular) tab inside its own scroll area.
+    fn scrolled(
+        &mut self,
+        ui: &mut egui::Ui,
+        salt: &str,
+        add: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
         egui::ScrollArea::vertical()
+            .id_salt(salt)
             .auto_shrink([false, false])
-            .show(ui, |ui| match self.tab {
-                Tab::Overview => self.tab_overview(ui, d),
-                Tab::Peers => self.tab_peers(ui, d),
-                Tab::Files => self.tab_files(ui, &dir, d),
-                Tab::Conflicts => self.tab_conflicts(ui, &dir, d),
-                Tab::History => self.tab_history(ui, &dir, d),
-                Tab::Audit => self.tab_audit(ui, d),
-                Tab::Settings => self.tab_settings(ui, &dir, d),
+            .show(ui, |ui| add(self, ui));
+    }
+
+    /// The session's title page.
+    ///
+    /// Every other tab is a register. This one is not: it answers "what is the
+    /// state of this folder" in a sentence, then says what — if anything —
+    /// needs the reader, then shows what has been moving. The invite is a
+    /// setup action and lives behind a disclosure rather than sitting
+    /// permanently at the foot of a monitoring view.
+    fn tab_overview(&mut self, ui: &mut egui::Ui, d: &Detail) {
+        let standing = copy::Standing {
+            running: d.running,
+            strict: d.strict,
+            files: d.files_total.max(d.files.len()),
+            held_by_you: d.files.iter().filter(|f| f.mine_lock).count(),
+            held_by_peers: d
+                .files
+                .iter()
+                .filter(|f| f.locked_by.is_some() && !f.mine_lock)
+                .count(),
+            conflicts: d.conflicts.len(),
+            peers_online: d.members.iter().filter(|m| m.online).count(),
+            peers_total: d.members.len(),
+        };
+
+        ui.add_space(theme::space::M);
+        ui.label(
+            egui::RichText::new(copy::standing(&standing))
+                .font(theme::font(theme::step::DISPLAY, theme::fam_serif()))
+                .color(theme::ink()),
+        );
+        ui.add_space(theme::space::M);
+
+        // Only what applies. An untroubled session says its sentence and stops.
+        for a in copy::attention(&standing) {
+            let kind = match a {
+                copy::Attention::Conflicts(_) => theme::Custody::Quarantined,
+                copy::Attention::NoPeers => theme::Custody::Blocked,
+                copy::Attention::Unpublished(_) => theme::Custody::Mine,
+                copy::Attention::Stopped => theme::Custody::Free,
+            };
+            let mut go = false;
+            register::notice(ui, kind, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(a.line())
+                            .font(theme::font(
+                                theme::step::BODY,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(v) = a.verb()
+                            && controls::ghost_small(ui, v).clicked()
+                        {
+                            go = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(theme::space::S);
+            if go {
+                match a {
+                    copy::Attention::Conflicts(_) => self.tab = Tab::Conflicts,
+                    copy::Attention::NoPeers => self.tab = Tab::Peers,
+                    copy::Attention::Unpublished(_) => self.tab = Tab::Files,
+                    copy::Attention::Stopped => {
+                        self.send(Cmd::Start(PathBuf::from(&d.dir)));
+                    }
+                }
+            }
+        }
+
+        // The mesh in one line rather than a second peer list: the Peers tab
+        // renders the same members in more detail, and two renderings of one
+        // record taught the reader to distrust both.
+        register::heading(ui, copy::OVERVIEW_STATE);
+        let cols = [
+            register::Col::new("", register::ColW::Flex(2.0)),
+            register::Col::new("", register::ColW::Flex(3.0)),
+        ];
+        let rows: Vec<(&str, String)> = vec![
+            (
+                copy::STATE_MODE,
+                if d.strict {
+                    copy::MODE_STRICT.to_string()
+                } else {
+                    copy::MODE_EASY.to_string()
+                },
+            ),
+            (
+                copy::STATE_ROLE,
+                if d.role.is_empty() {
+                    copy::UNKNOWN.to_string()
+                } else {
+                    d.role.clone()
+                },
+            ),
+            (copy::STATE_FILES, figures::count(standing.files, "file")),
+            (
+                copy::STATE_PEERS,
+                format!("{} of {}", standing.peers_online, standing.peers_total),
+            ),
+            (
+                copy::STATE_CONFLICTS,
+                copy::plural(standing.conflicts, "copy", "copies"),
+            ),
+        ];
+        register::Register::new("session-state", &cols)
+            .no_margin()
+            .show(ui, register::Content::Entries(rows.len()), |e| {
+                let (k, v) = &rows[e.index()];
+                e.no_mark();
+                let k = *k;
+                e.cell(|ui| {
+                    ui.label(
+                        egui::RichText::new(k)
+                            .font(theme::font(
+                                theme::step::LABEL,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_muted()),
+                    );
+                });
+                let v = v.clone();
+                e.cell(|ui| {
+                    ui.label(
+                        egui::RichText::new(&v)
+                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                            .color(theme::ink()),
+                    );
+                });
+            });
+
+        self.overview_movement(ui, d);
+        self.overview_invite(ui, d);
+    }
+
+    /// Transfers and events are one stream — what has moved, and what has
+    /// happened — so they are one register rather than a progress card above a
+    /// bulleted list in a different visual language.
+    fn overview_movement(&mut self, ui: &mut egui::Ui, d: &Detail) {
+        let pulls = d.pulls.len();
+        let events = d.events.len();
+        if pulls == 0 && events == 0 {
+            return;
+        }
+        register::heading(ui, copy::OVERVIEW_MOVEMENT);
+
+        if d.backlog > 0 || d.resuming > 0 || d.download_limit_bps > 0 {
+            ui.label(
+                egui::RichText::new(copy::transfer_meta(
+                    d.backlog,
+                    d.resuming,
+                    (d.download_limit_bps > 0).then(|| human_bytes(d.download_limit_bps)),
+                ))
+                .font(theme::font(
+                    theme::step::META,
+                    egui::FontFamily::Proportional,
+                ))
+                .color(theme::ink_faint()),
+            );
+            ui.add_space(theme::space::S);
+        }
+
+        let cols = [
+            register::Col::new("what", register::ColW::Flex(3.0)),
+            register::Col::new("progress", register::ColW::Fixed(150.0)),
+            register::Col::new("rate", register::ColW::Fixed(96.0)).right(),
+        ];
+        register::Register::new("movement", &cols)
+            .max_height(theme::density().row_h() * 8.0)
+            .show(ui, register::Content::Entries(pulls + events), |e| {
+                e.no_mark();
+                if e.index() < pulls {
+                    let p = &d.pulls[e.index()];
+                    let path = p.path.clone();
+                    e.cell(|ui| {
+                        ui.label(
+                            egui::RichText::new(&path)
+                                .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                                .color(theme::ink()),
+                        );
+                    });
+                    let share = p.percent as f32 / 100.0;
+                    let done = human_bytes(p.bytes_done);
+                    let whole = human_bytes(p.bytes_total);
+                    e.cell(|ui| {
+                        ui.vertical(|ui| {
+                            components::progress_gold(ui, share);
+                            ui.label(
+                                egui::RichText::new(format!("{done} of {whole}"))
+                                    .font(theme::font(theme::step::META, theme::fam_mono()))
+                                    .color(theme::ink_faint()),
+                            );
+                        });
+                    });
+                    e.figure(&format!("{}/s", human_bytes(p.rate)), theme::ink_muted());
+                } else {
+                    let ev = &d.events[events - 1 - (e.index() - pulls)];
+                    let text = ev.text.clone();
+                    e.cell(|ui| {
+                        controls::diamond_bullet(ui);
+                        ui.label(
+                            egui::RichText::new(&text)
+                                .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                                .color(theme::ink_muted()),
+                        );
+                    });
+                    e.cell(|_| {});
+                    e.cell(|_| {});
+                }
             });
     }
 
-    fn tab_overview(&mut self, ui: &mut egui::Ui, d: &Detail) {
-        components::ledger_stats(
-            ui,
-            &[
-                (format!("{}", d.files_total.max(d.files.len())), "files"),
-                (if d.strict { "strict" } else { "easy" }.to_string(), "mode"),
-                (
-                    if d.role.is_empty() { "?" } else { &d.role }.to_string(),
-                    "role",
-                ),
-                (
-                    format!("{}", d.members.iter().filter(|m| m.online).count()),
-                    "peers online",
-                ),
-                (format!("{}", d.conflicts.len()), "conflicts"),
-            ],
-        );
-        ui.add_space(6.0);
+    /// Bringing someone in is a setup act, not something to monitor, so it sits
+    /// behind a disclosure — and the ticket it mints is scoped, which the
+    /// window previously could not express at all.
+    fn overview_invite(&mut self, ui: &mut egui::Ui, d: &Detail) {
+        register::heading(ui, copy::OVERVIEW_INVITE);
+        let open = self.invite_open;
+        ui.horizontal(|ui| {
+            if controls::chevron(ui, open).clicked() {
+                self.invite_open = !open;
+            }
+            ui.label(
+                egui::RichText::new(copy::INVITE_CAUTION)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_faint()),
+            );
+        });
+        if !open {
+            return;
+        }
+        ui.add_space(theme::space::S);
 
-        theme::section(ui, "Members");
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if d.members.is_empty() {
-                ui.label(
-                    egui::RichText::new(if d.running {
-                        copy::MEMBERS_EMPTY_RUNNING
-                    } else {
-                        copy::MEMBERS_EMPTY_STOPPED
-                    })
-                    .color(DIM),
-                );
-            } else {
-                for m in &d.members {
-                    ui.horizontal(|ui| {
-                        health::signal_arcs(
-                            ui,
-                            telemetry::grade_lit(&m.grade),
-                            if m.online { GOOD } else { theme::FAINT },
-                        );
-                        let name = m.name.clone().unwrap_or_else(|| m.id_short.clone());
-                        ui.label(
-                            egui::RichText::new(name)
-                                .family(theme::fam_medium())
-                                .color(INK),
-                        );
-                        if m.via_lan {
-                            theme::pill(ui, "LAN", theme::LAPIS);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(match m.rtt_ms {
-                                    Some(r) => format!("{r} ms"),
-                                    None => "—".into(),
-                                })
-                                .size(11.5)
-                                .color(DIM),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{} · {}", m.grade, m.conn))
-                                    .size(11.5)
-                                    .color(theme::FAINT),
-                            );
-                        });
-                    });
+        // A ticket carries the session secret, so who may use it and for how
+        // long are the two questions worth asking before minting one.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(copy::INVITE_ROLE)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_muted()),
+            );
+            for r in copy::INVITE_ROLES {
+                if choice(ui, r, self.invite_role == *r) {
+                    self.invite_role = (*r).to_string();
                 }
             }
         });
-
-        if !d.pulls.is_empty() || d.backlog > 0 || d.resuming > 0 {
-            ui.add_space(4.0);
-            theme::section(ui, "Transfers");
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for p in &d.pulls {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&p.path).size(12.0).color(INK));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} / {} · {}% · {}/s",
-                                    human_bytes(p.bytes_done),
-                                    human_bytes(p.bytes_total),
-                                    p.percent,
-                                    human_bytes(p.rate)
-                                ))
-                                .size(11.0)
-                                .color(DIM),
-                            );
-                        });
-                    });
-                    components::progress_gold(ui, p.percent as f32 / 100.0);
-                    ui.add_space(2.0);
+        ui.add_space(theme::space::XS);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(copy::INVITE_EXPIRY)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_muted()),
+            );
+            for (label, ms) in copy::INVITE_TTLS {
+                if choice(ui, label, self.invite_ttl_ms == *ms) {
+                    self.invite_ttl_ms = *ms;
                 }
-                let mut meta = format!("backlog {} · resuming {}", d.backlog, d.resuming);
-                if d.download_limit_bps > 0 {
-                    meta.push_str(&format!(
-                        " · capped {}/s",
-                        human_bytes(d.download_limit_bps)
-                    ));
-                }
-                ui.label(egui::RichText::new(meta).size(10.5).color(theme::FAINT));
+            }
+        });
+        ui.add_space(theme::space::M);
+        if components::bevel_primary(ui, copy::INVITE_MINT).clicked() {
+            self.send(Cmd::Invite {
+                dir: PathBuf::from(&d.dir),
+                role: (self.invite_role != copy::INVITE_ROLE_DEFAULT)
+                    .then(|| self.invite_role.clone()),
+                ttl_ms: self.invite_ttl_ms,
             });
         }
 
-        if !d.events.is_empty() {
-            ui.add_space(4.0);
-            theme::section(ui, "Activity");
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for e in d.events.iter().rev().take(8) {
-                    ui.horizontal(|ui| {
-                        controls::diamond_bullet(ui);
-                        ui.label(
-                            egui::RichText::new(&e.text)
-                                .size(11.5)
-                                .color(DIM)
-                                .family(egui::FontFamily::Monospace),
-                        );
-                    });
-                }
-            });
-        }
-
-        ui.add_space(4.0);
-        theme::section(ui, "Invite");
         let qr = d.invite.as_ref().and_then(|t| self.qr_texture(ui.ctx(), t));
-        components::notched_card(ui, Some(ACCENT), |ui| {
-            ui.set_width(ui.available_width());
-            match &d.invite {
-                Some(t) => {
-                    ui.label(
-                        egui::RichText::new(copy::INVITE_CAUTION)
-                            .size(11.5)
-                            .color(DIM),
+        match &d.invite {
+            Some(t) => {
+                ui.add_space(theme::space::M);
+                ceremony::ticket_card(ui, t, qr.as_ref());
+                if controls::ghost_button(ui, copy::INVITE_COPY).clicked() {
+                    ui.ctx().copy_text(t.clone());
+                    self.toasts.push(
+                        copy::TOAST_TICKET_COPIED.into(),
+                        toasts::Kind::Info,
+                        ui.input(|i| i.time),
                     );
-                    ceremony::ticket_card(ui, t, qr.as_ref());
-                    if components::bevel_primary(ui, "Copy ticket").clicked() {
-                        ui.ctx().copy_text(t.clone());
-                        self.toasts.push(
-                            copy::TOAST_TICKET_COPIED.into(),
-                            toasts::Kind::Info,
-                            ui.input(|i| i.time),
-                        );
-                    }
-                }
-                None => {
-                    ui.label(egui::RichText::new(copy::INVITE_EMPTY).color(DIM));
                 }
             }
-        });
+            None => {
+                ui.add_space(theme::space::S);
+                ui.label(
+                    egui::RichText::new(copy::INVITE_EMPTY)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_faint()),
+                );
+            }
+        }
     }
 
     fn tab_peers(&mut self, ui: &mut egui::Ui, d: &Detail) {
-        if d.members.is_empty() {
-            components::empty_state(
-                ui,
-                copy::PEERS_EMPTY_TITLE,
-                if d.running {
-                    copy::PEERS_EMPTY_RUNNING
-                } else {
-                    copy::PEERS_EMPTY_STOPPED
-                },
-            );
-            return;
-        }
-        ui.label(egui::RichText::new(copy::PEERS_INTRO).size(11.5).color(DIM));
+        ui.label(
+            egui::RichText::new(copy::PEERS_INTRO)
+                .font(theme::font(
+                    theme::step::META,
+                    egui::FontFamily::Proportional,
+                ))
+                .color(theme::ink_muted()),
+        );
         rhythm::space(ui, 2);
 
-        // The mesh as a shape before the mesh as a list.
+        // The mesh as a shape before the mesh as a list — but only when there
+        // is a mesh. With nobody to plot, the sky is a large empty circle sitting
+        // on top of the answer, which is the register's own empty state.
         let stars: Vec<constellation::Star<'_>> = d
             .members
             .iter()
@@ -2766,562 +2546,1268 @@ impl App {
                 grade: Some(m.grade.as_str()),
             })
             .collect();
-        let width = ui.available_width();
-        let height = constellation::desired_height(width, stars.len());
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-        let now = ui.input(|i| i.time);
-        if self.sky_key.as_deref() != Some(d.dir.as_str()) {
-            self.sky_key = Some(d.dir.clone());
-            self.sky_start = now;
-        }
-        let sky_t = (((now - self.sky_start) / SKY_REVEAL) as f32).clamp(0.0, 1.0);
-        if sky_t < 1.0 {
-            // Nothing else drives frames this fast; REFRESH is 1.5s.
-            ui.ctx().request_repaint();
-        }
-        let hovered = constellation::sky(ui, rect, &stars, sky_t);
-        rhythm::space(ui, 2);
+        let hovered = if stars.is_empty() {
+            None
+        } else {
+            let width = ui.available_width();
+            let height = constellation::desired_height(width, stars.len());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            let now = ui.input(|i| i.time);
+            if self.sky_key.as_deref() != Some(d.dir.as_str()) {
+                self.sky_key = Some(d.dir.clone());
+                self.sky_start = now;
+            }
+            let sky_t = (((now - self.sky_start) / SKY_REVEAL) as f32).clamp(0.0, 1.0);
+            if sky_t < 1.0 {
+                // Nothing else drives frames this fast; REFRESH is 1.5s.
+                ui.ctx().request_repaint();
+            }
+            let h = constellation::sky(ui, rect, &stars, sky_t);
+            rhythm::space(ui, 2);
+            h
+        };
 
-        for (i, m) in d.members.iter().enumerate() {
+        // Sampled before the register so the row closure needs no borrow of
+        // `self`: the whole point of the table is that every peer's figures sit
+        // in one column, and that only works if they are gathered up front.
+        let rows: Vec<PeerRow> = d
+            .members
+            .iter()
+            .map(|m| PeerRow {
+                rtt: if has_path(m) {
+                    self.telemetry.last_ms(&m.id_short).or(m.rtt_ms)
+                } else {
+                    None
+                },
+                series: self.telemetry.series(&m.id_short),
+                lit: telemetry::grade_lit(&m.grade),
+            })
+            .collect();
+
+        let cols = [
+            register::Col::new("", register::ColW::Fixed(26.0)),
+            register::Col::new("peer", register::ColW::Flex(2.0)),
+            register::Col::new("id", register::ColW::Fixed(92.0)),
+            register::Col::new("link", register::ColW::Fixed(126.0)),
+            register::Col::new("rtt", register::ColW::Fixed(96.0)).right(),
+            register::Col::new("trend", register::ColW::Fixed(128.0)),
+            register::Col::new("up / down", register::ColW::Fixed(132.0)),
+        ];
+        let content = if let Some(err) = &d.error {
+            register::Content::Failed {
+                what: copy::PEERS_FAILED,
+                because: err,
+            }
+        } else if d.members.is_empty() {
+            register::Content::Empty {
+                title: copy::PEERS_EMPTY_TITLE,
+                hint: if d.running {
+                    copy::PEERS_EMPTY_RUNNING
+                } else {
+                    copy::PEERS_EMPTY_STOPPED
+                },
+            }
+        } else {
+            register::Content::Entries(d.members.len())
+        };
+
+        let out = register::Register::new("peers", &cols).show(ui, content, |e| {
+            let (Some(m), Some(r)) = (d.members.get(e.index()), rows.get(e.index())) else {
+                return;
+            };
             let grade_color = match m.grade.as_str() {
-                "Good" => GOOD,
-                "Fair" => WARN,
-                "Poor" => BAD,
-                _ => theme::FAINT,
+                "Good" => theme::custody_good(),
+                "Fair" => theme::custody_stale(),
+                "Poor" => theme::custody_blocked(),
+                _ => theme::ink_faint(),
             };
-            // Hovering a star in the sky lights its row, so the shape and the
-            // list are legibly the same peers.
-            let lit = hovered == Some(i);
-            let card = if lit {
-                theme::card().stroke(egui::Stroke::new(1.0, ACCENT.linear_multiply(0.55)))
-            } else {
-                theme::card()
-            };
-            card.show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    health::signal_arcs(ui, telemetry::grade_lit(&m.grade), grade_color);
-                    let name = m.name.clone().unwrap_or_else(|| m.id_short.clone());
-                    ui.label(
-                        egui::RichText::new(name)
-                            .family(theme::fam_semibold())
-                            .size(13.5)
-                            .color(INK),
-                    );
-                    ui.label(
-                        egui::RichText::new(&m.id_short)
-                            .size(10.5)
-                            .family(egui::FontFamily::Monospace)
-                            .color(theme::FAINT),
-                    );
-                    theme::pill(ui, &m.conn, if m.online { GOOD } else { theme::FAINT });
-                    if m.via_lan {
-                        theme::pill(ui, "LAN", theme::LAPIS);
-                    } else if m.relay_url.is_some() {
-                        theme::pill(ui, "relay", DIM);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // No path, no round-trip. The ring's last sample is
-                        // history, and `online` alone can mean "seen in gossip
-                        // via someone else" — showing that as a live figure is
-                        // the same lie as showing an offline peer's last RTT.
-                        let live_rtt = if has_path(m) {
-                            self.telemetry.last_ms(&m.id_short).or(m.rtt_ms)
+            e.no_mark();
+            // Hovering a star in the sky selects its entry, so the shape and
+            // the table are legibly the same peers.
+            e.selected(hovered == Some(e.index()));
+
+            let lit = r.lit;
+            e.cell(|ui| health::signal_arcs(ui, lit, grade_color));
+
+            let name = m.name.clone().unwrap_or_else(|| m.id_short.clone());
+            e.cell(|ui| {
+                ui.label(
+                    egui::RichText::new(&name)
+                        .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                        .color(if m.online {
+                            theme::ink()
                         } else {
-                            None
-                        };
-                        ui.label(
-                            egui::RichText::new(match live_rtt {
-                                Some(r) if m.jitter_ms > 0.05 => {
-                                    format!("{r} ms ±{:.1}", m.jitter_ms)
-                                }
-                                Some(r) => format!("{r} ms"),
-                                None => "—".into(),
-                            })
-                            .size(11.0)
-                            .family(egui::FontFamily::Monospace)
-                            .color(DIM),
-                        );
-                        health::sparkline(
-                            ui,
-                            &self.telemetry.series(&m.id_short),
-                            egui::vec2(120.0, 24.0),
-                            if m.online { theme::LAPIS } else { theme::FAINT },
-                        );
-                    });
-                });
-                ui.horizontal(|ui| {
-                    health::rate_arrows(
-                        ui,
-                        &telemetry::fmt_rate(m.rate_tx),
-                        &telemetry::fmt_rate(m.rate_rx),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "lifetime · up {} · down {}",
-                            telemetry::fmt_total(m.bytes_tx),
-                            telemetry::fmt_total(m.bytes_rx)
-                        ))
-                        .size(10.5)
-                        .color(theme::FAINT),
-                    );
-                    if let Some(ms) = m.ttd_ms {
-                        theme::pill(ui, &format!("direct in {:.1}s", ms as f64 / 1000.0), GOOD);
-                    }
-                    if m.flaps > 0 {
-                        theme::pill(ui, &format!("{} flaps/min", m.flaps), WARN);
-                    }
-                });
+                            theme::ink_muted()
+                        }),
+                );
             });
-            ui.add_space(4.0);
+            let id = m.id_short.clone();
+            e.cell(|ui| {
+                ui.label(
+                    egui::RichText::new(&id)
+                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                        .color(theme::ink_faint()),
+                );
+            });
+
+            let conn = m.conn.clone();
+            let online = m.online;
+            let lan = m.via_lan;
+            let relay = m.relay_url.is_some();
+            let flaps = m.flaps;
+            e.cell(|ui| {
+                register::tag(
+                    ui,
+                    &conn,
+                    if online {
+                        theme::custody_good()
+                    } else {
+                        theme::ink_faint()
+                    },
+                );
+                if lan {
+                    register::tag(ui, copy::PEER_LAN, theme::custody_peer());
+                } else if relay {
+                    register::tag(ui, copy::PEER_RELAY, theme::ink_muted());
+                }
+                if flaps > 0 {
+                    register::tag(ui, &format!("{flaps}/min"), theme::custody_stale());
+                }
+            });
+
+            // No path, no round-trip. The ring's last sample is history, and
+            // `online` alone can mean "seen in gossip via someone else" —
+            // showing that as a live figure is the same lie as showing an
+            // offline peer its last RTT.
+            let rtt_text = match r.rtt {
+                Some(v) if m.jitter_ms > 0.05 => format!("{v} ms ±{:.1}", m.jitter_ms),
+                Some(v) => format!("{v} ms"),
+                None => "—".into(),
+            };
+            e.figure(
+                &rtt_text,
+                if r.rtt.is_some() {
+                    theme::ink_muted()
+                } else {
+                    theme::ink_faint()
+                },
+            );
+
+            let series = r.series.clone();
+            let trend_color = if online {
+                theme::custody_peer()
+            } else {
+                theme::ink_faint()
+            };
+            e.cell(|ui| {
+                let h = theme::density().row_h() - theme::space::M;
+                health::sparkline(ui, &series, egui::vec2(120.0, h), trend_color);
+            });
+
+            let up = telemetry::fmt_rate(m.rate_tx);
+            let down = telemetry::fmt_rate(m.rate_rx);
+            e.cell(|ui| health::rate_arrows(ui, &up, &down));
+
+            // Lifetime totals and the direct-path timing are detail, not a
+            // column — they belong on hover rather than widening every row.
+            let lifetime = copy::peer_lifetime(
+                &telemetry::fmt_total(m.bytes_tx),
+                &telemetry::fmt_total(m.bytes_rx),
+                m.ttd_ms,
+            );
+            e.response().clone().on_hover_text(lifetime);
+        });
+        if out.retry {
+            self.send(Cmd::Refresh);
         }
     }
 
     fn tab_files(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail) {
+        let now = ui.input(|i| i.time);
         ui.horizontal(|ui| {
             let out = fields::search_field(ui, &mut self.file_filter, copy::HINT_FILTER, 280.0);
             if out.cleared {
                 self.file_filter.clear();
+            }
+            // A new pattern is a new result set, so it starts at its first
+            // page rather than part-way through the previous one's.
+            if out.response.changed() {
+                self.file_offset = 0;
             }
             // Ctrl+F asked for this field; the tab switch only reaches it now.
             if std::mem::take(&mut self.focus_filter) {
                 out.response.request_focus();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let by_size = self.files_sort == grouping::SortMode::Size;
-                if ui
-                    .selectable_label(by_size, copy::FILES_SORT_SIZE)
-                    .clicked()
-                {
-                    self.files_sort = grouping::SortMode::Size;
-                }
-                if ui
-                    .selectable_label(!by_size, copy::FILES_SORT_NAME)
-                    .clicked()
-                {
-                    self.files_sort = grouping::SortMode::Name;
-                }
                 ui.label(
-                    egui::RichText::new(copy::FILES_SORT_LABEL)
-                        .size(10.5)
-                        .color(theme::FAINT),
+                    egui::RichText::new(figures::count(d.files_total, "file"))
+                        .font(theme::font(theme::step::META, theme::fam_mono()))
+                        .color(theme::ink_faint()),
                 );
             });
         });
+
+        // The daemon only publishes the first `FILES_LIST_MAX` paths, and the
+        // filter below runs over that slice — so say plainly that the rest are
+        // reachable from the CLI rather than implying the list is the folder.
         if d.files_truncated {
-            ui.label(
-                egui::RichText::new(copy::files_truncated(d.files.len(), d.files_total))
-                    .size(11.0)
-                    .color(WARN),
-            );
-        }
-        ui.add_space(4.0);
-        let filter = self.file_filter.to_lowercase();
-        let rows: Vec<FileRow> = d
-            .files
-            .iter()
-            .filter(|f| filter.is_empty() || f.path.to_lowercase().contains(&filter))
-            .cloned()
-            .collect();
-        if rows.is_empty() {
-            if filter.is_empty() {
-                components::empty_state(ui, copy::FILES_EMPTY_TITLE, copy::FILES_EMPTY_HINT);
-            } else {
-                ui.label(egui::RichText::new(copy::FILES_FILTER_EMPTY).color(DIM));
-            }
-            return;
-        }
-        // Grouped by top-level folder, each group carrying its share of the
-        // session's bytes — a flat list hides where the weight actually sits.
-        let keys: Vec<(String, u64)> = rows.iter().map(|f| (f.path.clone(), f.size)).collect();
-        for g in grouping::group_files(&keys, self.files_sort) {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if g.root {
-                    ui.label(egui::RichText::new(&g.name).size(11.5).color(theme::FAINT));
-                } else {
-                    controls::diamond_bullet(ui);
-                    ui.label(
-                        egui::RichText::new(&g.name)
-                            .family(theme::fam_semibold())
-                            .size(13.0)
-                            .color(INK),
-                    );
-                }
+            ui.add_space(theme::space::S);
+            register::notice(ui, theme::Custody::Stale, |ui| {
                 ui.label(
-                    egui::RichText::new(grouping::group_caption(
-                        g.indices.len(),
-                        &human_bytes(g.bytes),
-                        g.share,
-                    ))
-                    .size(10.5)
-                    .color(theme::FAINT),
+                    egui::RichText::new(copy::files_truncated(d.files.len(), d.files_total))
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
                 );
             });
-            components::progress_gold(ui, g.share);
-            ui.add_space(2.0);
-            for i in g.indices {
-                let Some(f) = rows.get(i) else { continue };
-                self.file_card(ui, dir, d, f);
+        }
+        ui.add_space(theme::space::M);
+
+        let filter = self.file_filter.to_lowercase();
+        let by_size = self.files_sort == grouping::SortMode::Size;
+        // A client-side filter over a capped list can only find what the cap
+        // let through, so anything the snapshot cannot answer goes to the
+        // daemon, which matches against the whole index.
+        let ask_daemon = d.running && (d.files_truncated || !filter.is_empty());
+        let served: Vec<FileRow>;
+        let rows: Vec<&FileRow> = if ask_daemon {
+            let want = (d.dir.clone(), filter.clone(), by_size, self.file_offset);
+            // Debounced: the query runs on the daemon's single actor, so one
+            // round trip per keystroke would put the whole session behind the
+            // user's typing. A sort or page change is not typing and goes at
+            // once.
+            if self.file_query.as_ref() != Some(&want) {
+                let typed = self.file_query.as_ref().is_some_and(|(dir, _, size, off)| {
+                    *dir == want.0 && *size == want.2 && *off == want.3
+                });
+                if self.file_query_due.is_none() {
+                    self.file_query_due = Some(if typed { now + SEARCH_DEBOUNCE } else { now });
+                }
+                if self.file_query_due.is_some_and(|due| now >= due) {
+                    self.file_query = Some(want.clone());
+                    self.file_query_due = None;
+                    self.send(Cmd::SearchFiles {
+                        dir: PathBuf::from(&d.dir),
+                        pattern: self.file_filter.clone(),
+                        by_size,
+                        desc: by_size,
+                        offset: self.file_offset,
+                    });
+                } else {
+                    // Nothing else drives a frame this soon; without this the
+                    // debounce would not fire until the next 1.5s refresh.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(SEARCH_DEBOUNCE));
+                }
+            } else {
+                self.file_query_due = None;
             }
+            served = match &self.file_page {
+                // Only an answer to *this* folder and *this* pattern; a stale
+                // page would read as the answer to what was just typed.
+                Some(p) if p.dir == d.dir && p.pattern.to_lowercase() == filter => p.rows.clone(),
+                _ => Vec::new(),
+            };
+            served.iter().collect()
+        } else {
+            self.file_query = None;
+            served = Vec::new();
+            let _ = &served;
+            d.files.iter().collect()
+        };
+
+        // Grouped by top-level folder so the weight of the session is visible;
+        // the groups are flattened into the same row stream as the files and
+        // their open version histories, which keeps every line one row tall and
+        // therefore keeps the whole register virtualised.
+        let keys: Vec<(String, u64)> = rows.iter().map(|f| (f.path.clone(), f.size)).collect();
+        let groups = grouping::group_files(&keys, self.files_sort);
+        let vctx = VersionCtx::new(d);
+        let mut lines: Vec<FileLine<'_>> = Vec::with_capacity(rows.len() + groups.len());
+        let mut folio = 0usize;
+        for g in &groups {
+            lines.push(FileLine::Group(g));
+            for i in &g.indices {
+                let Some(f) = rows.get(*i) else { continue };
+                folio += 1;
+                lines.push(FileLine::File(f, folio));
+                if self.open_versions.contains(&f.path)
+                    && let Some(vs) = d.versions.get(&f.path)
+                {
+                    for v in vs {
+                        lines.push(FileLine::Version(&f.path, v));
+                    }
+                }
+            }
+        }
+
+        let cols = [
+            register::Col::new("path", register::ColW::Flex(3.0)).sortable("name"),
+            register::Col::new("kind", register::ColW::Fixed(46.0)),
+            register::Col::new("bytes", register::ColW::Fixed(78.0))
+                .right()
+                .sortable("size"),
+            register::Col::new("custody", register::ColW::Fixed(132.0)),
+            register::Col::new("", register::ColW::Fixed(86.0)).right(),
+        ];
+        let content = if let Some(e) = &d.error {
+            register::Content::Failed {
+                what: copy::FILES_FAILED,
+                because: e,
+            }
+        } else if !lines.is_empty() {
+            register::Content::Entries(lines.len())
+        } else if filter.is_empty() {
+            register::Content::Empty {
+                title: copy::FILES_EMPTY_TITLE,
+                hint: copy::FILES_EMPTY_HINT,
+            }
+        } else {
+            register::Content::Empty {
+                title: copy::FILES_FILTER_EMPTY,
+                hint: copy::FILES_FILTER_EMPTY_HINT,
+            }
+        };
+
+        if ask_daemon
+            && let Some(page) = self.file_page.clone()
+            && page.dir == d.dir
+        {
+            ui.add_space(theme::space::S);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(copy::files_page(
+                        page.offset,
+                        page.rows.len(),
+                        page.matched,
+                    ))
+                    .font(theme::font(theme::step::META, theme::fam_mono()))
+                    .color(theme::ink_faint()),
+                );
+                if page.offset > 0 && controls::ghost_small(ui, copy::PAGE_PREV).clicked() {
+                    self.file_offset = page.offset.saturating_sub(page.rows.len().max(1));
+                }
+                if let Some(next) = page.next_offset
+                    && controls::ghost_small(ui, copy::PAGE_NEXT).clicked()
+                {
+                    self.file_offset = next;
+                }
+            });
+            ui.add_space(theme::space::S);
+        }
+
+        let sort_key = match self.files_sort {
+            grouping::SortMode::Size => "size",
+            grouping::SortMode::Name => "name",
+        };
+        let out = register::Register::new("files", &cols)
+            .sorted_by(sort_key, self.files_sort == grouping::SortMode::Size)
+            .show(ui, content, |e| match lines[e.index()] {
+                FileLine::Group(g) => self.file_group_line(e, g),
+                FileLine::File(f, folio) => self.file_line(e, dir, d, f, folio),
+                FileLine::Version(path, v) => self.version_line(e, dir, path, v, d.running, vctx),
+            });
+        if let Some(k) = out.sort {
+            self.files_sort = match k {
+                "size" => grouping::SortMode::Size,
+                _ => grouping::SortMode::Name,
+            };
+        }
+        if out.retry {
+            self.send(Cmd::Refresh);
         }
     }
 
-    /// One file row: name, type chip, size, lease seal, actions, and its
-    /// version history when expanded.
-    fn file_card(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail, f: &FileRow) {
+    /// A folder heading inside the files register: the group's name in the
+    /// engraved voice, its file count and its share of the session's bytes.
+    fn file_group_line(&mut self, e: &mut register::Entry<'_>, g: &grouping::Group) {
+        e.no_mark().divider();
+        let name = g.name.clone();
+        let root = g.root;
+        e.cell(|ui| {
+            ui.label(
+                egui::RichText::new(name)
+                    .font(theme::font(
+                        theme::step::LABEL,
+                        if root {
+                            egui::FontFamily::Proportional
+                        } else {
+                            theme::fam_serif()
+                        },
+                    ))
+                    .color(if root {
+                        theme::ink_faint()
+                    } else {
+                        theme::ink()
+                    }),
+            );
+        });
+        e.cell(|_| {});
+        e.figure(&human_bytes(g.bytes), theme::ink_faint());
+        let share = copy::group_share(g.indices.len(), g.share);
+        e.cell(|ui| {
+            ui.label(
+                egui::RichText::new(share)
+                    .font(theme::font(theme::step::META, theme::fam_mono()))
+                    .color(theme::ink_faint()),
+            );
+        });
+        e.cell(|_| {});
+    }
+
+    /// One file entry: path, kind, size, who holds it, and the one action its
+    /// state actually permits.
+    fn file_line(
+        &mut self,
+        e: &mut register::Entry<'_>,
+        dir: &Path,
+        d: &Detail,
+        f: &FileRow,
+        folio: usize,
+    ) {
+        let custody = file_custody(f, d.running);
+        e.custody(custody);
+        e.folio(folio);
+
         let open = self.open_versions.contains(&f.path);
         let has_versions = d.versions.contains_key(&f.path);
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                if has_versions && controls::chevron(ui, open).clicked() {
-                    if open {
-                        self.open_versions.remove(&f.path);
-                    } else {
-                        self.open_versions.insert(f.path.clone());
-                    }
+        let path = f.path.clone();
+        let mut toggle = false;
+        e.indent(1.0).cell(|ui| {
+            if has_versions {
+                if controls::chevron(ui, open).clicked() {
+                    toggle = true;
                 }
+            } else {
+                ui.add_space(theme::space::XL);
+            }
+            ui.label(
+                egui::RichText::new(&path)
+                    .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                    .color(theme::ink()),
+            );
+        });
+        if toggle {
+            if open {
+                self.open_versions.remove(&f.path);
+            } else {
+                self.open_versions.insert(f.path.clone());
+            }
+        }
+
+        let path_for_chip = f.path.clone();
+        e.cell(|ui| components::ext_chip(ui, &path_for_chip));
+        e.figure(&human_bytes(f.size), theme::ink_muted());
+
+        let word = match (&f.locked_by, f.mine_lock) {
+            (Some(_), true) => copy::CUSTODY_HELD_YOU.to_string(),
+            (Some(h), false) => format!("{} {}", copy::CUSTODY_HELD_BY, short(h)),
+            (None, _) => copy::CUSTODY_FREE.to_string(),
+        };
+        let held = f.locked_by.is_some();
+        e.cell(|ui| {
+            if held {
+                register::tag(ui, &word, custody.color());
+            } else {
                 ui.label(
-                    egui::RichText::new(&f.path)
-                        .family(theme::fam_medium())
-                        .color(INK),
+                    egui::RichText::new(&word)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_faint()),
                 );
-                components::ext_chip(ui, &f.path);
-                ui.label(
-                    egui::RichText::new(human_bytes(f.size))
-                        .size(11.5)
-                        .color(theme::FAINT),
-                );
-                match &f.locked_by {
-                    Some(h) if f.mine_lock => {
-                        let _ = h;
-                        components::seal_dot(ui, ACCENT, true);
-                        theme::pill(ui, "locked · you", ACCENT);
-                    }
-                    Some(h) => {
-                        components::seal_dot(ui, WARN, true);
-                        theme::pill(ui, &format!("locked · {}", short(h)), WARN);
-                    }
-                    None => {}
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if d.running {
-                        if f.locked_by.is_some() {
-                            if f.mine_lock && controls::ghost_small(ui, "Unlock").clicked() {
-                                self.send(Cmd::Unlock {
-                                    dir: dir.to_path_buf(),
-                                    path: f.path.clone(),
-                                });
-                            }
-                        } else if controls::ghost_small(ui, "Lock").clicked() {
-                            self.send(Cmd::Lock {
-                                dir: dir.to_path_buf(),
-                                path: f.path.clone(),
-                            });
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new(copy::FILES_STOPPED_ACTION)
-                                .size(10.5)
-                                .color(theme::FAINT),
-                        );
-                    }
-                });
-            });
-            if open && let Some(versions) = d.versions.get(&f.path) {
-                ui.add_space(2.0);
-                let ctx = VersionCtx::new(d);
-                for v in versions {
-                    self.version_row(ui, dir, &f.path, v, d.running, ctx);
-                }
             }
         });
-        ui.add_space(4.0);
+
+        // The daemon refuses every lease on a viewer or archive folder, so the
+        // control is disabled with the reason rather than offered and refused.
+        let may_edit = role_can_edit(&d.role);
+        let running = d.running;
+        let mine = f.mine_lock;
+        let mut action = None;
+        let mut wait = false;
+        let working = self.busy_with(&d.dir, &f.path);
+        e.cell(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if working {
+                    ceremony::loading_mark(ui, theme::sized(theme::step::META));
+                } else if !running {
+                    ui.label(
+                        egui::RichText::new(copy::FILES_STOPPED_ACTION)
+                            .font(theme::font(
+                                theme::step::META,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_faint()),
+                    );
+                } else if !may_edit {
+                    ui.add_enabled_ui(false, |ui| {
+                        let _ = controls::ghost_small(ui, copy::ACTION_LOCK);
+                    })
+                    .response
+                    .on_disabled_hover_text(copy::role_cannot_edit(&d.role));
+                } else if held {
+                    if mine {
+                        if controls::ghost_small(ui, copy::ACTION_UNLOCK).clicked() {
+                            action = Some(false);
+                        }
+                    } else if controls::ghost_small(ui, copy::ACTION_WAIT)
+                        .on_hover_text(copy::ACTION_WAIT_HOVER)
+                        .clicked()
+                    {
+                        action = Some(true);
+                        wait = true;
+                    }
+                } else if controls::ghost_small(ui, copy::ACTION_LOCK).clicked() {
+                    action = Some(true);
+                }
+            });
+        });
+        let mut menu: Option<FileMenu> = None;
+        e.response().clone().context_menu(|ui| {
+            ui.set_min_width(180.0);
+            if ui.button(copy::MENU_RENAME).clicked() {
+                menu = Some(FileMenu::Rename);
+                ui.close();
+            }
+            if ui.button(copy::MENU_DIFF).clicked() {
+                menu = Some(FileMenu::Diff);
+                ui.close();
+            }
+            if ui.button(copy::MENU_COPY_PATH).clicked() {
+                menu = Some(FileMenu::CopyPath);
+                ui.close();
+            }
+        });
+        match menu {
+            Some(FileMenu::Rename) => {
+                self.rename = Some((f.path.clone(), f.path.clone()));
+            }
+            Some(FileMenu::Diff) => {
+                // Against the newest kept version: "what changed since the
+                // last published state" is the question a diff answers here.
+                if let Some(v) = d.versions.get(&f.path).and_then(|vs| vs.first()) {
+                    self.send(Cmd::Diff {
+                        dir: dir.to_path_buf(),
+                        path: f.path.clone(),
+                        n: v.n as usize,
+                    });
+                } else {
+                    self.toasts.push(
+                        copy::DIFF_NO_VERSIONS.into(),
+                        toasts::Kind::Warn,
+                        ui_time(e),
+                    );
+                }
+            }
+            Some(FileMenu::CopyPath) => {
+                e.response().ctx.copy_text(f.path.clone());
+            }
+            None => {}
+        }
+
+        match action {
+            Some(true) if wait => self.send(Cmd::LockWait {
+                dir: dir.to_path_buf(),
+                path: f.path.clone(),
+            }),
+            Some(true) => self.send(Cmd::Lock {
+                dir: dir.to_path_buf(),
+                path: f.path.clone(),
+            }),
+            Some(false) => self.send(Cmd::Unlock {
+                dir: dir.to_path_buf(),
+                path: f.path.clone(),
+            }),
+            None => {}
+        }
     }
 
-    /// One version row (shared by Files expanders and the History tab).
-    fn version_row(
+    /// One version entry, ruled into whichever register is showing it. The
+    /// secondary verbs (pin, tag) live on the row's context menu so the action
+    /// lane carries only the one that matters; the tag editor borrows the path
+    /// lane, which is the only lane wide enough for a field.
+    fn version_line(
         &mut self,
-        ui: &mut egui::Ui,
+        e: &mut register::Entry<'_>,
         dir: &Path,
         path: &str,
         v: &VersionRow,
         running: bool,
         ctx: VersionCtx,
     ) {
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
+        e.no_mark();
+        let editing = self
+            .tag_edit
+            .as_ref()
+            .is_some_and(|(p, n, _)| p == path && *n == v.n as usize);
+
+        let mut commit: Option<Option<String>> = None;
+        let mut cancel = false;
+        let label = format!("v{}", v.n);
+        let when = fmt_ts_full(v.ts_ms);
+        let tag_text = v.tag.clone();
+        let tag_buf = self.tag_edit.as_mut().map(|(_, _, b)| b);
+        e.indent(2.0).cell(|ui| {
             ui.label(
-                egui::RichText::new(format!("v{}", v.n))
-                    .size(11.5)
-                    .family(egui::FontFamily::Monospace)
-                    .color(theme::LAPIS),
+                egui::RichText::new(&label)
+                    .font(theme::font(theme::step::DATA, theme::fam_mono_medium()))
+                    .color(theme::custody_peer()),
             );
-            ui.label(
-                egui::RichText::new(fmt_ts_full(v.ts_ms))
-                    .size(11.5)
-                    .color(DIM),
-            );
-            // Monospace so the padding actually lines the column up.
-            ui.label(
-                egui::RichText::new(figures::align(
-                    &figures::split(&human_bytes(v.size)),
-                    ctx.width,
-                ))
-                .size(11.5)
-                .family(egui::FontFamily::Monospace)
-                .color(DIM),
-            );
-            ui.label(
-                egui::RichText::new(figures::ago(v.ts_ms / 1000, ctx.now_s))
-                    .size(11.0)
-                    .color(theme::FAINT),
-            );
-            if v.pinned {
-                theme::pill(ui, "pinned", ACCENT);
+            if editing && let Some(buf) = tag_buf {
+                let r =
+                    fields::text_field(ui, buf, copy::HINT_TAG, 160.0, fields::FieldState::Neutral);
+                r.request_focus();
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let t = buf.trim().to_string();
+                    commit = Some(if t.is_empty() { None } else { Some(t) });
+                }
+                // Consumed, so Escape closes the editor without also reaching
+                // the overlay handlers that would close the whole view.
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    cancel = true;
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(&when)
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+                if let Some(t) = &tag_text {
+                    register::tag(ui, t, theme::custody_peer());
+                }
             }
-            if let Some(tag) = &v.tag {
-                theme::pill(ui, tag, theme::LAPIS);
+        });
+        if cancel {
+            self.tag_edit = None;
+        }
+        if let Some(name) = commit {
+            self.send(Cmd::Tag {
+                dir: dir.to_path_buf(),
+                path: path.to_string(),
+                n: v.n as usize,
+                name,
+            });
+            self.tag_edit = None;
+        }
+
+        self.version_tail(e, dir, path, v, running, ctx);
+    }
+
+    /// The lanes every version entry shares, whatever leads it: the pin mark,
+    /// the size, the age, the restore verb, and the context menu carrying the
+    /// secondary verbs.
+    fn version_tail(
+        &mut self,
+        e: &mut register::Entry<'_>,
+        dir: &Path,
+        path: &str,
+        v: &VersionRow,
+        running: bool,
+        ctx: VersionCtx,
+    ) {
+        let pinned = v.pinned;
+        e.cell(|ui| {
+            if pinned {
+                register::status_mark(ui, theme::gold());
             }
+        });
+        e.figure(
+            &figures::align(&figures::split(&human_bytes(v.size)), ctx.width),
+            theme::ink_muted(),
+        );
+        let age = figures::ago(v.ts_ms / 1000, ctx.now_s);
+        e.cell(|ui| {
+            ui.label(
+                egui::RichText::new(&age)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_faint()),
+            );
+        });
+
+        let mut restore = false;
+        e.cell(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !running {
+                if running {
+                    if controls::ghost_small(ui, copy::ACTION_RESTORE).clicked() {
+                        restore = true;
+                    }
+                } else {
                     ui.label(
                         egui::RichText::new(copy::VERSION_STOPPED_ACTION)
-                            .size(10.5)
-                            .color(theme::FAINT),
+                            .font(theme::font(
+                                theme::step::META,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_faint()),
                     );
-                    return;
-                }
-                if controls::ghost_small(ui, "Restore").clicked() {
-                    self.ask(
-                        copy::RESTORE_TITLE,
-                        copy::restore_body(path, v.n, &human_bytes(v.size)),
-                        "Restore",
-                        false,
-                        Cmd::Restore {
-                            dir: dir.to_path_buf(),
-                            path: path.to_string(),
-                            n: v.n as usize,
-                        },
-                    );
-                }
-                if controls::ghost_small(ui, if v.pinned { "Unpin" } else { "Pin" }).clicked() {
-                    self.send(Cmd::Pin {
-                        dir: dir.to_path_buf(),
-                        path: path.to_string(),
-                        n: v.n as usize,
-                        pinned: !v.pinned,
-                    });
-                }
-                let editing = self
-                    .tag_edit
-                    .as_ref()
-                    .is_some_and(|(p, n, _)| p == path && *n == v.n as usize);
-                if editing {
-                    let mut done: Option<Option<String>> = None;
-                    if let Some((_, _, buf)) = self.tag_edit.as_mut() {
-                        let r = fields::text_field(
-                            ui,
-                            buf,
-                            copy::HINT_TAG,
-                            110.0,
-                            fields::FieldState::Neutral,
-                        );
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let t = buf.trim().to_string();
-                            done = Some(if t.is_empty() { None } else { Some(t) });
-                        }
-                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            self.tag_edit = None;
-                        }
-                    }
-                    if let Some(name) = done {
-                        self.send(Cmd::Tag {
-                            dir: dir.to_path_buf(),
-                            path: path.to_string(),
-                            n: v.n as usize,
-                            name,
-                        });
-                        self.tag_edit = None;
-                    }
-                } else if controls::ghost_small(ui, "Tag").clicked() {
-                    self.tag_edit = Some((
-                        path.to_string(),
-                        v.n as usize,
-                        v.tag.clone().unwrap_or_default(),
-                    ));
                 }
             });
         });
+        if restore {
+            self.ask(
+                copy::RESTORE_TITLE,
+                copy::restore_body(path, v.n, &human_bytes(v.size)),
+                copy::ACTION_RESTORE,
+                false,
+                Cmd::Restore {
+                    dir: dir.to_path_buf(),
+                    path: path.to_string(),
+                    n: v.n as usize,
+                },
+            );
+        }
+
+        let mut pin_toggle = false;
+        let mut start_tag = false;
+        e.response().clone().context_menu(|ui| {
+            if ui
+                .button(if pinned {
+                    copy::ACTION_UNPIN
+                } else {
+                    copy::ACTION_PIN
+                })
+                .clicked()
+            {
+                pin_toggle = true;
+                ui.close();
+            }
+            if ui.button(copy::ACTION_TAG).clicked() {
+                start_tag = true;
+                ui.close();
+            }
+        });
+        if pin_toggle {
+            self.send(Cmd::Pin {
+                dir: dir.to_path_buf(),
+                path: path.to_string(),
+                n: v.n as usize,
+                pinned: !v.pinned,
+            });
+        }
+        if start_tag {
+            self.tag_edit = Some((
+                path.to_string(),
+                v.n as usize,
+                v.tag.clone().unwrap_or_default(),
+            ));
+        }
     }
 
     fn tab_history(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail) {
-        if d.versions.is_empty() {
-            components::empty_state(
-                ui,
-                copy::HISTORY_EMPTY_TITLE,
-                if d.running {
+        // Flattened newest-first across every path, with a day heading opening
+        // each run. The path is its own column rather than a label printed
+        // above every entry, so a file with thirty versions names itself once
+        // per line instead of thirty times over.
+        let mut all: Vec<(&String, &VersionRow)> = d
+            .versions
+            .iter()
+            .flat_map(|(p, vs)| vs.iter().map(move |v| (p, v)))
+            .collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.1.ts_ms));
+        let total = all.len();
+        all.truncate(HISTORY_MAX);
+
+        let mut lines: Vec<HistoryLine<'_>> = Vec::with_capacity(all.len());
+        let mut last_day = String::new();
+        for (path, v) in all {
+            let day = fmt_day(v.ts_ms);
+            if day != last_day {
+                lines.push(HistoryLine::Day(day.clone()));
+                last_day = day;
+            }
+            lines.push(HistoryLine::Version(path, v));
+        }
+
+        if total > HISTORY_MAX {
+            register::notice(ui, theme::Custody::Stale, |ui| {
+                ui.label(
+                    egui::RichText::new(copy::history_truncated(HISTORY_MAX, total))
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+            });
+            ui.add_space(theme::space::M);
+        }
+
+        let vctx = VersionCtx::new(d);
+        let cols = [
+            register::Col::new("version", register::ColW::Flex(3.0)),
+            register::Col::new("", register::ColW::Fixed(28.0)),
+            register::Col::new("bytes", register::ColW::Fixed(78.0)).right(),
+            register::Col::new("age", register::ColW::Fixed(96.0)),
+            register::Col::new("", register::ColW::Fixed(86.0)).right(),
+        ];
+        let content = if let Some(err) = &d.error {
+            register::Content::Failed {
+                what: copy::HISTORY_FAILED,
+                because: err,
+            }
+        } else if lines.is_empty() {
+            register::Content::Empty {
+                title: copy::HISTORY_EMPTY_TITLE,
+                hint: if d.running {
                     copy::HISTORY_EMPTY_HINT_RUNNING
                 } else {
                     copy::HISTORY_EMPTY_HINT_STOPPED
                 },
-            );
-            return;
-        }
-        // Flattened, newest first, across every path.
-        let mut all: Vec<(String, VersionRow)> = d
-            .versions
-            .iter()
-            .flat_map(|(p, vs)| vs.iter().map(|v| (p.clone(), v.clone())))
-            .collect();
-        all.sort_by_key(|e| std::cmp::Reverse(e.1.ts_ms));
-        all.truncate(200);
-        let vctx = VersionCtx::new(d);
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let mut last_day = String::new();
-            for (path, v) in &all {
-                let day = fmt_day(v.ts_ms);
-                if day != last_day {
-                    components::day_rule(ui, &day);
-                    last_day = day;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(path)
-                            .family(theme::fam_medium())
-                            .size(12.5)
-                            .color(INK),
-                    );
-                });
-                self.version_row(ui, dir, path, v, d.running, vctx);
-                ui.add_space(2.0);
             }
-        });
+        } else {
+            register::Content::Entries(lines.len())
+        };
+
+        let out = register::Register::new("history", &cols)
+            .no_margin()
+            .show(ui, content, |e| match &lines[e.index()] {
+                HistoryLine::Day(day) => {
+                    e.no_mark().divider();
+                    let day = day.clone();
+                    e.cell(|ui| {
+                        ui.label(
+                            egui::RichText::new(&day)
+                                .font(theme::font(theme::step::LABEL, theme::fam_serif()))
+                                .color(theme::ink()),
+                        );
+                    });
+                }
+                HistoryLine::Version(path, v) => {
+                    // In History the path is what identifies the entry, so it
+                    // leads the lane and the version number follows it.
+                    let p = (*path).clone();
+                    e.no_mark().cell(|ui| {
+                        ui.label(
+                            egui::RichText::new(&p)
+                                .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                                .color(theme::ink()),
+                        );
+                    });
+                    self.version_tail(e, dir, path, v, d.running, vctx);
+                }
+            });
+        if out.retry {
+            self.send(Cmd::Refresh);
+        }
     }
 
     fn tab_conflicts(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail) {
-        if d.conflicts.is_empty() {
-            components::empty_state(ui, copy::CONFLICTS_EMPTY_TITLE, copy::CONFLICTS_EMPTY_HINT);
-            return;
-        }
         ui.label(
             egui::RichText::new(copy::CONFLICTS_INTRO)
-                .size(11.5)
-                .color(DIM),
+                .font(theme::font(
+                    theme::step::META,
+                    egui::FontFamily::Proportional,
+                ))
+                .color(theme::ink_muted()),
         );
-        ui.add_space(4.0);
-        for c in &d.conflicts {
-            components::notched_card(ui, Some(WARN), |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(if c.path.is_empty() { &c.name } else { &c.path })
-                            .family(theme::fam_medium())
-                            .color(INK),
-                    );
-                    theme::pill(ui, &c.reason, WARN);
-                });
-                // Weigh the two copies against each other rather than merely
-                // listing one of them: the choice ahead is which bytes live.
-                let live = d.files.iter().find(|f| f.path == c.path);
-                let kept_text = human_bytes(c.size);
-                let kept_when = format!("kept {}", fmt_ts_full(c.ts_ms));
-                let live_text = live.map(|f| human_bytes(f.size)).unwrap_or_default();
-                balance::scales(
-                    ui,
-                    balance::Side {
-                        title: copy::BAL_KEPT_TITLE,
-                        size: c.size,
-                        size_text: &kept_text,
-                        when: &kept_when,
-                        note: &c.reason,
-                        accent: WARN,
-                    },
-                    balance::Side {
-                        title: copy::BAL_LIVE_TITLE,
-                        size: live.map(|f| f.size).unwrap_or(0),
-                        size_text: &live_text,
-                        when: copy::BAL_LIVE_WHEN,
-                        note: if live.is_some() {
-                            copy::BAL_LIVE_NOTE
-                        } else {
-                            copy::BAL_LIVE_MISSING
-                        },
-                        accent: theme::LAPIS,
-                    },
-                );
-                ui.add_space(4.0);
-                if d.running {
-                    ui.horizontal(|ui| {
-                        if !c.path.is_empty()
-                            && components::bevel_primary(ui, "Keep mine (apply the copy)").clicked()
-                        {
-                            // Guided lock → apply → unlock → discard; the copy
-                            // is only discarded once the publish succeeds.
-                            self.send(Cmd::ResolveMine {
-                                dir: dir.to_path_buf(),
-                                id: c.name.clone(),
-                                target: c.path.clone(),
-                            });
-                        }
-                        if controls::bevel_danger(ui, "Keep theirs (discard copy)").clicked() {
-                            self.ask(
-                                copy::CONFLICT_DISCARD_TITLE,
-                                copy::conflict_discard_body(&c.name),
-                                "Discard the copy",
-                                true,
-                                Cmd::ConflictDiscard {
-                                    dir: dir.to_path_buf(),
-                                    id: c.name.clone(),
-                                },
-                            );
-                        }
-                    });
+        ui.add_space(theme::space::M);
+        let cols = [
+            register::Col::new("preserved copy", register::ColW::Flex(3.0)),
+            register::Col::new("reason", register::ColW::Fixed(118.0)),
+            register::Col::new("bytes", register::ColW::Fixed(78.0)).right(),
+            register::Col::new("kept", register::ColW::Fixed(150.0)),
+        ];
+        let content = if let Some(err) = &d.error {
+            register::Content::Failed {
+                what: copy::CONFLICTS_FAILED,
+                because: err,
+            }
+        } else if d.conflicts.is_empty() {
+            register::Content::Empty {
+                title: copy::CONFLICTS_EMPTY_TITLE,
+                hint: copy::CONFLICTS_EMPTY_HINT,
+            }
+        } else {
+            register::Content::Entries(d.conflicts.len())
+        };
+
+        self.conflict_sel = self.conflict_sel.min(d.conflicts.len().saturating_sub(1));
+        let sel = self.conflict_sel;
+        let mut pick = None;
+        // Capped so the scales below stay on screen: the register lists, the
+        // pane weighs, and the decision is made against one drawing rather than
+        // against a stack of them.
+        let body_h = (theme::density().row_h() * 6.0).min(ui.available_height() * 0.42);
+        let out = register::Register::new("conflicts", &cols)
+            .max_height(body_h)
+            .show(ui, content, |e| {
+                let Some(c) = d.conflicts.get(e.index()) else {
+                    return;
+                };
+                let selected = e.index() == sel;
+                e.custody(theme::Custody::Quarantined);
+                e.selected(selected);
+                if e.response().clicked() {
+                    pick = Some(e.index());
+                }
+                let label = if c.path.is_empty() {
+                    c.name.clone()
                 } else {
+                    c.path.clone()
+                };
+                e.cell(|ui| {
                     ui.label(
-                        egui::RichText::new(copy::CONFLICTS_STOPPED_NOTE)
-                            .size(10.5)
-                            .color(theme::FAINT),
+                        egui::RichText::new(&label)
+                            .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                            .color(theme::ink()),
+                    );
+                });
+                let reason = c.reason.clone();
+                e.cell(|ui| register::tag(ui, &reason, theme::custody_quarantine()));
+                e.figure(&human_bytes(c.size), theme::ink_muted());
+                let when = fmt_ts_full(c.ts_ms);
+                e.cell(|ui| {
+                    ui.label(
+                        egui::RichText::new(&when)
+                            .font(theme::font(theme::step::META, theme::fam_mono()))
+                            .color(theme::ink_faint()),
+                    );
+                });
+            });
+        if let Some(i) = pick {
+            self.conflict_sel = i;
+        }
+        if out.retry {
+            self.send(Cmd::Refresh);
+        }
+        self.prune_bar(ui, dir, d);
+        let Some(c) = d.conflicts.get(self.conflict_sel).cloned() else {
+            return;
+        };
+        self.conflict_detail(ui, dir, d, &c);
+    }
+
+    /// Bulk-clearing preserved copies that have aged out. Destructive, so the
+    /// count and the bytes are computed and shown before anything is asked —
+    /// the user confirms against exactly what will be deleted.
+    fn prune_bar(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail) {
+        if d.conflicts.is_empty() || !d.running || !role_can_edit(&d.role) {
+            return;
+        }
+        let (names, bytes) = prunable(&d.conflicts, crate::now_ms(), self.prune_age_ms);
+
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(copy::PRUNE_OLDER_THAN)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_muted()),
+            );
+            for (label, ms) in copy::PRUNE_AGES {
+                if choice(ui, label, self.prune_age_ms == *ms) {
+                    self.prune_age_ms = *ms;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enabled = !names.is_empty();
+                let r = ui
+                    .add_enabled_ui(enabled, |ui| controls::bevel_danger(ui, copy::PRUNE_VERB))
+                    .inner;
+                if r.clicked() {
+                    self.ask(
+                        copy::PRUNE_TITLE,
+                        copy::prune_body(names.len(), &human_bytes(bytes)),
+                        copy::PRUNE_VERB,
+                        true,
+                        Cmd::PruneConflicts {
+                            dir: dir.to_path_buf(),
+                            older_than_ms: self.prune_age_ms,
+                            names: names.clone(),
+                        },
                     );
                 }
+                ui.label(
+                    egui::RichText::new(copy::prune_preview(names.len(), &human_bytes(bytes)))
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_faint()),
+                );
             });
-            ui.add_space(4.0);
+        });
+    }
+
+    /// The decision pane for one preserved copy: the two candidates weighed
+    /// against each other, then the three resolutions ordered by what each one
+    /// does to the user's bytes.
+    fn conflict_detail(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail, c: &ConflictRow) {
+        register::heading(ui, copy::CONFLICT_WEIGH_TITLE);
+        let live = d.files.iter().find(|f| f.path == c.path);
+        let kept_text = human_bytes(c.size);
+        let kept_when = format!("kept {}", fmt_ts_full(c.ts_ms));
+        let live_text = live.map(|f| human_bytes(f.size)).unwrap_or_default();
+        balance::scales(
+            ui,
+            balance::Side {
+                title: copy::BAL_KEPT_TITLE,
+                size: c.size,
+                size_text: &kept_text,
+                when: &kept_when,
+                note: &c.reason,
+                accent: theme::custody_quarantine(),
+            },
+            balance::Side {
+                title: copy::BAL_LIVE_TITLE,
+                size: live.map(|f| f.size).unwrap_or(0),
+                size_text: &live_text,
+                when: copy::BAL_LIVE_WHEN,
+                note: if live.is_some() {
+                    copy::BAL_LIVE_NOTE
+                } else {
+                    copy::BAL_LIVE_MISSING
+                },
+                accent: theme::custody_peer(),
+            },
+        );
+        ui.add_space(theme::space::M);
+
+        if !d.running {
+            ui.label(
+                egui::RichText::new(copy::CONFLICTS_STOPPED_NOTE)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_faint()),
+            );
+            return;
         }
+        if !role_can_edit(&d.role) {
+            register::notice(ui, theme::Custody::Blocked, |ui| {
+                ui.label(
+                    egui::RichText::new(copy::role_cannot_edit(&d.role))
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+            });
+            return;
+        }
+
+        // `keep both` writes the copy beside the synced file under a name that
+        // collides with nothing indexed. An orphaned copy has no original path,
+        // so its name is derived from the copy's own id — it stays restorable,
+        // which is the point: the only action previously offered on an orphan
+        // was the one that deleted it.
+        let stem = if c.path.is_empty() {
+            c.name.as_str()
+        } else {
+            c.path.as_str()
+        };
+        let both_target = crate::conflicts::both_name(stem, crate::now_ms(), |cand| {
+            d.files.iter().any(|f| f.path == cand)
+        });
+
+        if c.path.is_empty() {
+            ui.label(
+                egui::RichText::new(copy::CONFLICT_ORPHAN_NOTE)
+                    .font(theme::font(
+                        theme::step::META,
+                        egui::FontFamily::Proportional,
+                    ))
+                    .color(theme::ink_muted()),
+            );
+            ui.add_space(theme::space::S);
+        }
+
+        ui.horizontal(|ui| {
+            if components::bevel_primary(ui, copy::CONFLICT_KEEP_BOTH).clicked() {
+                self.send(Cmd::ResolveBoth {
+                    dir: dir.to_path_buf(),
+                    id: c.name.clone(),
+                    target: both_target.clone(),
+                });
+            }
+            // Both remaining verbs destroy bytes, so both are styled as
+            // destructive and both ask first. Keep-mine is the heavier of the
+            // two — it overwrites what every peer holds *and* deletes the
+            // preserved copy — and it used to be the unconfirmed gold primary.
+            if !c.path.is_empty() && controls::bevel_danger(ui, copy::CONFLICT_KEEP_MINE).clicked()
+            {
+                self.ask(
+                    copy::CONFLICT_MINE_TITLE,
+                    copy::conflict_mine_body(&c.path, &human_bytes(c.size)),
+                    copy::CONFLICT_MINE_VERB,
+                    true,
+                    Cmd::ResolveMine {
+                        dir: dir.to_path_buf(),
+                        id: c.name.clone(),
+                        target: c.path.clone(),
+                    },
+                );
+            }
+            if controls::bevel_danger(ui, copy::CONFLICT_KEEP_THEIRS).clicked() {
+                self.ask(
+                    copy::CONFLICT_DISCARD_TITLE,
+                    copy::conflict_discard_body(&c.name),
+                    copy::CONFLICT_DISCARD_VERB,
+                    true,
+                    Cmd::ConflictDiscard {
+                        dir: dir.to_path_buf(),
+                        id: c.name.clone(),
+                    },
+                );
+            }
+        });
+        ui.add_space(theme::space::XS);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} — {}",
+                copy::CONFLICT_KEEP_BOTH_NOTE,
+                both_target
+            ))
+            .font(theme::font(
+                theme::step::META,
+                egui::FontFamily::Proportional,
+            ))
+            .color(theme::ink_faint()),
+        );
     }
 
     fn tab_audit(&mut self, ui: &mut egui::Ui, d: &Detail) {
-        if d.audit.is_empty() {
-            components::empty_state(ui, copy::AUDIT_EMPTY_TITLE, copy::AUDIT_EMPTY_HINT);
-            return;
-        }
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            for e in &d.audit {
-                let mut extra = String::new();
-                if let Some(p) = &e.path {
-                    extra.push_str(p);
+        let kinds: Vec<String> = {
+            let mut k: Vec<String> = d.audit.iter().map(|a| a.kind.clone()).collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        };
+        ui.horizontal(|ui| {
+            let out = fields::search_field(ui, &mut self.audit_query, copy::AUDIT_FILTER, 260.0);
+            if out.cleared {
+                self.audit_query.clear();
+            }
+            if choice(ui, copy::AUDIT_ALL_KINDS, self.audit_kind.is_none()) {
+                self.audit_kind = None;
+            }
+            for k in &kinds {
+                if choice(ui, k, self.audit_kind.as_deref() == Some(k.as_str())) {
+                    self.audit_kind = Some(k.clone());
                 }
-                if let Some(pe) = &e.peer {
-                    extra.push_str(&format!("  ‹{}›", short(pe)));
-                }
-                if let Some(de) = &e.detail {
-                    if !extra.is_empty() {
-                        extra.push_str("  ");
-                    }
-                    extra.push_str(de);
-                }
-                let kind = e.kind.clone();
-                let color = audit_color(&kind);
-                components::timeline_row(ui, color, &fmt_ts(e.ts_ms), |ui| {
-                    ui.horizontal(|ui| {
-                        theme::pill(ui, &kind, color);
-                        ui.label(egui::RichText::new(extra).size(11.5).color(DIM));
-                    });
-                });
             }
         });
+        ui.add_space(theme::space::M);
+
+        let q = self.audit_query.to_lowercase();
+        let rows: Vec<&AuditRow> = d
+            .audit
+            .iter()
+            .filter(|a| audit_matches(a, self.audit_kind.as_deref(), &q))
+            .collect();
+
+        let matched = rows.len();
+        if matched > AUDIT_MAX {
+            register::notice(ui, theme::Custody::Stale, |ui| {
+                ui.label(
+                    egui::RichText::new(copy::audit_truncated(AUDIT_MAX, matched))
+                        .font(theme::font(
+                            theme::step::META,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+            });
+            ui.add_space(theme::space::M);
+        }
+
+        let cols = [
+            register::Col::new("when", register::ColW::Fixed(150.0)),
+            register::Col::new("event", register::ColW::Fixed(118.0)),
+            register::Col::new("subject", register::ColW::Flex(3.0)),
+            register::Col::new("peer", register::ColW::Fixed(104.0)),
+        ];
+        let content = if let Some(err) = &d.error {
+            register::Content::Failed {
+                what: copy::AUDIT_FAILED,
+                because: err,
+            }
+        } else if rows.is_empty() {
+            register::Content::Empty {
+                title: if d.audit.is_empty() {
+                    copy::AUDIT_EMPTY_TITLE
+                } else {
+                    copy::AUDIT_FILTER_EMPTY
+                },
+                hint: if d.audit.is_empty() {
+                    copy::AUDIT_EMPTY_HINT
+                } else {
+                    copy::AUDIT_FILTER_EMPTY_HINT
+                },
+            }
+        } else {
+            register::Content::Entries(rows.len().min(AUDIT_MAX))
+        };
+        let out = register::Register::new("audit", &cols).show(ui, content, |e| {
+            let Some(a) = rows.get(e.index()).copied() else {
+                return;
+            };
+            let when = fmt_ts(a.ts_ms);
+            e.cell(|ui| {
+                ui.label(
+                    egui::RichText::new(&when)
+                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                        .color(theme::ink_faint()),
+                );
+            });
+            let kind = a.kind.clone();
+            let color = audit_color(&kind);
+            e.cell(|ui| register::tag(ui, &kind, color));
+            let subject = a
+                .path
+                .clone()
+                .or_else(|| a.detail.clone())
+                .unwrap_or_default();
+            let detail = match (&a.path, &a.detail) {
+                (Some(_), Some(de)) => Some(de.clone()),
+                _ => None,
+            };
+            e.cell(|ui| {
+                ui.label(
+                    egui::RichText::new(&subject)
+                        .font(theme::font(
+                            theme::step::LABEL,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink()),
+                );
+                if let Some(de) = &detail {
+                    ui.label(
+                        egui::RichText::new(de)
+                            .font(theme::font(
+                                theme::step::META,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink_faint()),
+                    );
+                }
+            });
+            let peer = a.peer.as_deref().map(short).unwrap_or_default();
+            e.cell(|ui| {
+                ui.label(
+                    egui::RichText::new(&peer)
+                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                        .color(theme::ink_muted()),
+                );
+            });
+        });
+        if out.retry {
+            self.send(Cmd::Refresh);
+        }
     }
 
     fn tab_settings(&mut self, ui: &mut egui::Ui, dir: &Path, d: &Detail) {
@@ -3334,13 +3820,13 @@ impl App {
             return;
         };
 
-        theme::section(ui, "Live settings");
+        register::heading(ui, "Live settings");
         ui.label(
             egui::RichText::new(copy::LIVE_SECTION_NOTE)
                 .size(11.0)
-                .color(theme::FAINT),
+                .color(theme::ink_faint()),
         );
-        theme::card().show(ui, |ui| {
+        register::well().show(ui, |ui| {
             ui.set_width(ui.available_width());
             self.cfg_row(
                 ui,
@@ -3395,14 +3881,14 @@ impl App {
                 "auto-acquire on edit",
                 Some(cfg.autolock),
             );
-            self.cfg_toggle(ui, dir, "audit", "audit log", None);
-            self.cfg_toggle(ui, dir, "hooks", "event hooks", None);
-            self.cfg_toggle(ui, dir, "notify", "desktop notifications", None);
+            self.cfg_toggle(ui, dir, "audit", "audit log", Some(cfg.audit));
+            self.cfg_toggle(ui, dir, "hooks", "event hooks", Some(cfg.hooks));
+            self.cfg_toggle(ui, dir, "notify", "desktop notifications", Some(cfg.notify));
         });
 
         ui.add_space(6.0);
-        theme::section(ui, "Fixed until restart");
-        theme::card().show(ui, |ui| {
+        register::heading(ui, "Fixed until restart");
+        register::well().show(ui, |ui| {
             ui.set_width(ui.available_width());
             for (k, v) in [
                 (
@@ -3421,13 +3907,13 @@ impl App {
                 ("lan", if cfg.lan { "on".into() } else { "off".into() }),
             ] {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(k).size(12.0).color(DIM));
+                    ui.label(egui::RichText::new(k).size(12.0).color(theme::ink_muted()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(v)
                                 .size(12.0)
                                 .family(egui::FontFamily::Monospace)
-                                .color(INK),
+                                .color(theme::ink()),
                         );
                     });
                 });
@@ -3435,18 +3921,18 @@ impl App {
             ui.label(
                 egui::RichText::new(copy::FIXED_SECTION_NOTE)
                     .size(10.5)
-                    .color(theme::FAINT),
+                    .color(theme::ink_faint()),
             );
         });
 
         ui.add_space(6.0);
-        theme::section(ui, "Peers");
-        theme::card().show(ui, |ui| {
+        register::heading(ui, "Peers");
+        register::well().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
                 egui::RichText::new(copy::PEERS_NAME_HINT)
                     .size(11.5)
-                    .color(DIM),
+                    .color(theme::ink_muted()),
             );
             ui.horizontal(|ui| {
                 fields::text_field_mono(ui, &mut self.peer_id, copy::HINT_PEER_ID, 180.0);
@@ -3473,49 +3959,88 @@ impl App {
                     egui::RichText::new(&m.id_short)
                         .size(11.0)
                         .family(egui::FontFamily::Monospace)
-                        .color(theme::FAINT),
+                        .color(theme::ink_faint()),
                 );
             }
         });
 
         if !d.leases.is_empty() {
             ui.add_space(6.0);
-            theme::section(ui, "Active leases");
-            theme::card().show(ui, |ui| {
+            register::heading(ui, "Active leases");
+            register::well().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for l in &d.leases {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&l.path).size(12.0).color(INK));
-                        theme::pill(
+                        ui.label(egui::RichText::new(&l.path).size(12.0).color(theme::ink()));
+                        register::tag(
                             ui,
                             &if l.mine {
                                 "you".to_string()
                             } else {
                                 short(&l.holder)
                             },
-                            if l.mine { ACCENT } else { DIM },
+                            if l.mine {
+                                theme::gold()
+                            } else {
+                                theme::ink_muted()
+                            },
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 egui::RichText::new(format!("{} left", human_dur(l.expires_in_ms)))
                                     .size(11.0)
-                                    .color(theme::FAINT),
+                                    .color(theme::ink_faint()),
                             );
                         });
                     });
                 }
             });
         }
+        self.maintenance_section(ui);
+    }
+
+    /// Machine-level upkeep: whether tazamun comes back after a reboot. Not a
+    /// per-session setting, which is why it sits at the foot of the page under
+    /// its own heading rather than among the folder's config keys.
+    fn maintenance_section(&mut self, ui: &mut egui::Ui) {
+        register::heading(ui, copy::MAINTENANCE_TITLE);
+        ui.label(
+            egui::RichText::new(copy::SUPERVISOR_NOTE)
+                .font(theme::font(
+                    theme::step::META,
+                    egui::FontFamily::Proportional,
+                ))
+                .color(theme::ink_faint()),
+        );
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            if controls::ghost_button(ui, copy::SUPERVISOR_INSTALL).clicked() {
+                self.send(Cmd::Supervisor { install: true });
+            }
+            if controls::ghost_button(ui, copy::SUPERVISOR_REMOVE).clicked() {
+                self.ask(
+                    copy::SUPERVISOR_REMOVE_TITLE,
+                    copy::SUPERVISOR_REMOVE_BODY.to_string(),
+                    copy::SUPERVISOR_REMOVE,
+                    true,
+                    Cmd::Supervisor { install: false },
+                );
+            }
+        });
     }
 
     /// One editable live-config row: label, current value, edit buffer, apply.
     fn cfg_row(&mut self, ui: &mut egui::Ui, dir: &Path, key: &str, label: &str, current: &str) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).size(12.0).color(DIM));
+            ui.label(
+                egui::RichText::new(label)
+                    .size(12.0)
+                    .color(theme::ink_muted()),
+            );
             ui.label(
                 egui::RichText::new(format!("({key})"))
                     .size(10.0)
-                    .color(theme::FAINT),
+                    .color(theme::ink_faint()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // The entry is (baseline, buffer). Baseline = the daemon value
@@ -3567,8 +4092,9 @@ impl App {
         });
     }
 
-    /// An on/off live key. `current` is None when the payload does not report
-    /// the value (audit/hooks/notify) — both buttons are offered blind.
+    /// An on/off live key. `current` is None only if the daemon's config
+    /// summary omits the key entirely, in which case neither side is marked
+    /// rather than one being marked wrongly.
     fn cfg_toggle(
         &mut self,
         ui: &mut egui::Ui,
@@ -3578,23 +4104,27 @@ impl App {
         current: Option<bool>,
     ) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).size(12.0).color(DIM));
+            ui.label(
+                egui::RichText::new(label)
+                    .size(12.0)
+                    .color(theme::ink_muted()),
+            );
             ui.label(
                 egui::RichText::new(format!("({key})"))
                     .size(10.0)
-                    .color(theme::FAINT),
+                    .color(theme::ink_faint()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let on_sel = current == Some(true);
                 let off_sel = current == Some(false);
-                if ui.selectable_label(off_sel, "off").clicked() {
+                if choice(ui, copy::TOGGLE_OFF, off_sel) {
                     self.send(Cmd::ConfigSet {
                         dir: dir.to_path_buf(),
                         key: key.to_string(),
                         value: "off".into(),
                     });
                 }
-                if ui.selectable_label(on_sel, "on").clicked() {
+                if choice(ui, copy::TOGGLE_ON, on_sel) {
                     self.send(Cmd::ConfigSet {
                         dir: dir.to_path_buf(),
                         key: key.to_string(),
@@ -3637,95 +4167,90 @@ impl App {
     /// Every chord `shortcuts::sections()` advertises, wired here so the sheet
     /// and the window can never drift. Escape is deliberately absent: each
     /// overlay consumes its own, so one press closes exactly one thing.
+    /// Dispatches every global chord from [`shortcuts::sections`].
+    ///
+    /// The table is the registry: a binding printed on the sheet is the same
+    /// binding matched here, so the two cannot drift. Bindings marked
+    /// [`shortcuts::Action::Convention`] are left alone — egui, a list widget
+    /// or whichever overlay is open already answers them.
     fn keyboard(&mut self, ui: &egui::Ui, overview: &Option<Overview>) {
-        const TAB_KEYS: [(egui::Key, Tab); 7] = [
-            (egui::Key::Num1, Tab::Overview),
-            (egui::Key::Num2, Tab::Peers),
-            (egui::Key::Num3, Tab::Files),
-            (egui::Key::Num4, Tab::Conflicts),
-            (egui::Key::Num5, Tab::History),
-            (egui::Key::Num6, Tab::Audit),
-            (egui::Key::Num7, Tab::Settings),
-        ];
-        // While a text field owns the keyboard a bare "?" is a character being
-        // typed, not a request for the sheet.
+        // While a text field owns the keyboard, a bare "?" is a character being
+        // typed and Ctrl+A selects the field's text.
         let typing = ui.ctx().memory(|m| m.focused()).is_some();
-        let cmd = egui::Modifiers::COMMAND;
+        let has_session = self.selected.is_some();
 
-        let (palette, refresh, settings, filter, bigger, smaller, reset, sheet, all, jump) = ui
-            .input_mut(|i| {
-                (
-                    i.consume_key(cmd, egui::Key::K),
-                    i.consume_key(cmd, egui::Key::R),
-                    i.consume_key(cmd, egui::Key::Comma),
-                    i.consume_key(cmd, egui::Key::F),
-                    {
-                        // Consume both spellings: layouts disagree on whether
-                        // Ctrl and the "+" key reports Plus or Equals, and a
-                        // short-circuit would leave the other one pending.
-                        let plus = i.consume_key(cmd, egui::Key::Plus);
-                        let equals = i.consume_key(cmd, egui::Key::Equals);
-                        plus || equals
-                    },
-                    i.consume_key(cmd, egui::Key::Minus),
-                    i.consume_key(cmd, egui::Key::Num0),
-                    !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::Questionmark),
-                    // While a field has the keyboard, Ctrl+A selects its text,
-                    // not every session.
-                    !typing && i.consume_key(cmd, egui::Key::A),
-                    TAB_KEYS
-                        .iter()
-                        .find(|(k, _)| i.consume_key(cmd, *k))
-                        .map(|(_, t)| *t),
-                )
-            });
-
-        if palette {
-            self.palette_open = !self.palette_open;
-            self.palette_query.clear();
-            self.palette_sel = 0;
-        }
-        if refresh {
-            self.send(Cmd::Refresh);
-        }
-        if all && let Some(ov) = overview {
-            let keys: Vec<String> = ov.sessions.iter().map(|s| s.path.clone()).collect();
-            self.multi.select_all(&keys);
-        }
-        if sheet {
-            self.shortcuts_open = !self.shortcuts_open;
-            // Keep the two modals mutually exclusive so Escape is unambiguous.
-            self.palette_open = false;
-        }
-
-        // Tab chords only mean something once a session is on screen.
-        if self.selected.is_some() {
-            if let Some(t) = jump {
-                self.tab = t;
+        let mut fired: Vec<shortcuts::Action> = Vec::new();
+        ui.input_mut(|i| {
+            for b in shortcuts::sections().iter().flat_map(|s| s.bindings) {
+                let Some((mods, keys)) = b.action.chord() else {
+                    continue;
+                };
+                if typing && b.action.yields_to_typing() {
+                    continue;
+                }
+                // Every spelling is consumed, not just the first to match: a
+                // short-circuit would leave the other pending for the next
+                // frame, where it would fire again.
+                let mut hit = false;
+                for k in keys {
+                    hit |= i.consume_key(mods, *k);
+                }
+                if hit && !(b.action.needs_session() && !has_session) {
+                    fired.push(b.action);
+                }
             }
-            if settings {
-                self.tab = Tab::Settings;
-            }
-            if filter {
-                self.tab = Tab::Files;
-                self.focus_filter = true;
-            }
-        }
+        });
 
-        if bigger || smaller || reset {
-            let next = if reset {
-                a11y::SCALE_DEFAULT
-            } else {
-                a11y::step_scale(self.text_scale, bigger)
-            };
-            if next != self.text_scale {
-                self.text_scale = next;
-                self.scale_dirty = Some(next);
-                self.toasts.push(
-                    a11y::scale_label(next),
-                    toasts::Kind::Info,
-                    ui.input(|i| i.time),
-                );
+        let now = ui.input(|i| i.time);
+        for action in fired {
+            match action {
+                shortcuts::Action::Palette => {
+                    self.palette_open = !self.palette_open;
+                    self.palette_query.clear();
+                    self.palette_sel = 0;
+                    self.palette_focused = false;
+                }
+                shortcuts::Action::Refresh => self.send(Cmd::Refresh),
+                shortcuts::Action::Settings => self.tab = Tab::Settings,
+                shortcuts::Action::Sheet => {
+                    self.shortcuts_open = !self.shortcuts_open;
+                    // Keep the two modals mutually exclusive so Escape is
+                    // unambiguous.
+                    self.palette_open = false;
+                    self.palette_focused = false;
+                }
+                shortcuts::Action::SelectAll => {
+                    if let Some(ov) = overview {
+                        let keys: Vec<String> =
+                            ov.sessions.iter().map(|s| s.path.clone()).collect();
+                        self.multi.select_all(&keys);
+                    }
+                }
+                shortcuts::Action::FileFilter => {
+                    self.tab = Tab::Files;
+                    self.focus_filter = true;
+                }
+                shortcuts::Action::Tab(n) => {
+                    if let Some(t) = Tab::ALL.get(n) {
+                        self.tab = *t;
+                    }
+                }
+                shortcuts::Action::TextBigger
+                | shortcuts::Action::TextSmaller
+                | shortcuts::Action::TextReset => {
+                    let next = match action {
+                        shortcuts::Action::TextReset => a11y::SCALE_DEFAULT,
+                        shortcuts::Action::TextBigger => a11y::step_scale(self.text_scale, true),
+                        _ => a11y::step_scale(self.text_scale, false),
+                    };
+                    if next != self.text_scale {
+                        self.text_scale = next;
+                        self.style_dirty = true;
+                        self.toasts
+                            .push(a11y::scale_label(next), toasts::Kind::Info, now);
+                    }
+                }
+                shortcuts::Action::Convention => {}
             }
         }
     }
@@ -3737,6 +4262,7 @@ impl App {
         }
         if modal_backdrop(ui.ctx(), "palette-dim", 140) {
             self.palette_open = false;
+            self.palette_focused = false;
             return;
         }
 
@@ -3749,6 +4275,8 @@ impl App {
             Colophon,
             Refresh,
             Quit,
+            /// A session operation that needs nothing but the open folder.
+            Session(&'static str),
         }
         let mut acts: Vec<(String, Act)> = vec![("Home — all sessions".into(), Act::Go(None))];
         if let Some(ov) = overview {
@@ -3773,6 +4301,15 @@ impl App {
                 acts.push((label.into(), Act::OpenTab(t)));
             }
         }
+        if self.selected.is_some() {
+            for (label, key) in [
+                (copy::MENU_DOCTOR, "doctor"),
+                (copy::MENU_DASHBOARD, "dashboard"),
+                (copy::MENU_GC, "gc"),
+            ] {
+                acts.push((label.into(), Act::Session(key)));
+            }
+        }
         acts.push(("Colophon — about tazamun".into(), Act::Colophon));
         acts.push(("Refresh now".into(), Act::Refresh));
         acts.push(("Quit tazamun".into(), Act::Quit));
@@ -3794,6 +4331,7 @@ impl App {
         });
         if esc {
             self.palette_open = false;
+            self.palette_focused = false;
             return;
         }
         // Wraps at both ends, answers Home/End, and clamps an index left stale
@@ -3812,9 +4350,9 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::BG1)
-                    .stroke(egui::Stroke::new(1.0, ACCENT.linear_multiply(0.35)))
-                    .corner_radius(theme::R_CARD + 2)
+                    .fill(theme::bg_chrome())
+                    .stroke(egui::Stroke::new(1.0, theme::gold().linear_multiply(0.35)))
+                    .corner_radius(theme::R_NONE + 2)
                     .inner_margin(egui::Margin::same(10))
                     .shadow(egui::Shadow {
                         offset: [0, 6],
@@ -3832,8 +4370,9 @@ impl App {
                             avail,
                             fields::FieldState::Neutral,
                         );
-                        if !te.has_focus() {
+                        if !te.has_focus() && !self.palette_focused {
                             te.request_focus();
+                            self.palette_focused = true;
                         }
                         if te.changed() {
                             self.palette_sel = 0;
@@ -3844,7 +4383,7 @@ impl App {
                                 egui::pos2(te.rect.left() + 4.0, te.rect.bottom() + 2.0),
                                 egui::pos2(te.rect.right() - 4.0, te.rect.bottom() + 7.0),
                             ),
-                            theme::GOLD.linear_multiply(0.12),
+                            theme::gold().linear_multiply(0.12),
                         );
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical()
@@ -3855,12 +4394,16 @@ impl App {
                                     let selected = i == self.palette_sel;
                                     let r = ui.add(
                                         egui::Button::new(
-                                            egui::RichText::new(label)
-                                                .size(13.0)
-                                                .color(if selected { INK } else { DIM }),
+                                            egui::RichText::new(label).size(13.0).color(
+                                                if selected {
+                                                    theme::ink()
+                                                } else {
+                                                    theme::ink_muted()
+                                                },
+                                            ),
                                         )
                                         .fill(if selected {
-                                            theme::BG3
+                                            theme::bg_raise()
                                         } else {
                                             egui::Color32::TRANSPARENT
                                         })
@@ -3871,7 +4414,7 @@ impl App {
                                             ui.painter(),
                                             egui::pos2(r.rect.left() + 9.0, r.rect.center().y),
                                             2.4,
-                                            ACCENT,
+                                            theme::gold(),
                                         );
                                     }
                                     if r.hovered() && pointer_moving {
@@ -3887,13 +4430,25 @@ impl App {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             ceremony::keycap(ui, "↑");
                             ceremony::keycap(ui, "↓");
-                            ui.label(egui::RichText::new("move").size(10.0).color(theme::FAINT));
+                            ui.label(
+                                egui::RichText::new("move")
+                                    .size(10.0)
+                                    .color(theme::ink_faint()),
+                            );
                             ui.add_space(8.0);
                             ceremony::keycap(ui, "Enter");
-                            ui.label(egui::RichText::new("run").size(10.0).color(theme::FAINT));
+                            ui.label(
+                                egui::RichText::new("run")
+                                    .size(10.0)
+                                    .color(theme::ink_faint()),
+                            );
                             ui.add_space(8.0);
                             ceremony::keycap(ui, "Esc");
-                            ui.label(egui::RichText::new("close").size(10.0).color(theme::FAINT));
+                            ui.label(
+                                egui::RichText::new("close")
+                                    .size(10.0)
+                                    .color(theme::ink_faint()),
+                            );
                         });
                     });
             });
@@ -3905,6 +4460,16 @@ impl App {
                 Act::Start(p) => self.send(Cmd::Start(PathBuf::from(p))),
                 Act::Stop(p) => self.send(Cmd::Stop(PathBuf::from(p))),
                 Act::OpenTab(t) => self.tab = *t,
+                Act::Session(key) => {
+                    if let Some(sel) = self.selected.clone() {
+                        let dir = PathBuf::from(sel);
+                        self.send(match *key {
+                            "doctor" => Cmd::Doctor { dir },
+                            "dashboard" => Cmd::Dashboard { dir },
+                            _ => Cmd::Gc { dir },
+                        });
+                    }
+                }
                 Act::Colophon => self.colophon_open = true,
                 Act::Refresh => self.send(Cmd::Refresh),
                 Act::Quit => {
@@ -3915,6 +4480,7 @@ impl App {
                 }
             }
             self.palette_open = false;
+            self.palette_focused = false;
         }
     }
 
@@ -3937,9 +4503,9 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
             .show(ui.ctx(), |ui| {
                 let fr = egui::Frame::new()
-                    .fill(theme::BG1)
-                    .stroke(theme::stroke_faint())
-                    .corner_radius(theme::R_CARD + 2)
+                    .fill(theme::bg_chrome())
+                    .stroke(egui::Stroke::new(theme::RULE_W, theme::rule_hair()))
+                    .corner_radius(theme::R_NONE + 2)
                     .inner_margin(egui::Margin::same(20))
                     .shadow(egui::Shadow {
                         offset: [0, 8],
@@ -3977,9 +4543,9 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -10.0))
             .show(ui.ctx(), |ui| {
                 let fr = egui::Frame::new()
-                    .fill(theme::BG1)
-                    .stroke(theme::stroke_faint())
-                    .corner_radius(theme::R_CARD + 2)
+                    .fill(theme::bg_chrome())
+                    .stroke(egui::Stroke::new(theme::RULE_W, theme::rule_hair()))
+                    .corner_radius(theme::R_NONE + 2)
                     .inner_margin(egui::Margin::same(20))
                     .shadow(egui::Shadow {
                         offset: [0, 8],
@@ -3993,13 +4559,13 @@ impl App {
                             egui::RichText::new(copy::SHORTCUTS_TITLE)
                                 .size(14.5)
                                 .family(theme::fam_semibold())
-                                .color(INK),
+                                .color(theme::ink()),
                         );
                         ui.add_space(2.0);
                         ui.label(
                             egui::RichText::new(copy::SHORTCUTS_SUB)
                                 .size(11.5)
-                                .color(theme::DIM),
+                                .color(theme::ink_muted()),
                         );
                         ui.add_space(10.0);
                         egui::ScrollArea::vertical()
@@ -4014,6 +4580,12 @@ impl App {
     }
 
     /// The confirm modal: nothing destructive fires without an explicit click.
+    ///
+    /// Built on [`egui::Modal`] rather than a hand-rolled backdrop. The
+    /// hand-rolled one blocked the pointer but not the keyboard, so Tab walked
+    /// straight out of an open "discard this preserved copy?" dialog into the
+    /// live controls behind it — and those controls had no visible focus. A
+    /// real modal layer makes that impossible.
     fn confirm_overlay(&mut self, ui: &mut egui::Ui) {
         let Some(confirm) = self.confirm.as_ref() else {
             return;
@@ -4024,70 +4596,65 @@ impl App {
             confirm.verb.clone(),
             confirm.danger,
         );
-        if modal_backdrop(ui.ctx(), "confirm-dim", 150) {
-            self.confirm = None;
-            return;
-        }
 
-        let esc = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if esc {
-            self.confirm = None;
-            return;
-        }
         let mut decided: Option<bool> = None;
-        egui::Area::new(egui::Id::new("confirm"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+        let modal = egui::Modal::new(egui::Id::new("confirm"))
+            .backdrop_color(theme::scrim())
+            .frame(register::overlay().stroke(egui::Stroke::new(
+                theme::RULE_W,
+                if danger {
+                    theme::custody_blocked()
+                } else {
+                    theme::rule_emphasis()
+                },
+            )))
             .show(ui.ctx(), |ui| {
-                let fr = egui::Frame::new()
-                    .fill(theme::BG1)
-                    .stroke(if danger {
-                        egui::Stroke::new(1.0, BAD.linear_multiply(0.5))
-                    } else {
-                        theme::stroke_faint()
-                    })
-                    .corner_radius(theme::R_CARD + 2)
-                    .inner_margin(egui::Margin::same(16))
-                    .shadow(egui::Shadow {
-                        offset: [0, 8],
-                        blur: 28,
-                        spread: 0,
-                        color: egui::Color32::from_black_alpha(140),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(420.0);
-                        ui.label(
-                            egui::RichText::new(&title)
-                                .family(theme::fam_semibold())
-                                .size(15.0)
-                                .color(INK),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(&body).size(12.5).color(DIM));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let r = if danger {
-                                        controls::bevel_danger(ui, &verb)
-                                    } else {
-                                        components::bevel_primary(ui, &verb)
-                                    };
-                                    if r.clicked() {
-                                        decided = Some(true);
-                                    }
-                                    if controls::ghost_button(ui, "Cancel").clicked() {
-                                        decided = Some(false);
-                                    }
-                                },
-                            );
-                        });
+                ui.set_width(420.0);
+                ui.label(
+                    egui::RichText::new(&title)
+                        .font(theme::font(theme::step::TITLE, theme::fam_serif()))
+                        .color(theme::ink()),
+                );
+                ui.add_space(theme::space::S);
+                ui.label(
+                    egui::RichText::new(&body)
+                        .font(theme::font(
+                            theme::step::BODY,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+                ui.add_space(theme::space::L);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let r = if danger {
+                            controls::bevel_danger(ui, &verb)
+                        } else {
+                            components::bevel_primary(ui, &verb)
+                        };
+                        // Cancel takes focus, not the destructive verb: a
+                        // dialog that arms Enter on the irreversible choice is
+                        // a trap for anyone who confirms by reflex.
+                        let cancel = controls::ghost_button(ui, copy::ACTION_CANCEL);
+                        if !r.has_focus() && !cancel.has_focus() {
+                            cancel.request_focus();
+                        }
+                        if r.clicked() {
+                            decided = Some(true);
+                        }
+                        if cancel.clicked() {
+                            decided = Some(false);
+                        }
                     });
-                // Adorn over the finished card: the alphas are ghost-level, so
-                // the flourishes/seal never fight the text.
-                ceremony::adorn_dialog(ui.painter(), fr.response.rect, danger);
+                });
+                // Adorned over the finished card: the alphas are ghost-level,
+                // so the flourishes never fight the text.
+                ceremony::adorn_dialog(ui.painter(), ui.min_rect(), danger);
             });
+
+        if modal.should_close() {
+            decided = decided.or(Some(false));
+        }
         match decided {
             Some(true) => {
                 if let Some(mut c) = self.confirm.take()
@@ -4138,13 +4705,13 @@ fn modal_backdrop(ctx: &egui::Context, id: &str, alpha: u8) -> bool {
 /// Color-classify an audit event kind for its pill.
 fn audit_color(kind: &str) -> egui::Color32 {
     if kind.contains("quarantine") || kind.contains("conflict") {
-        WARN
+        theme::custody_stale()
     } else if kind.contains("error") || kind.contains("refus") {
-        BAD
+        theme::custody_blocked()
     } else if kind.contains("lock") || kind.contains("publish") || kind.contains("restore") {
-        GOOD
+        theme::custody_good()
     } else {
-        theme::LAPIS
+        theme::custody_peer()
     }
 }
 
@@ -4167,15 +4734,15 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 
 fn status_dot(s: &SessionRow) -> (&'static str, egui::Color32) {
     if !s.readable {
-        ("○", BAD)
+        ("○", theme::custody_blocked())
     } else if s.paused {
-        ("⏸", WARN)
+        ("⏸", theme::custody_stale())
     } else if s.running && s.peers_online > 0 {
-        ("●", GOOD)
+        ("●", theme::custody_good())
     } else if s.running {
-        ("●", WARN)
+        ("●", theme::custody_stale())
     } else {
-        ("○", DIM)
+        ("○", theme::ink_muted())
     }
 }
 
@@ -4320,6 +4887,8 @@ impl App {
     /// Hidden capture hook for docs and bug reports: run with
     /// `TAZAMUN_GUI_SHOT=/path/prefix` and the app writes one composited frame
     /// (`<prefix>.raw` RGBA + `<prefix>.dim`) about 3s after launch, then exits.
+    /// `TAZAMUN_GUI_SHOT_TAB`, `_SELECT`, `_MODE` and `_DENSITY` pin what is on
+    /// screen, so a capture does not depend on the last run's preferences.
     fn debug_screenshot(&mut self, ui: &egui::Ui) {
         let Ok(path) = std::env::var("TAZAMUN_GUI_SHOT") else {
             return;
@@ -4348,5 +4917,167 @@ impl App {
             );
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn audit(kind: &str, path: Option<&str>, peer: Option<&str>, detail: Option<&str>) -> AuditRow {
+        AuditRow {
+            ts_ms: 0,
+            kind: kind.into(),
+            path: path.map(str::to_string),
+            peer: peer.map(str::to_string),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    fn conflict(name: &str, ts_ms: u64, size: u64) -> ConflictRow {
+        ConflictRow {
+            name: name.into(),
+            path: String::new(),
+            reason: String::new(),
+            ts_ms,
+            size,
+        }
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_every_entry() {
+        let a = audit("lock", Some("a.txt"), None, None);
+        assert!(audit_matches(&a, None, ""));
+    }
+
+    #[test]
+    fn the_kind_filter_is_exact() {
+        let a = audit("lock", None, None, None);
+        assert!(audit_matches(&a, Some("lock"), ""));
+        assert!(!audit_matches(&a, Some("unlock"), ""));
+        // A prefix is not a match: "lock" must not select "lock_denied".
+        let b = audit("lock_denied", None, None, None);
+        assert!(!audit_matches(&b, Some("lock"), ""));
+    }
+
+    #[test]
+    fn the_needle_searches_every_text_field() {
+        let a = audit(
+            "lock",
+            Some("notes/plan.md"),
+            Some("3f9a0b2c"),
+            Some("ttl 90s"),
+        );
+        assert!(audit_matches(&a, None, "plan"));
+        assert!(audit_matches(&a, None, "3f9a"));
+        assert!(audit_matches(&a, None, "ttl"));
+        assert!(!audit_matches(&a, None, "absent"));
+    }
+
+    /// The caller lower-cases the needle once; an entry with capitals must
+    /// still match, or a search for "README" silently finds nothing.
+    #[test]
+    fn matching_ignores_case_in_the_entry() {
+        let a = audit("lock", Some("README.md"), None, None);
+        assert!(audit_matches(&a, None, "readme"));
+    }
+
+    #[test]
+    fn kind_and_needle_must_both_hold() {
+        let a = audit("lock", Some("a.txt"), None, None);
+        assert!(audit_matches(&a, Some("lock"), "a.txt"));
+        assert!(!audit_matches(&a, Some("unlock"), "a.txt"));
+        assert!(!audit_matches(&a, Some("lock"), "b.txt"));
+    }
+
+    #[test]
+    fn an_entry_with_no_text_matches_only_an_empty_needle() {
+        let a = audit("gc", None, None, None);
+        assert!(audit_matches(&a, None, ""));
+        assert!(!audit_matches(&a, None, "anything"));
+    }
+
+    #[test]
+    fn nothing_is_prunable_when_nothing_is_old_enough() {
+        let rows = [conflict("a", 900, 10), conflict("b", 950, 20)];
+        let (names, bytes) = prunable(&rows, 1_000, 500);
+        assert!(names.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn prunable_selects_only_what_is_past_the_cutoff() {
+        let rows = [conflict("old", 100, 10), conflict("new", 950, 20)];
+        let (names, bytes) = prunable(&rows, 1_000, 500);
+        assert_eq!(names, vec!["old".to_string()]);
+        assert_eq!(bytes, 10);
+    }
+
+    /// Exactly at the cutoff counts as old enough, and the boundary is worth
+    /// pinning: this decides whether a copy is deleted.
+    #[test]
+    fn the_cutoff_boundary_is_inclusive() {
+        let rows = [conflict("edge", 500, 7)];
+        let (names, _) = prunable(&rows, 1_000, 500);
+        assert_eq!(names, vec!["edge".to_string()]);
+    }
+
+    /// A clock that has gone backwards must not make everything prunable.
+    #[test]
+    fn a_future_timestamp_is_never_prunable() {
+        let rows = [conflict("future", 5_000, 1)];
+        let (names, bytes) = prunable(&rows, 1_000, 0);
+        assert_eq!(names, vec!["future".to_string()], "a zero cutoff takes all");
+        let (names, _) = prunable(&rows, 1_000, 500);
+        assert!(names.is_empty(), "{names:?}");
+        assert_eq!(bytes, 1);
+    }
+
+    #[test]
+    fn prunable_totals_do_not_overflow() {
+        let rows = [conflict("a", 0, u64::MAX), conflict("b", 0, u64::MAX)];
+        let (names, bytes) = prunable(&rows, 1_000, 0);
+        assert_eq!(names.len(), 2);
+        assert_eq!(bytes, u64::MAX);
+    }
+
+    /// A viewer or archive folder refuses every lease, so the window must not
+    /// offer the verbs.
+    #[test]
+    fn only_editing_roles_may_take_a_lease() {
+        assert!(role_can_edit("editor"));
+        assert!(role_can_edit("owner"));
+        assert!(!role_can_edit("viewer"));
+        assert!(!role_can_edit("archive"));
+    }
+
+    /// A stopped session cannot grant anything, so its files read as refused
+    /// rather than free — offering Lock there would always fail.
+    #[test]
+    fn custody_of_a_stopped_session_is_blocked() {
+        let f = FileRow {
+            path: "a.txt".into(),
+            size: 1,
+            locked_by: None,
+            mine_lock: false,
+        };
+        assert_eq!(file_custody(&f, false), theme::Custody::Blocked);
+        assert_eq!(file_custody(&f, true), theme::Custody::Free);
+    }
+
+    #[test]
+    fn custody_distinguishes_your_lease_from_a_peers() {
+        let mine = FileRow {
+            path: "a".into(),
+            size: 0,
+            locked_by: Some("me".into()),
+            mine_lock: true,
+        };
+        let theirs = FileRow {
+            mine_lock: false,
+            ..mine.clone()
+        };
+        assert_eq!(file_custody(&mine, true), theme::Custody::Mine);
+        assert_eq!(file_custody(&theirs, true), theme::Custody::Peer);
     }
 }

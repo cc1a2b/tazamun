@@ -7,12 +7,18 @@
 //! it never competes for layout or input. Pure presentation; no I/O, no state.
 //! Total for degenerate input: zero counts, empty notes and hairline widths
 //! clip and keep going. The only time-dependent behaviour is the busy breath,
-//! which is also the only thing that ever schedules a repaint — idle costs
-//! nothing.
+//! which is also the only thing that ever schedules a repaint — idle, and
+//! reduced motion, cost nothing.
+//!
+//! Painted galleys announce nothing, and this strip is the window's standing
+//! report — the only place the aggregate counts are written at all. So it also
+//! claims one focusable rect carrying [`strip_sentence`]: a reader reaches the
+//! whole strip in one stop and hears one sentence, rather than losing the
+//! counts entirely.
 
 use eframe::egui;
 
-use super::{ornament, theme};
+use super::{a11y, focusnav, ornament, theme};
 
 /// Everything the strip reports, gathered by the caller.
 pub struct Status<'a> {
@@ -35,7 +41,6 @@ pub const STRIP_H: f32 = 26.0;
 /// edge, so square corners here would break the frameless chrome's rounding.
 const R_WINDOW_BOTTOM: u8 = theme::R_WINDOW;
 
-const FONT_PX: f32 = 11.0;
 /// Inset of the first cluster from the left edge.
 const PAD_L: f32 = 14.0;
 /// Air on each side of a separator diamond.
@@ -49,6 +54,14 @@ const NOTE_MIN_W: f32 = 60.0;
 const NOTE_AIR: f32 = 8.0;
 const SEAL_R: f32 = 6.0;
 
+/// What the strip is called when it is read out rather than seen.
+const LEAD: &str = "status";
+/// The khatam seal, in words: filled and breathing while work is in flight,
+/// outlined at rest. Both states are drawn, so both are announced — a reader
+/// must be able to tell "nothing is happening" from "nobody told me".
+const BUSY: &str = "working";
+const IDLE: &str = "idle";
+
 /// Paints the strip across `ui`'s full width. `maximized` follows the window
 /// state so the bottom corners stay square when maximized and rounded when
 /// not, matching the frameless chrome.
@@ -57,6 +70,14 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
     if !rect.is_finite() || !rect.is_positive() {
         return;
     }
+
+    let resp = ui.interact(
+        rect,
+        ui.id().with("status-strip"),
+        egui::Sense::focusable_noninteractive(),
+    );
+    a11y::describe(&resp, &strip_sentence(&s));
+
     let p = ui.painter();
 
     // Surface: flat against the content above, rounded into the window below.
@@ -69,7 +90,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
             sw: r,
             se: r,
         },
-        theme::BG1,
+        theme::bg_chrome(),
     ));
 
     // Top edge: a whisper of strapwork with the hairline over it keeping the
@@ -79,11 +100,11 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
         egui::pos2(rect.right() - 12.0, rect.top() + 6.0),
     )
     .intersect(rect);
-    ornament::girih_band(p, band, theme::GOLD.linear_multiply(0.08));
+    ornament::girih_band(p, band, theme::wash::of(theme::gold(), theme::wash::GHOST));
     p.hline(
         rect.x_range(),
         rect.top() + 0.5,
-        egui::Stroke::new(1.0, theme::stroke_faint().color),
+        egui::Stroke::new(theme::RULE_W, theme::rule_hair()),
     );
 
     // Counts are hard-clipped short of the seal, so no count can ever run
@@ -94,7 +115,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
         egui::pos2(bound, rect.bottom()),
     ));
 
-    let font = egui::FontId::new(FONT_PX, theme::fam_medium());
+    let font = theme::font(theme::step::META, theme::fam_medium());
     let cy = rect.center().y;
     let mut x = rect.left() + PAD_L;
     let mut drawn = 0usize;
@@ -109,7 +130,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
                     &counts,
                     egui::pos2(x, cy),
                     2.2,
-                    theme::GOLD.linear_multiply(0.45),
+                    theme::alpha(theme::gold(), 115),
                 );
                 x += SEP_AIR;
             }
@@ -126,14 +147,14 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
                 s.sessions,
                 plural(s.sessions, "session", "sessions")
             ),
-            theme::DIM,
+            theme::ink_muted(),
         );
         cluster(
             format!("{} running", s.running),
             if s.running > 0 {
-                theme::GOOD
+                theme::custody_good()
             } else {
-                theme::DIM
+                theme::ink_muted()
             },
         );
         cluster(
@@ -143,9 +164,9 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
                 plural(s.peers_online, "peer", "peers")
             ),
             if s.peers_online > 0 {
-                theme::LAPIS
+                theme::custody_peer()
             } else {
-                theme::DIM
+                theme::ink_muted()
             },
         );
         if s.conflicts > 0 {
@@ -155,7 +176,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
                     s.conflicts,
                     plural(s.conflicts, "copy", "copies")
                 ),
-                theme::WARN,
+                theme::custody_stale(),
             );
         }
     }
@@ -165,34 +186,162 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
     if let Some(note) = s.note
         && bound - x >= NOTE_MIN_W
     {
-        let galley = p.layout_no_wrap(note.to_owned(), font, theme::FAINT);
+        let galley = p.layout_no_wrap(note.to_owned(), font, theme::ink_faint());
         let size = galley.size();
         let left = (bound - size.x).max(x + NOTE_AIR);
         let clip = p.with_clip_rect(egui::Rect::from_min_max(
             egui::pos2(x + NOTE_AIR, rect.top()),
             egui::pos2(bound, rect.bottom()),
         ));
-        clip.galley(egui::pos2(left, cy - size.y * 0.5), galley, theme::FAINT);
+        clip.galley(
+            egui::pos2(left, cy - size.y * 0.5),
+            galley,
+            theme::ink_faint(),
+        );
     }
 
-    // The seal: outlined and still at rest, filled and breathing while busy.
+    // The seal: outlined and still at rest, filled while busy — breathing only
+    // when the user has not asked for stillness.
     let seal = egui::pos2(rect.right() - 16.0, cy);
-    if s.busy {
+    let breathing = s.busy && !theme::reduced_motion();
+    if breathing {
         let phase = (ui.input(|i| i.time) * 2.2).sin() as f32 * 0.5 + 0.5;
         ornament::khatam(
             p,
             seal,
             SEAL_R,
-            theme::GOLD.linear_multiply(0.45 + 0.55 * phase),
+            theme::alpha(theme::gold(), (115.0 + 140.0 * phase) as u8),
             true,
         );
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(60));
+        ui.ctx().request_repaint_after(theme::motion::CADENCE);
+    } else if s.busy {
+        ornament::khatam(p, seal, SEAL_R, theme::gold(), true);
     } else {
-        ornament::khatam(p, seal, SEAL_R, theme::GOLD.linear_multiply(0.35), false);
+        ornament::khatam(p, seal, SEAL_R, theme::alpha(theme::gold(), 89), false);
     }
+
+    // Last, so the house ring sits over the strip rather than under its fill.
+    focusnav::ring(ui, &resp);
+}
+
+/// The one sentence the strip announces: the same counts it paints, in the same
+/// order, plus the seal's state and the note. A count the strip drops — zero
+/// preserved copies, a note squeezed out by a narrow window — is dropped here
+/// too, except the note, which costs a reader nothing and is the only place the
+/// current action is named.
+fn strip_sentence(s: &Status<'_>) -> String {
+    let mut parts = vec![
+        format!(
+            "{} {}",
+            s.sessions,
+            plural(s.sessions, "session", "sessions")
+        ),
+        format!("{} running", s.running),
+        format!(
+            "{} {} online",
+            s.peers_online,
+            plural(s.peers_online, "peer", "peers")
+        ),
+    ];
+    if s.conflicts > 0 {
+        parts.push(format!(
+            "{} preserved {}",
+            s.conflicts,
+            plural(s.conflicts, "copy", "copies")
+        ));
+    }
+    parts.push(if s.busy { BUSY } else { IDLE }.to_owned());
+    if let Some(note) = s.note.map(str::trim).filter(|n| !n.is_empty()) {
+        parts.push(note.to_owned());
+    }
+    a11y::sentence(LEAD, &parts)
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status() -> Status<'static> {
+        Status {
+            sessions: 4,
+            running: 2,
+            peers_online: 3,
+            conflicts: 1,
+            busy: true,
+            note: Some("notes.txt"),
+        }
+    }
+
+    #[test]
+    fn sentence_reads_the_whole_strip() {
+        assert_eq!(
+            strip_sentence(&status()),
+            "status: 4 sessions, 2 running, 3 peers online, 1 preserved copy, working, notes.txt"
+        );
+    }
+
+    #[test]
+    fn sentence_drops_the_clause_the_strip_does_not_paint() {
+        // Zero conflicts paints no cluster, so it announces none either.
+        let quiet = Status {
+            conflicts: 0,
+            busy: false,
+            note: None,
+            ..status()
+        };
+        assert_eq!(
+            strip_sentence(&quiet),
+            "status: 4 sessions, 2 running, 3 peers online, idle"
+        );
+    }
+
+    #[test]
+    fn sentence_singularizes_every_count() {
+        let one = Status {
+            sessions: 1,
+            running: 1,
+            peers_online: 1,
+            conflicts: 1,
+            busy: false,
+            note: None,
+        };
+        assert_eq!(
+            strip_sentence(&one),
+            "status: 1 session, 1 running, 1 peer online, 1 preserved copy, idle"
+        );
+    }
+
+    #[test]
+    fn sentence_holds_at_zero_and_at_an_empty_note() {
+        let empty = Status {
+            sessions: 0,
+            running: 0,
+            peers_online: 0,
+            conflicts: 0,
+            busy: false,
+            note: Some("   "),
+        };
+        assert_eq!(
+            strip_sentence(&empty),
+            "status: 0 sessions, 0 running, 0 peers online, idle"
+        );
+    }
+
+    #[test]
+    fn busy_and_idle_are_both_spoken() {
+        let busy = strip_sentence(&Status {
+            busy: true,
+            ..status()
+        });
+        let idle = strip_sentence(&Status {
+            busy: false,
+            ..status()
+        });
+        assert!(busy.contains(BUSY) && !busy.contains(IDLE));
+        assert!(idle.contains(IDLE) && !idle.contains(BUSY));
+    }
 }

@@ -14,15 +14,17 @@ pub const TITLEBAR_H: f32 = 46.0;
 const RESIZE_BAND: f32 = 6.0;
 const CORNER_BAND: f32 = 14.0;
 
-/// The wordmark: a gold `T` and the rest in ink, drawn rather than blitted.
+/// The wordmark: a gold `T` and the rest in ink, drawn rather than blitted,
+/// in the engraved voice. `size` is in pixels — the caller supplies it already
+/// scaled, e.g. `theme::sized(theme::step::DISPLAY)`.
 ///
 /// It used to be a pre-rendered texture of the shaped Arabic `تزامُن`, because
 /// egui has no bidi or shaping and would have drawn the letters disjoint. The
-/// Latin form needs neither: it renders from the embedded Inter at any size,
+/// Latin form needs neither: it renders from the embedded serif at any size,
 /// stays crisp on every display scale, and — the reason it changed — is simply
 /// easier to read at UI size for the people using this.
 pub fn wordmark(ui: &mut egui::Ui, size: f32) {
-    let font = FontId::new(size, super::theme::fam_semibold());
+    let font = FontId::new(size, theme::fam_serif());
     let mut job = egui::text::LayoutJob::default();
     let mut part = |text: &str, color| {
         job.append(
@@ -35,8 +37,8 @@ pub fn wordmark(ui: &mut egui::Ui, size: f32) {
             },
         );
     };
-    part("T", super::theme::GOLD);
-    part("azamun", super::theme::INK);
+    part("T", theme::gold());
+    part("azamun", theme::ink());
     ui.label(job);
 }
 
@@ -63,12 +65,12 @@ pub fn paint_root(ui: &egui::Ui, maximized: bool) {
     let rect = ui.max_rect();
     let r = radius(maximized);
     let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(r), theme::BG0);
+    p.rect_filled(rect, CornerRadius::same(r), theme::bg_deep());
     if !maximized {
         p.rect_stroke(
             rect.shrink(0.5),
             CornerRadius::same(r),
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xe9, 0xec, 0xf8, 26)),
+            Stroke::new(theme::RULE_W, theme::rule_divider()),
             egui::StrokeKind::Inside,
         );
     }
@@ -85,18 +87,18 @@ pub fn paint_titlebar_bg(ui: &egui::Ui, maximized: bool) {
         se: 0,
     };
     let p = ui.painter();
-    p.rect_filled(rect, cr, theme::BG1);
+    p.rect_filled(rect, cr, theme::bg_chrome());
     // The brand signature: a whisper of girih strapwork along the bar's foot,
     // with the hairline underneath keeping the edge crisp.
     let band = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 10.0, rect.bottom() - 7.0),
         egui::pos2(rect.right() - 10.0, rect.bottom() - 1.5),
     );
-    ornament::girih_band(p, band, theme::GOLD.linear_multiply(0.10));
+    ornament::girih_band(p, band, theme::wash::of(theme::gold(), theme::wash::GHOST));
     p.hline(
         rect.x_range(),
         rect.bottom() - 0.5,
-        Stroke::new(1.0, theme::GOLD.linear_multiply(0.16)),
+        Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 41)),
     );
 }
 
@@ -109,9 +111,12 @@ pub fn paint_sidebar_bg(ui: &egui::Ui, maximized: bool) {
         sw: radius(maximized),
         se: 0,
     };
-    ui.painter().rect_filled(rect, cr, theme::BG1);
-    ui.painter()
-        .vline(rect.right() - 0.5, rect.y_range(), theme::stroke_faint());
+    ui.painter().rect_filled(rect, cr, theme::bg_chrome());
+    ui.painter().vline(
+        rect.right() - 0.5,
+        rect.y_range(),
+        Stroke::new(theme::RULE_W, theme::rule_hair()),
+    );
 }
 
 /// Title-bar drag / double-click handling over `bar_rect`. Call BEFORE laying
@@ -143,21 +148,26 @@ pub fn window_button(ui: &mut egui::Ui, kind: WinButton, maximized: bool) -> egu
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let hovered = resp.hovered();
     let danger = matches!(kind, WinButton::Close);
-    let t = ui.ctx().animate_bool_with_time(resp.id, hovered, 0.10);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, hovered, theme::dur(theme::motion::TOUCH));
     if t > 0.0 {
         let fill = if danger {
-            theme::lerp_color(Color32::TRANSPARENT, theme::BAD.linear_multiply(0.9), t)
+            theme::mix(
+                Color32::TRANSPARENT,
+                theme::alpha(theme::custody_blocked(), 230),
+                t,
+            )
         } else {
-            theme::lerp_color(Color32::TRANSPARENT, theme::BG3, t)
+            theme::mix(Color32::TRANSPARENT, theme::bg_raise(), t)
         };
-        ui.painter().rect_filled(rect, 7.0, fill);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(theme::R_CHIP), fill);
     }
-    let ink = if danger && hovered {
-        Color32::WHITE
-    } else if hovered {
-        theme::INK
+    let ink = if hovered {
+        theme::ink()
     } else {
-        theme::DIM
+        theme::ink_muted()
     };
     let s = Stroke::new(1.25, ink);
     let c = rect.center();
@@ -172,7 +182,7 @@ pub fn window_button(ui: &mut egui::Ui, kind: WinButton, maximized: bool) -> egu
                 let r1 = Rect::from_center_size(c + egui::vec2(-1.5, 1.5), egui::vec2(7.0, 7.0));
                 let r2 = Rect::from_center_size(c + egui::vec2(1.5, -1.5), egui::vec2(7.0, 7.0));
                 p.rect_stroke(r2, 1.5, s, egui::StrokeKind::Middle);
-                p.rect_filled(r1.expand(0.8), 1.5, theme::BG1);
+                p.rect_filled(r1.expand(0.8), 1.5, theme::bg_chrome());
                 p.rect_stroke(r1, 1.5, s, egui::StrokeKind::Middle);
             } else {
                 let r1 = Rect::from_center_size(c, egui::vec2(9.0, 9.0));

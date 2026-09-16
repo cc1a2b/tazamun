@@ -6,7 +6,7 @@
 //! for degenerate inputs, and the only clock is `animate_bool_with_time`.
 
 use eframe::egui;
-use egui::{CornerRadius, FontFamily, FontId, Margin, Rangef, Rect, Sense, Stroke, StrokeKind};
+use egui::{CornerRadius, FontFamily, Margin, Rangef, Rect, Sense, Stroke, StrokeKind};
 use egui::{pos2, vec2};
 
 use super::theme;
@@ -31,8 +31,8 @@ struct FieldSpec {
 }
 
 /// The house text field: a recessed well with a hairline rule that grows into
-/// a 2px gold underline from the centre outward as the field takes focus.
-/// `state` tints the rule (GOOD/BAD) when not Neutral. Height 30.
+/// a gold underline from the centre outward as the field takes focus.
+/// `state` tints the rule (settled / blocked) when not Neutral. Height 30.
 pub fn text_field(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -98,7 +98,7 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
 
     // Magnifier: glass sits up-left of the mark centre so glass plus handle
     // reads optically centred at (left + 17, centre y).
-    let s = Stroke::new(1.3, theme::DIM);
+    let s = Stroke::new(1.3, theme::ink_muted());
     let glass = pos2(rect.left() + 15.6, rect.center().y - 1.4);
     let d = std::f32::consts::FRAC_1_SQRT_2;
     let p = ui.painter();
@@ -123,9 +123,9 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
             .interact(clear_rect, response.id.with("clear"), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         let color = if mark.hovered() {
-            theme::INK
+            theme::ink()
         } else {
-            theme::DIM
+            theme::ink_muted()
         };
         let c = clear_rect.center();
         let r = 3.4;
@@ -139,9 +139,9 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
     SearchOut { response, cleared }
 }
 
-/// A crafted focus ring for any widget: a 1px gold rounded outline inset 2px,
-/// with four tiny corner ticks. `t` is 0..=1 (animate it with
-/// `ctx.animate_bool_with_time`); nothing is drawn at t <= 0.
+/// A crafted focus ring for any widget: a hairline rounded outline inset 2px
+/// in the palette's focus colour, with four tiny corner ticks. `t` is 0..=1
+/// (animate it with `ctx.animate_bool_with_time`); nothing is drawn at t <= 0.
 pub fn focus_ring(ui: &egui::Ui, rect: Rect, t: f32) {
     if !t.is_finite() || t <= 0.0 || !rect.is_finite() || !rect.is_positive() {
         return;
@@ -154,11 +154,14 @@ pub fn focus_ring(ui: &egui::Ui, rect: Rect, t: f32) {
     let p = ui.painter();
     p.rect_stroke(
         r,
-        CornerRadius::same(theme::R_INPUT + 1),
-        Stroke::new(1.0, theme::GOLD.linear_multiply(0.55 * t)),
+        CornerRadius::same(theme::R_CONTROL),
+        Stroke::new(
+            theme::RULE_W,
+            theme::alpha(theme::focus(), (140.0 * t) as u8),
+        ),
         StrokeKind::Inside,
     );
-    let s = Stroke::new(1.25, theme::GOLD.linear_multiply(0.9 * t));
+    let s = Stroke::new(1.25, theme::alpha(theme::focus(), (230.0 * t) as u8));
     // An L of two 4px arms hugging each corner.
     let arms = [
         (r.left_top(), 1.0, 1.0),
@@ -190,11 +193,15 @@ fn field_impl(
     let (rect, _bg) = ui.allocate_exact_size(vec2(width, FIELD_H), Sense::hover());
 
     let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(theme::R_INPUT), theme::BG_INPUT);
+    p.rect_filled(
+        rect,
+        CornerRadius::same(theme::R_CONTROL),
+        theme::bg_sunken(),
+    );
     p.rect_stroke(
         rect,
-        CornerRadius::same(theme::R_INPUT),
-        theme::stroke_faint(),
+        CornerRadius::same(theme::R_CONTROL),
+        Stroke::new(theme::RULE_W, theme::rule_hair()),
         StrokeKind::Inside,
     );
 
@@ -207,37 +214,47 @@ fn field_impl(
         .frame(egui::Frame::new())
         .desired_width(inner.width())
         .hint_text(hint.to_owned())
-        .text_color(theme::INK)
+        .text_color(theme::ink())
         .margin(Margin::ZERO)
         .font(if spec.mono {
-            FontId::new(12.0, FontFamily::Monospace)
+            theme::font(theme::step::DATA, theme::fam_mono())
         } else {
-            FontId::new(13.0, FontFamily::Proportional)
+            theme::font(theme::step::LABEL, FontFamily::Proportional)
         });
-    // TextEdit recolors its hint with `weak_text_color`, so scope that to
-    // FAINT rather than tinting the hint text directly.
+    // TextEdit recolors its hint with `weak_text_color`, so scope that to the
+    // faint ink rather than tinting the hint text directly.
     let resp = ui
         .scope(|ui| {
-            ui.style_mut().visuals.weak_text_color = Some(theme::FAINT);
+            ui.style_mut().visuals.weak_text_color = Some(theme::ink_faint());
             ui.put(inner, te)
         })
         .inner;
 
     let t = ui
         .ctx()
-        .animate_bool_with_time(resp.id.with("rule"), resp.has_focus(), 0.16)
+        .animate_bool_with_time(
+            resp.id.with("rule"),
+            resp.has_focus(),
+            theme::dur(theme::motion::STATE),
+        )
         .clamp(0.0, 1.0);
     let (accent, resting) = match spec.state {
-        FieldState::Neutral => (theme::GOLD, theme::FAINT.linear_multiply(0.35)),
-        FieldState::Valid => (theme::GOOD, theme::GOOD.linear_multiply(0.5)),
-        FieldState::Invalid => (theme::BAD, theme::BAD.linear_multiply(0.5)),
+        FieldState::Neutral => (theme::gold(), theme::alpha(theme::ink_faint(), 89)),
+        FieldState::Valid => (
+            theme::custody_good(),
+            theme::alpha(theme::custody_good(), 128),
+        ),
+        FieldState::Invalid => (
+            theme::custody_blocked(),
+            theme::alpha(theme::custody_blocked(), 128),
+        ),
     };
     let y = rect.bottom() - 3.0;
     let p = ui.painter();
     p.hline(
         Rangef::new(inner.left(), inner.right()),
         y,
-        Stroke::new(1.0, resting),
+        Stroke::new(theme::RULE_W, resting),
     );
     if t > 0.0 && inner.width() > 0.0 {
         let half = inner.width() * 0.5 * t;
@@ -245,7 +262,7 @@ fn field_impl(
         p.hline(
             Rangef::new(cx - half, cx + half),
             y,
-            Stroke::new(2.0, accent),
+            Stroke::new(theme::RULE_ACCENT_W, accent),
         );
     }
 

@@ -1,202 +1,262 @@
-//! Crafted secondary controls for the native GUI: the ghost-button family,
-//! the red bevel for destructive actions, the animated disclosure chevron,
-//! dotted-leader key/value rows, count chips and diamond bullets — the pieces
-//! that retire the last stock-egui widgets from the app's quieter corners.
-//! Pure presentation over `theme` and `ornament`; zero I/O, total for
-//! degenerate inputs, and the only clock is `animate_bool_with_time`.
+//! The control set: the quiet siblings of the primary plate — the ghost-button
+//! family, the destructive plate, the disclosure chevron, the dotted-leader
+//! key/value line, the count chip and the diamond bullet.
+//!
+//! Pure presentation over `theme`, `ornament`, `register` and the plate form in
+//! `components`; zero I/O, total for degenerate inputs, and the only clock is
+//! `animate_bool_with_time`.
+//!
+//! Every control here is drawn rather than themed, because egui resolves a
+//! widget's visuals from the *previous* frame's response — which is one frame
+//! late for a focus ring, and the ring is the only thing telling a keyboard
+//! user where they are.
 
 use eframe::egui;
-use egui::{Color32, CornerRadius, FontFamily, FontId, RichText, Sense, Stroke, Vec2};
+use egui::{FontFamily, Sense, Stroke, StrokeKind, Vec2};
 use egui::{pos2, vec2};
 
-use super::{ornament, theme};
+use super::{components, ornament, register, theme};
 
-const DANGER_FILL: Color32 = Color32::from_rgb(0x66, 0x24, 0x24);
-const DANGER_HOVER: Color32 = Color32::from_rgb(0x7d, 0x2c, 0x2c);
-const DANGER_INK: Color32 = Color32::from_rgb(0xff, 0xd9, 0xd9);
-
-/// Secondary action: transparent fill, hairline border; on hover the fill
-/// warms to BG3 and a 2px gold underline sweeps in from the left (animated);
-/// while pressed the border turns gold. Standard control height (~28).
+/// The secondary action: a hairline-outlined control, transparent at rest, with
+/// a gold rule that sweeps in along its foot under the pointer.
 pub fn ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ghost_impl(ui, label, 13.0, 28.0, vec2(14.0, 4.0))
+    ghost(
+        ui,
+        label,
+        theme::step::LABEL,
+        vec2(theme::space::L, theme::space::M),
+    )
 }
 
-/// The compact row variant of [`ghost_button`] (~20px tall, 11.5 text) for
-/// dense lists (file rows, version rows).
+/// The row-sized [`ghost_button`], for the dense registers where a full-height
+/// control would break the line pitch.
 pub fn ghost_small(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ghost_impl(ui, label, 11.5, 20.0, vec2(9.0, 2.0))
+    ghost(
+        ui,
+        label,
+        theme::step::META,
+        vec2(theme::space::M, theme::space::S),
+    )
 }
 
-fn ghost_impl(
-    ui: &mut egui::Ui,
-    label: &str,
-    text_size: f32,
-    height: f32,
-    padding: Vec2,
-) -> egui::Response {
-    let resp = ui
-        .scope(|ui| {
-            ui.spacing_mut().interact_size.y = height;
-            ui.spacing_mut().button_padding = padding;
-            let v = &mut ui.style_mut().visuals;
-            for w in [
-                &mut v.widgets.inactive,
-                &mut v.widgets.hovered,
-                &mut v.widgets.active,
-            ] {
-                w.fg_stroke = Stroke::new(1.0, theme::INK);
-                w.corner_radius = CornerRadius::same(theme::R_BUTTON);
-                w.expansion = 0.0;
-            }
-            v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-            v.widgets.inactive.bg_stroke = theme::stroke_faint();
-            v.widgets.hovered.weak_bg_fill = theme::BG3;
-            v.widgets.hovered.bg_stroke = theme::stroke_faint();
-            v.widgets.active.weak_bg_fill = theme::BG3;
-            v.widgets.active.bg_stroke = Stroke::new(1.0, theme::GOLD);
-            ui.add(egui::Button::new(
-                RichText::new(label)
-                    .size(text_size)
-                    .family(theme::fam_medium())
-                    .color(theme::INK),
-            ))
-        })
-        .inner;
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(resp.id, resp.hovered(), 0.16);
-    if t > 0.0 && resp.rect.width() > 8.0 {
-        let left = resp.rect.left() + 4.0;
-        ui.painter().hline(
-            egui::Rangef::new(left, left + (resp.rect.width() - 8.0) * t),
-            resp.rect.bottom() - 2.0,
-            Stroke::new(2.0, theme::GOLD.linear_multiply(0.85 * t)),
-        );
-    }
-    resp
-}
-
-/// Destructive primary: the bevel treatment in the red family — fill 0x66/24/24,
-/// hover 0x7d/2c/2c, label 0xff/d9/d9 (fam_medium), 1px white-12% inner top
-/// highlight suppressed while pressed. Min height 30.
-pub fn bevel_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let resp = ui
-        .scope(|ui| {
-            ui.spacing_mut().interact_size.y = 30.0;
-            let v = &mut ui.style_mut().visuals;
-            for w in [
-                &mut v.widgets.inactive,
-                &mut v.widgets.hovered,
-                &mut v.widgets.active,
-            ] {
-                w.fg_stroke = Stroke::new(1.0, DANGER_INK);
-                w.bg_stroke = Stroke::NONE;
-                w.corner_radius = CornerRadius::same(theme::R_BUTTON);
-                w.expansion = 0.0;
-            }
-            v.widgets.inactive.weak_bg_fill = DANGER_FILL;
-            v.widgets.hovered.weak_bg_fill = DANGER_HOVER;
-            v.widgets.active.weak_bg_fill = DANGER_FILL;
-            ui.add(egui::Button::new(
-                RichText::new(label)
-                    .size(13.5)
-                    .family(theme::fam_medium())
-                    .color(DANGER_INK),
-            ))
-        })
-        .inner;
-    if !resp.is_pointer_button_down_on() && resp.rect.width() > 8.0 {
-        ui.painter().hline(
-            egui::Rangef::new(resp.rect.left() + 3.0, resp.rect.right() - 3.0),
-            resp.rect.top() + 1.5,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
-        );
-    }
-    resp
-}
-
-/// Painter-drawn disclosure chevron in a 16x16 click cell: a right-pointing
-/// triangle that rotates smoothly to down when `open` (animate_bool), DIM at
-/// rest, INK on hover.
-pub fn chevron(ui: &mut egui::Ui, open: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let t = ui.ctx().animate_bool_with_time(resp.id, open, 0.14);
-    let angle = t * std::f32::consts::FRAC_PI_2;
-    let c = rect.center();
-    let color = if resp.hovered() {
-        theme::INK
+/// The ghost body.
+///
+/// * **rest** — no fill, a `rule_divider` hairline, the label in `ink`.
+/// * **hover** — the ground lifts to `bg_raise`, the hairline warms to
+///   `gold_deep`, and a 2px gold rule sweeps along the foot from the left.
+/// * **focus** — the focus ring outside the control and the foot rule drawn to
+///   its full length, with the resting ground kept so focus never has to be
+///   told apart from hover by colour alone.
+/// * **pressed** — the hairline goes to full `gold` and the label drops one
+///   pixel.
+/// * **disabled** — hairline and label in `ink_disabled`, no fill, no sweep, no
+///   ring, no pointer cursor.
+fn ghost(ui: &mut egui::Ui, label: &str, step: f32, pad: Vec2) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let face = if enabled {
+        theme::ink()
     } else {
-        theme::DIM
+        theme::ink_disabled()
     };
-    // Isoceles triangle pointing right at rest (vertex angles 0/140/220 deg),
-    // rotated toward down as the section opens.
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        theme::font(step, theme::fam_medium()),
+        face,
+    );
+    let size = vec2(
+        galley.size().x + pad.x * 2.0,
+        (theme::sized(step) + pad.y * 2.0).max(galley.size().y),
+    );
+    let (rect, resp) = ui.allocate_at_least(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+
+    let pressed = enabled && resp.is_pointer_button_down_on();
+    let hovered = enabled && resp.hovered();
+    let focused = enabled && resp.has_focus();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let reached = ui.ctx().animate_bool_with_time(
+        resp.id,
+        hovered || focused,
+        theme::dur(theme::motion::STATE),
+    );
+    let sweep = if !enabled {
+        0.0
+    } else if pressed {
+        1.0
+    } else {
+        reached
+    };
+
+    let body = components::snapped(rect);
+    let edge = if !enabled {
+        // Held back deliberately: at full strength `ink_disabled` is a *heavier*
+        // line than the resting rule in both palettes, so an unusable control
+        // would be the loudest thing in the row.
+        theme::alpha(theme::ink_disabled(), 140)
+    } else if pressed {
+        theme::gold()
+    } else if hovered {
+        theme::gold_deep()
+    } else {
+        theme::rule_divider()
+    };
+    let p = ui.painter();
+    if hovered || pressed {
+        p.rect_filled(body, theme::R_CONTROL, theme::bg_raise());
+    }
+    p.rect_stroke(
+        body,
+        theme::R_CONTROL,
+        Stroke::new(theme::RULE_W, edge),
+        StrokeKind::Inside,
+    );
+
+    let mut at = components::centre(rect, galley.size());
+    if pressed {
+        at.y += 1.0;
+    }
+    p.galley(at, galley, face);
+
+    if sweep > 0.0 && body.width() > theme::space::M {
+        let from = body.left() + theme::space::S;
+        let span = (body.width() - theme::space::M) * sweep;
+        p.hline(
+            egui::Rangef::new(from, from + span),
+            theme::snap(body.bottom() - theme::RULE_ACCENT_W),
+            Stroke::new(theme::RULE_ACCENT_W, theme::alpha(theme::gold(), 215)),
+        );
+    }
+    if focused {
+        register::focus_ring(p, rect);
+    }
+    resp
+}
+
+/// The destructive action: the plate form in the danger family, so it is the
+/// same object as the primary it sits beside in a confirm dialog and differs
+/// only in colour. States are [`components::plate`]'s.
+pub fn bevel_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    components::plate(
+        ui,
+        label,
+        theme::danger_fill(),
+        theme::danger_hover(),
+        theme::on_danger(),
+    )
+}
+
+/// The disclosure mark: a painter-drawn triangle in a square click cell,
+/// pointing right when shut and turning through a quarter circle as the section
+/// opens. `ink_muted` at rest, `ink` under the pointer or while focused, `gold`
+/// while pressed, `ink_disabled` when the cell cannot be used; the focus ring
+/// goes round the whole cell.
+pub fn chevron(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let side = theme::sized(theme::step::TITLE) + theme::space::XS;
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
+    let name = if open { "Collapse" } else { "Expand" };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name));
+    if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let turn = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, open, theme::dur(theme::motion::STATE));
+    let color = if !enabled {
+        theme::ink_disabled()
+    } else if resp.is_pointer_button_down_on() {
+        theme::gold()
+    } else if resp.hovered() || resp.has_focus() {
+        theme::ink()
+    } else {
+        theme::ink_muted()
+    };
+    // Isoceles triangle pointing right at rest (vertex angles 0/140/220
+    // degrees), rotated toward down as the section opens.
+    let angle = turn * std::f32::consts::FRAC_PI_2;
+    let c = rect.center();
+    let r = side * 0.3;
     let points: Vec<_> = [0.0_f32, 140.0, 220.0]
         .into_iter()
         .map(|deg| {
             let a = deg.to_radians() + angle;
-            pos2(c.x + 5.0 * a.cos(), c.y + 5.0 * a.sin())
+            pos2(c.x + r * a.cos(), c.y + r * a.sin())
         })
         .collect();
-    ui.painter()
-        .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    let p = ui.painter();
+    p.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    if enabled && resp.has_focus() {
+        register::focus_ring(p, rect);
+    }
     resp
 }
 
-/// A dotted-leader key/value line (book-index style): label (12, DIM) on the
-/// left, value (12, monospace, INK) on the right, and a row of 1px leader dots
-/// (FAINT at 40%, one every 4px) filling the gap on the shared baseline.
+/// A key and its value on one line, joined by a book-index leader: the key in
+/// `ink_muted` on the left, the value in the tabular face on the right, and a
+/// run of hairline dots across the gap on the shared baseline. The value is the
+/// record, so when the line is too narrow the key elides and the value stays
+/// whole.
 pub fn leader_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width().max(0.0), 18.0), Sense::hover());
+    let h = theme::sized(theme::step::BODY) + theme::space::S;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(0.0), h), Sense::hover());
     if rect.width() <= 0.0 {
         return;
     }
     let p = ui.painter().with_clip_rect(rect);
-    let label_galley = p.layout_no_wrap(
-        label.to_owned(),
-        FontId::new(12.0, FontFamily::Proportional),
-        theme::DIM,
-    );
     let value_galley = p.layout_no_wrap(
         value.to_owned(),
-        FontId::new(12.0, FontFamily::Monospace),
-        theme::INK,
+        theme::font(theme::step::DATA, theme::fam_mono()),
+        theme::ink(),
     );
+    let value_w = value_galley.size().x;
+
+    let mut job = egui::text::LayoutJob::single_section(
+        label.to_owned(),
+        egui::TextFormat {
+            font_id: theme::font(theme::step::LABEL, FontFamily::Proportional),
+            color: theme::ink_muted(),
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(
+        (rect.width() - value_w - theme::space::XL).max(0.0),
+    );
+    let label_galley = p.layout_job(job);
     let label_size = label_galley.size();
-    let value_size = value_galley.size();
-    let dots_from = rect.left() + label_size.x + 8.0;
-    let dots_to = rect.right() - value_size.x - 8.0;
-    // Leaders only when a real gap remains; a long value just clips instead.
-    if dots_to - dots_from >= 12.0 {
-        let baseline_y = rect.bottom() - 5.0;
-        let count = (((dots_to - dots_from) / 4.0).floor() as usize + 1).min(2048);
+
+    let from = rect.left() + label_size.x + theme::space::M;
+    let to = rect.right() - value_w - theme::space::M;
+    // Leaders only when a real gap remains; below that the line is already full.
+    if to - from >= theme::space::L {
+        // The value's own metrics, so the dots keep sitting on its baseline at
+        // every text scale.
+        let baseline = rect.center().y + value_galley.size().y * 0.3;
+        let count = (((to - from) / theme::space::S).floor() as usize + 1).min(2048);
+        let dot = theme::alpha(theme::ink_faint(), 120);
         for k in 0..count {
-            p.circle_filled(
-                pos2(dots_from + k as f32 * 4.0, baseline_y),
-                0.7,
-                theme::FAINT.linear_multiply(0.4),
-            );
+            p.circle_filled(pos2(from + k as f32 * theme::space::S, baseline), 0.7, dot);
         }
     }
     p.galley(
-        pos2(rect.left(), rect.center().y - label_size.y / 2.0),
+        pos2(rect.left(), rect.center().y - label_size.y * 0.5),
         label_galley,
-        theme::DIM,
+        theme::ink_muted(),
     );
     p.galley(
         pos2(
-            rect.right() - value_size.x,
-            rect.center().y - value_size.y / 2.0,
+            rect.right() - value_w,
+            rect.center().y - value_galley.size().y * 0.5,
         ),
         value_galley,
-        theme::INK,
+        theme::ink(),
     );
 }
 
-/// A tiny gold count chip (mono 9.5 on GOLD-tinted pill, ~16x14 min); draws
-/// nothing when `n == 0`.
+/// A tally: the count in the tabular face inside a square-cut gold chip, at
+/// least as wide as it is tall so a single digit reads as a mark rather than a
+/// sliver. Nothing is drawn for zero — an absent count is not a count of none.
 pub fn count_chip(ui: &mut egui::Ui, n: usize) {
     if n == 0 {
         return;
@@ -206,30 +266,33 @@ pub fn count_chip(ui: &mut egui::Ui, n: usize) {
     } else {
         n.to_string()
     };
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text, FontId::new(9.5, FontFamily::Monospace), theme::GOLD);
-    let size = galley.size();
-    let (rect, _) = ui.allocate_exact_size(vec2((size.x + 8.0).max(16.0), 14.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 7.0, theme::GOLD.linear_multiply(0.15));
-    p.galley(
-        pos2(
-            rect.center().x - size.x / 2.0,
-            rect.center().y - size.y / 2.0,
-        ),
-        galley,
-        theme::GOLD,
+    let c = theme::gold();
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        theme::font(theme::step::CAPTION, theme::fam_mono_medium()),
+        c,
     );
+    let h = theme::sized(theme::step::META) + theme::space::S;
+    let (rect, _) = ui.allocate_exact_size(
+        vec2((galley.size().x + theme::space::M).max(h), h),
+        Sense::hover(),
+    );
+    let p = ui.painter();
+    p.rect_filled(rect, theme::R_CHIP, theme::wash::of(c, theme::wash::TINT));
+    p.rect_stroke(
+        rect,
+        theme::R_CHIP,
+        Stroke::new(theme::RULE_W, theme::alpha(c, 110)),
+        StrokeKind::Inside,
+    );
+    p.galley(components::centre(rect, galley.size()), galley, c);
 }
 
-/// A small gold diamond bullet for list lines (10x14 cell, r=2.2 at 50% gold).
+/// The house diamond, sized and spaced to open a line of running text.
 pub fn diamond_bullet(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
-    ornament::diamond(
-        ui.painter(),
-        rect.center(),
-        2.2,
-        theme::GOLD.linear_multiply(0.5),
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(theme::space::L, theme::sized(theme::step::BODY)),
+        Sense::hover(),
     );
+    ornament::diamond(ui.painter(), rect.center(), 2.2, theme::gold_deep());
 }
