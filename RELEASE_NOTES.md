@@ -1,3 +1,76 @@
+# Tazamun v0.1.9
+
+The window is rebuilt as a register of custody. The GUI read as a generic dark
+dashboard: the codebase already owned a real Islamic-geometric language —
+khatam stars, girih strapwork, the house diamond — and modules named for a
+manuscript, but the chassis underneath was cards and capsules and the ornament
+was decoration sprinkled on top. This makes that language the structure of the
+page instead.
+
+## What you will notice
+
+- **Entries are ruled, not boxed.** Files, Peers, History, Conflicts and Audit
+  were stacks of cards, each free to disagree with the next about where its
+  columns sat. They are now one ruled register each, under a single column
+  ruler, with a folio in the margin and a khatam seal beside anything under
+  lease. A file list that showed five rows now shows twenty-plus.
+- **Three palettes.** Night (ink on a dark desk), Paper (ink on warm stock) and
+  Contrast, switchable in Settings alongside register density and a
+  reduced-motion setting. All four persist.
+- **New typography.** Inter and Noto Sans Arabic are replaced by the IBM Plex
+  superfamily — nine faces for 1.87 MB against the old four for 2.09 MB. Mono
+  carries every figure, so columns of bytes and timings actually line up.
+- **The Overview answers the question.** It opens with a sentence — "5 files,
+  nothing is held, in step with 1 peer." — and shows what needs you only when
+  something does, instead of a strip of numbers to assemble yourself.
+
+## Things that were wrong, not merely plain
+
+- **Conflict resolution had its severity inverted.** "Keep mine" overwrites the
+  file on every peer *and* deletes the preserved copy, yet it was the
+  unconfirmed primary button while the lesser "keep theirs" wore the danger
+  styling and asked first. Both destructive verbs now warn and confirm.
+- **`keep both` was missing entirely** — the one resolution that deletes
+  nothing. Worse, for a preserved copy whose original path was never recorded,
+  the only action the window offered was the one that destroyed it.
+- **A failed read rendered as reassurance.** An unreadable conflicts directory
+  displayed "No conflicts waiting — every preserved copy is resolved". The view
+  layer can no longer express "empty" for a source it could not read.
+- **Lease refusals threw away the daemon's diagnosis.** It names which of the
+  three preconditions blocked the edit, what clears it, and who holds the
+  lease; the window kept the one-line message and dropped the rest. The words
+  REACHABILITY, FRESHNESS and LEASE now appear where they are needed.
+- **Accessibility was compiled out.** `default-features = false` dropped
+  AccessKit from eframe's defaults, so every screen-reader annotation in the
+  app — including those that predate this release — was inert. It is on, and
+  the painted figures (the balance, the peer mesh, the status strip, the invite
+  ticket) now describe themselves in a sentence.
+
+## Under it
+
+- One wedged daemon used to freeze the whole window for the full 30-second IPC
+  timeout, because the worker awaited every command inline. Commands now run
+  concurrently behind a gate per folder, sessions are polled in parallel on a
+  3-second timeout, and every click raises a ticket you can see and cancel.
+- Eleven operations the CLI has always had are reachable from the window for
+  the first time: `lock --wait`, `mv`, `diff`, `doctor`, `dashboard`, `gc`,
+  `conflicts prune`, role- and TTL-scoped `invite`, `rekey`, and the supervisor.
+- Files past the daemon's 1000-path cap were invisible to any UI. A server-side
+  query makes them searchable, pageable and lockable, and the same is true of
+  the audit ledger.
+
+## Fixed in the test suite
+
+Three timing races in the conflict tests and two Windows-only path assertions
+had been failing since before v0.1.4 without anyone seeing them: the `full`
+matrix, the only job that builds on Windows and macOS, is skipped for pushes to
+main. One of the races presented as the product overwriting bytes it had in
+fact preserved correctly — a test accusing the engine of losing data when it
+had not. All five are fixed and all three platforms are green.
+
+No engine changes. The Golden Invariant, the lease state machine and the path
+sanitizer are untouched.
+
 # Tazamun v0.1.8
 
 A one-command rename: `tazamun mv <old> <new>`. Renaming a synced file with a
