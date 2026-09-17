@@ -22,31 +22,22 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn color(self) -> egui::Color32 {
+    /// Colour in this window means custody and nothing else, so a toast borrows
+    /// the state it is reporting on rather than owning a second vocabulary.
+    fn custody(self) -> theme::Custody {
         match self {
-            Kind::Info => theme::LAPIS,
-            Kind::Good => theme::GOOD,
-            Kind::Warn => theme::WARN,
-            Kind::Bad => theme::BAD,
+            Kind::Info => theme::Custody::Peer,
+            Kind::Good => theme::Custody::Good,
+            Kind::Warn => theme::Custody::Stale,
+            Kind::Bad => theme::Custody::Blocked,
         }
     }
 }
 
 /// How long a toast lives, in seconds.
-pub const TTL: f64 = 4.0;
+const TTL: f64 = 4.0;
 /// How many toasts are shown at once; older ones expire first.
-pub const MAX_VISIBLE: usize = 3;
-
-/// Fade/rise-in duration, seconds.
-const FADE_IN: f64 = 0.15;
-/// Fade-out duration at the end of life, seconds.
-const FADE_OUT: f64 = 0.4;
-/// Pixels a toast travels upward as it fades in.
-const RISE: f32 = 10.0;
-/// Vertical pitch between stacked toasts, pixels.
-const PITCH: f32 = 40.0;
-/// Gap between the bottom edge and the newest toast, pixels.
-const BOTTOM_INSET: f32 = 20.0;
+const MAX_VISIBLE: usize = 3;
 
 struct Toast {
     text: String,
@@ -114,55 +105,77 @@ impl Queue {
     }
 }
 
-/// Draws the stack bottom-centre: newest nearest the bottom, each fading and
-/// rising into place, with a seal dot in its kind's colour. Requests a repaint
-/// only while at least one toast is live.
+/// Draws the stack bottom-centre, newest nearest the bottom. Each toast is a
+/// square slip laid on the register: a hairline border, a custody-coloured bar
+/// down its leading edge, the khatam seal, and the line itself. Requests a
+/// repaint only while at least one toast is live.
 pub fn draw(ui: &egui::Ui, q: &Queue, now: f64) {
     if q.is_empty() {
         return;
     }
+    let pitch = theme::density().row_h() + theme::space::M;
     // Index 0 sits at the bottom, so walk newest-first.
     for (i, toast) in q.items.iter().rev().enumerate() {
         let age = now - toast.born;
-        let t_in = ((age / FADE_IN).min(1.0)) as f32;
-        let t_out = (((TTL - age) / FADE_OUT).min(1.0)) as f32;
-        let alpha = t_in.min(t_out).max(0.0);
-        let rise = (1.0 - t_in) * RISE;
-        let color = toast.kind.color();
-        let dy = -BOTTOM_INSET - (i as f32) * PITCH + rise;
+        let entered = ramp(age, theme::dur(theme::motion::STATE));
+        let remaining = ramp(TTL - age, theme::dur(theme::motion::CEREMONY));
+        let opacity = entered.min(remaining);
+        let color = toast.kind.custody().color();
+        let dy = -theme::space::XL - (i as f32) * pitch + (1.0 - entered) * theme::space::M;
         egui::Area::new(egui::Id::new(("toast", i)))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, dy))
             .show(ui.ctx(), |ui| {
-                ui.set_opacity(alpha);
-                egui::Frame::new()
-                    .fill(theme::BG1)
-                    .stroke(egui::Stroke::new(1.0, color.linear_multiply(0.55)))
-                    .corner_radius(20)
-                    .inner_margin(egui::Margin::symmetric(14, 9))
-                    .shadow(egui::Shadow {
-                        offset: [0, 4],
-                        blur: 18,
-                        spread: 0,
-                        color: egui::Color32::from_black_alpha(110),
-                    })
+                ui.set_opacity(opacity);
+                let slip = egui::Frame::new()
+                    .fill(theme::bg_raise())
+                    .stroke(egui::Stroke::new(theme::RULE_W, theme::rule_emphasis()))
+                    .corner_radius(egui::CornerRadius::same(theme::R_NONE))
+                    .inner_margin(egui::Margin::symmetric(
+                        theme::space::L as i8,
+                        theme::space::M as i8,
+                    ))
+                    .shadow(theme::elevation::overlay())
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = theme::space::M;
                         ui.horizontal(|ui| {
+                            let side = theme::sized(theme::step::LABEL);
                             let (seal, _) = ui
-                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            ornament::khatam(ui.painter(), seal.center(), 5.0, color, true);
+                                .allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                            // Circumradius, so the star's points land inside the
+                            // cell rather than on the text beside it.
+                            ornament::khatam(ui.painter(), seal.center(), side * 0.4, color, true);
                             ui.label(
                                 egui::RichText::new(&toast.text)
-                                    .size(12.5)
-                                    .family(theme::fam_medium())
-                                    .color(theme::INK),
+                                    .font(theme::font(theme::step::LABEL, theme::fam_medium()))
+                                    .color(theme::ink()),
                             );
                         });
                     });
+                let edge = slip.response.rect;
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        edge.left_top(),
+                        egui::pos2(edge.left() + theme::RULE_ACCENT_W, edge.bottom()),
+                    ),
+                    egui::CornerRadius::same(theme::R_NONE),
+                    color,
+                );
             });
     }
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(33));
+    // This cadence drives expiry, not decoration: without it a slip would stay
+    // on screen until the next input event, so reduced motion must not stop it.
+    ui.ctx().request_repaint_after(theme::motion::CADENCE);
+}
+
+/// A 0..=1 ramp over `over` seconds. A zero-length ramp — what [`theme::dur`]
+/// returns under reduced motion — is already finished, so the slip appears at
+/// once instead of rising into place.
+fn ramp(elapsed: f64, over: f32) -> f32 {
+    if over <= 0.0 || !elapsed.is_finite() {
+        return 1.0;
+    }
+    (elapsed / f64::from(over)).clamp(0.0, 1.0) as f32
 }
 
 #[cfg(test)]

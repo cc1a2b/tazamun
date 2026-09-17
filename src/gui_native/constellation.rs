@@ -11,14 +11,21 @@
 //! same thresholds the daemon uses. Pure presentation over `theme` and
 //! `ornament`: zero I/O, no clock but the caller's `t`, total for degenerate
 //! inputs.
+//!
+//! All of that is carried in radius, thread and rim, which is to say in nothing
+//! a screen reader can reach. So the figure also says itself: one sentence
+//! ([`sky_sentence`]) naming every star it draws, in the order it draws them,
+//! and a keyboard cursor ([`star_cursor`]) that steps between stars the way the
+//! pointer hovers them — same slots, same order, same ring, same returned
+//! selection.
 
 use std::sync::Arc;
 
 use eframe::egui;
-use egui::{Color32, FontId, Galley, Pos2, Rect, Sense, Stroke};
+use egui::{Color32, Galley, Key, Modifiers, Pos2, Rect, Sense, Stroke};
 use egui::{pos2, vec2};
 
-use super::{ornament, telemetry, theme};
+use super::{a11y, focusnav, ornament, telemetry, theme};
 use crate::consts::{GRADE_GOOD_MAX_RTT_MS, GRADE_POOR_MIN_RTT_MS};
 
 /// Log-compression knee: RTTs near this many ms use the scale's steep part.
@@ -46,6 +53,22 @@ const STAGGER: f32 = 0.35;
 const WEAVE_WAVELENGTH: f32 = 13.0;
 const WEAVE_AMP: f32 = 1.5;
 
+/// What the sky is called when it is read out rather than seen, and the words
+/// its marks stand for. The drawing says all of this in radius, thread and
+/// rim; none of that survives without eyes, so the figure says it in a
+/// sentence instead — see [`sky_sentence`].
+const SKY_LEAD: &str = "peer mesh";
+/// The note the sky paints for a session of one, in the same words.
+const SKY_EMPTY: &str = "no peers yet";
+const PATH_DIRECT: &str = "direct";
+const PATH_RELAYED: &str = "relayed";
+/// An online peer with no reading yet: the dash the sub-line paints, in words.
+const RTT_UNMEASURED: &str = "round-trip unmeasured";
+const STAR_OFFLINE: &str = "offline";
+/// A peer that arrived with neither a name nor an id. Never seen in practice;
+/// the alternative is announcing a bare grade with nothing to attach it to.
+const STAR_UNNAMED: &str = "unnamed peer";
+
 /// One peer as the sky needs it.
 #[derive(Clone, Copy, Debug)]
 pub struct Star<'a> {
@@ -68,7 +91,8 @@ pub struct Star<'a> {
 /// Draws the mesh as a constellation into the given rect: this node at the
 /// centre, each peer a khatam at a radius set by its round-trip time. `t` is
 /// 0..=1 for the draw-on animation; nothing is drawn at t <= 0. Returns the
-/// index into `stars` of the peer under the pointer, if any.
+/// index into `stars` of the peer under the pointer — or of the star a keyboard
+/// reader has stepped to, which reaches the same figure the same way.
 pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> Option<usize> {
     if !rect.is_finite() || !rect.is_positive() || !t.is_finite() || t <= 0.0 {
         return None;
@@ -76,16 +100,45 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
     let ease = ease_out(t.clamp(0.0, 1.0));
     let centre = rect.center();
     let avail = rect.width().min(rect.height()) * 0.5 - CANVAS_MARGIN;
+
+    // The figure claims its rect before any ink goes down. Placement is pure,
+    // so the sentence the sky announces and the star a keyboard reader has
+    // stepped to are both settled by the time the drawing wants them — and the
+    // sky that is too small to draw still says what it holds.
+    let resp = ui.interact(
+        rect,
+        ui.id().with("constellation-sky"),
+        Sense::focusable_noninteractive(),
+    );
+    let placement = band_for(avail).map(|band| {
+        let (placed, overflow) = place(stars, &band);
+        (band, placed, overflow)
+    });
+    let cursor = star_cursor(
+        ui,
+        &resp,
+        placement.as_ref().map_or(0, |(_, placed, _)| placed.len()),
+    );
+    let spoken = cursor
+        .and_then(|slot| {
+            placement
+                .as_ref()
+                .and_then(|(_, placed, _)| placed.get(slot))
+        })
+        .map_or_else(|| sky_sentence(stars), |g| star_phrase(&stars[g.idx]));
+    a11y::describe(&resp, &spoken);
+
     let p = ui.painter().with_clip_rect(rect);
-    let Some(band) = band_for(avail) else {
+    let Some((band, placed, overflow)) = placement else {
         // Too small for a sky: the centre mark alone, still deliberate.
         ornament::khatam(
             &p,
             centre,
             (avail * 0.5).clamp(4.0, 12.0),
-            theme::GOLD.linear_multiply(ease),
+            theme::alpha(theme::gold(), (255.0 * ease) as u8),
             true,
         );
+        focusnav::ring(ui, &resp);
         return None;
     };
 
@@ -93,7 +146,10 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
     // unmeasured stars sit.
     for shape in egui::Shape::dashed_line(
         &ring_points(centre, band.r_rim),
-        Stroke::new(1.0, theme::FAINT.linear_multiply(0.30 * ease)),
+        Stroke::new(
+            theme::RULE_W,
+            theme::alpha(theme::ink_faint(), (77.0 * ease) as u8),
+        ),
         1.5,
         4.0,
     ) {
@@ -106,31 +162,32 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         &p,
         centre,
         band.centre_r,
-        theme::GOLD.linear_multiply(ease),
+        theme::alpha(theme::gold(), (255.0 * ease) as u8),
         true,
     );
     let you = p.layout_no_wrap(
         "you".to_string(),
-        FontId::new(10.5, theme::fam_medium()),
-        theme::DIM.linear_multiply(ease),
+        theme::font(theme::step::META, theme::fam_medium()),
+        theme::alpha(theme::ink_muted(), (255.0 * ease) as u8),
     );
     let you_size = you.size();
     let you_pos = pos2(centre.x - you_size.x * 0.5, centre.y + band.centre_r + 4.0);
-    p.galley(you_pos, you, theme::DIM);
+    p.galley(you_pos, you, theme::ink_muted());
 
     if stars.is_empty() {
         // A sky of one is the first-run case, not an error.
         let note = p.layout_no_wrap(
             "no peers yet".to_string(),
-            FontId::new(10.5, theme::fam_medium()),
-            theme::FAINT.linear_multiply(ease),
+            theme::font(theme::step::META, theme::fam_medium()),
+            theme::alpha(theme::ink_faint(), (255.0 * ease) as u8),
         );
         let size = note.size();
         p.galley(
             pos2(centre.x - size.x * 0.5, rect.bottom() - size.y - 6.0),
             note,
-            theme::FAINT,
+            theme::ink_faint(),
         );
+        focusnav::ring(ui, &resp);
         return None;
     }
 
@@ -141,12 +198,14 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         let r = band.radius_of_frac(radial_frac(ms));
         p.add(egui::Shape::closed_line(
             ring_points(centre, r),
-            Stroke::new(1.0, theme::INK.linear_multiply(0.035 * ease)),
+            Stroke::new(
+                theme::RULE_W,
+                theme::alpha(theme::ink(), (9.0 * ease) as u8),
+            ),
         ));
         (r, format!("{ms} ms"))
     });
 
-    let (placed, overflow) = place(stars, &band);
     let screen: Vec<(Pos2, f32)> = placed
         .iter()
         .map(|g| {
@@ -157,19 +216,23 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         })
         .collect();
 
-    // Hover before drawing, so the ring paints with its star this frame.
-    let resp = ui.interact(rect, ui.id().with("constellation-sky"), Sense::hover());
+    // Hover before drawing, so the ring paints with its star this frame. The
+    // keyboard cursor takes the same ring: a reader who stepped onto a star has
+    // to be able to see where they are, and the figure already has a mark for
+    // "this one".
     let pointer = resp.hover_pos().filter(|q| rect.contains(*q));
-    let hovered_slot = pointer.and_then(|q| {
-        hit_at(
-            placed
-                .iter()
-                .enumerate()
-                .filter(|&(slot, _)| screen[slot].1 > 0.0),
-            q.x - centre.x,
-            q.y - centre.y,
-        )
-    });
+    let hovered_slot = pointer
+        .and_then(|q| {
+            hit_at(
+                placed
+                    .iter()
+                    .enumerate()
+                    .filter(|&(slot, _)| screen[slot].1 > 0.0),
+                q.x - centre.x,
+                q.y - centre.y,
+            )
+        })
+        .or(cursor);
 
     // Threads first (under the stars), then the stars themselves.
     for (slot, g) in placed.iter().enumerate() {
@@ -189,7 +252,10 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
                 // The broken thread: dim, dotted, with a knot at the hop.
                 for shape in egui::Shape::dashed_line(
                     &[a, b],
-                    Stroke::new(1.0, theme::DIM.linear_multiply(0.65 * local)),
+                    Stroke::new(
+                        theme::RULE_W,
+                        theme::alpha(theme::ink_muted(), (166.0 * local) as u8),
+                    ),
                     2.5,
                     4.5,
                 ) {
@@ -205,19 +271,28 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
                             pos2(mid.x, mid.y + k),
                             pos2(mid.x - k, mid.y),
                         ],
-                        Stroke::new(1.0, theme::DIM.linear_multiply(0.8 * local)),
+                        Stroke::new(
+                            theme::RULE_W,
+                            theme::alpha(theme::ink_muted(), (204.0 * local) as u8),
+                        ),
                     ));
                 }
             } else {
                 // The taut band: a faint core with two strands woven over it.
                 p.line_segment(
                     [a, b],
-                    Stroke::new(1.0, theme::GOLD.linear_multiply(0.18 * local)),
+                    Stroke::new(
+                        theme::RULE_W,
+                        theme::alpha(theme::gold(), (46.0 * local) as u8),
+                    ),
                 );
                 for strand in weave_strands(a, b) {
                     p.add(egui::Shape::line(
                         strand,
-                        Stroke::new(1.0, theme::GOLD.linear_multiply(0.45 * local)),
+                        Stroke::new(
+                            theme::RULE_W,
+                            theme::alpha(theme::gold(), (115.0 * local) as u8),
+                        ),
                     ));
                 }
             }
@@ -228,13 +303,13 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
             p.circle_filled(
                 pos,
                 r * 1.9,
-                color.linear_multiply((0.06 + 0.04 * lit) * local),
+                theme::alpha(color, ((0.06 + 0.04 * lit) * local * 255.0) as u8),
             );
             ornament::khatam(
                 &p,
                 pos,
                 r,
-                color.linear_multiply((0.7 + 0.1 * lit) * local),
+                theme::alpha(color, ((0.7 + 0.1 * lit) * local * 255.0) as u8),
                 true,
             );
         } else {
@@ -243,12 +318,18 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
                 &p,
                 pos,
                 r,
-                theme::FAINT.linear_multiply(0.55 * local),
+                theme::alpha(theme::ink_faint(), (140.0 * local) as u8),
                 false,
             );
         }
         if hovered_slot == Some(slot) {
-            ornament::khatam(&p, pos, r + 4.0, theme::GOLD_HI.linear_multiply(0.8), false);
+            ornament::khatam(
+                &p,
+                pos,
+                r + 4.0,
+                theme::alpha(theme::gold_bright(), 204),
+                false,
+            );
         }
     }
 
@@ -262,13 +343,13 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
     if overflow > 0 {
         let g = p.layout_no_wrap(
             format!("+ {overflow} more"),
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme::FAINT.linear_multiply(ease),
+            theme::font(theme::step::CAPTION, theme::fam_mono()),
+            theme::alpha(theme::ink_faint(), (255.0 * ease) as u8),
         );
         let size = g.size();
         let min = pos2(rect.right() - size.x - 8.0, rect.bottom() - size.y - 6.0);
         rects.push(Rect::from_min_size(min, size));
-        p.galley(min, g, theme::FAINT);
+        p.galley(min, g, theme::ink_faint());
         pre = 2;
     }
     let mut jobs: Vec<Vec<(Pos2, Arc<Galley>)>> = Vec::new();
@@ -278,11 +359,15 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
             continue;
         }
         let star = &stars[g.idx];
-        let name_color = if star.online { theme::INK } else { theme::DIM };
+        let name_color = if star.online {
+            theme::ink()
+        } else {
+            theme::ink_muted()
+        };
         let name = p.layout_no_wrap(
             elide(star.name),
-            FontId::new(10.5, theme::fam_medium()),
-            name_color.linear_multiply(0.9 * local),
+            theme::font(theme::step::META, theme::fam_medium()),
+            theme::alpha(name_color, (230.0 * local) as u8),
         );
         // The sub-line is where honesty lives: an offline star says "offline",
         // never a stale round-trip; an unmeasured one says the dash.
@@ -296,8 +381,8 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         };
         let sub = p.layout_no_wrap(
             sub_text,
-            FontId::new(9.0, egui::FontFamily::Monospace),
-            theme::FAINT.linear_multiply(local),
+            theme::font(theme::step::CAPTION, theme::fam_mono()),
+            theme::alpha(theme::ink_faint(), (255.0 * local) as u8),
         );
         let (nsz, ssz) = (name.size(), sub.size());
         let w = nsz.x.max(ssz.x);
@@ -324,8 +409,8 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
     for (r_ring, text) in ring_marks {
         let g = p.layout_no_wrap(
             text,
-            FontId::new(8.5, egui::FontFamily::Monospace),
-            theme::FAINT.linear_multiply(0.8 * ease),
+            theme::font(theme::step::CAPTION, theme::fam_mono()),
+            theme::alpha(theme::ink_faint(), (204.0 * ease) as u8),
         );
         let size = g.size();
         let ang = -3.0 * std::f32::consts::FRAC_PI_4;
@@ -338,12 +423,159 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
     for (k, pieces) in jobs.into_iter().enumerate() {
         if accepted[pre + k] {
             for (at, galley) in pieces {
-                p.galley(at, galley, theme::DIM);
+                p.galley(at, galley, theme::ink_muted());
             }
         }
     }
 
-    hovered_slot.map(|slot| placed[slot].idx)
+    focusnav::ring(ui, &resp);
+    hovered_slot
+        .and_then(|slot| placed.get(slot))
+        .map(|g| g.idx)
+}
+
+// ─── what the sky says (pure) ────────────────────────────────────────────────
+
+/// The whole sky in one sentence: how many peers it holds, then every star it
+/// draws, in the order it draws them.
+///
+/// One sentence, because a reader must not have to assemble a mesh out of
+/// fourteen fragments — and this one, because radius, thread and rim are the
+/// only place the sky writes distance, path and presence down.
+fn sky_sentence(stars: &[Star<'_>]) -> String {
+    if stars.is_empty() {
+        return a11y::sentence(SKY_LEAD, &[SKY_EMPTY]);
+    }
+    let (order, overflow) = order_stars(stars);
+    let mut parts: Vec<String> = order.iter().map(|&idx| star_phrase(&stars[idx])).collect();
+    if overflow > 0 {
+        // The sky paints "+ N more"; the sentence owes the reader the same
+        // admission that it is not naming everyone.
+        parts.push(format!("{overflow} more not drawn"));
+    }
+    let lead = format!(
+        "{SKY_LEAD}, {} {}",
+        stars.len(),
+        if stars.len() == 1 { "peer" } else { "peers" }
+    );
+    a11y::sentence(&lead, &parts)
+}
+
+/// One star in words: who it is, by what path, and how far. An offline peer
+/// gets its name and "offline" and nothing else — the rim it sits on is the
+/// drawing refusing to pretend a distance it no longer has, and the sentence
+/// refuses in the same place.
+fn star_phrase(star: &Star<'_>) -> String {
+    let name = match star.name.trim() {
+        "" => star.id.trim(),
+        name => name,
+    };
+    let name = if name.is_empty() { STAR_UNNAMED } else { name };
+    if !star.online {
+        return format!("{name} {STAR_OFFLINE}");
+    }
+    let path = if star.relayed {
+        PATH_RELAYED
+    } else {
+        PATH_DIRECT
+    };
+    match star.rtt_ms {
+        Some(ms) => format!("{name} {path} {}", a11y::spoken_ms(u64::from(ms))),
+        None => format!("{name} {path} {RTT_UNMEASURED}"),
+    }
+}
+
+// ─── the keyboard's reach into the figure ────────────────────────────────────
+
+/// Which star a keyboard reader has stepped to while the sky holds focus, or
+/// `None` for the figure as a whole.
+///
+/// Hovering a star is a pointer's reach into the sky; this is the same reach
+/// without one. Arrows walk the drawn slots in the drawn order, Home and End
+/// take the ends, and Tab still leaves — the figure borrows the arrow keys, it
+/// never traps them.
+fn star_cursor(ui: &egui::Ui, resp: &egui::Response, slots: usize) -> Option<usize> {
+    let key = resp.id.with("star-cursor");
+    if slots == 0 || !resp.has_focus() {
+        // The cursor does not outlive the focus that made it: leaving and
+        // returning finds the whole sky again, not a star from last time.
+        ui.ctx().data_mut(|d| d.remove::<usize>(key));
+        return None;
+    }
+    ui.ctx().memory_mut(|m| {
+        m.set_focus_lock_filter(
+            resp.id,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: false,
+            },
+        );
+    });
+    // Bitwise, not short-circuiting: both keys of a pair must be consumed, or
+    // the one left behind moves focus out of the figure a frame later.
+    let (fwd, back, first, last) = ui.input_mut(|i| {
+        (
+            i.consume_key(Modifiers::NONE, Key::ArrowRight)
+                | i.consume_key(Modifiers::NONE, Key::ArrowDown),
+            i.consume_key(Modifiers::NONE, Key::ArrowLeft)
+                | i.consume_key(Modifiers::NONE, Key::ArrowUp),
+            i.consume_key(Modifiers::NONE, Key::Home),
+            i.consume_key(Modifiers::NONE, Key::End),
+        )
+    });
+    let next = step_cursor(
+        ui.ctx().data(|d| d.get_temp::<usize>(key)),
+        slots,
+        fwd,
+        back,
+        first,
+        last,
+    );
+    ui.ctx().data_mut(|d| match next {
+        Some(slot) => {
+            d.insert_temp(key, slot);
+        }
+        None => d.remove::<usize>(key),
+    });
+    next
+}
+
+/// Where the cursor lands. `held` is where it was — `None` meaning the figure
+/// as a whole, which is where a reader arrives and where stepping back off the
+/// first star returns to. Neither end wraps: a sky is not a list, and silently
+/// jumping from the nearest peer to the furthest would lose a reader their
+/// place in it.
+fn step_cursor(
+    held: Option<usize>,
+    slots: usize,
+    fwd: bool,
+    back: bool,
+    first: bool,
+    last: bool,
+) -> Option<usize> {
+    if slots == 0 {
+        return None;
+    }
+    // A stale slot from a mesh that has since shrunk clamps before it moves.
+    let held = held.map(|slot| slot.min(slots - 1));
+    if first {
+        return Some(0);
+    }
+    if last {
+        return Some(slots - 1);
+    }
+    if fwd {
+        return Some(held.map_or(0, |slot| (slot + 1).min(slots - 1)));
+    }
+    if back {
+        return match held {
+            None | Some(0) => None,
+            Some(slot) => Some(slot - 1),
+        };
+    }
+    held
 }
 
 /// The height the sky wants for a given width and peer count, so the caller
@@ -355,10 +587,15 @@ pub fn desired_height(width: f32, peers: usize) -> f32 {
     } else {
         230.0 + crowd * 4.0
     };
+    // The ceiling rises with the crowd, not just with the window. A wide window
+    // otherwise took the full 480 for a single centre mark, leaving the peer
+    // table below it off the bottom of the screen — the sky is a figure about
+    // the peers, so an empty one has nothing to be big about.
+    let ceiling = (floor + crowd * 28.0).min(480.0);
     if !width.is_finite() || width <= 0.0 {
         return floor;
     }
-    (width * 0.62).clamp(floor, 480.0)
+    (width * 0.62).clamp(floor.min(ceiling), ceiling)
 }
 
 // ─── pure geometry ───────────────────────────────────────────────────────────
@@ -416,10 +653,7 @@ struct PlacedGeo {
 /// unmeasured online, then offline, id-ordered within each class — so when
 /// the cap bites, the peers that matter most keep their place in the sky.
 fn place(stars: &[Star<'_>], band: &Band) -> (Vec<PlacedGeo>, usize) {
-    let mut order: Vec<usize> = (0..stars.len()).collect();
-    order.sort_by(|&a, &b| class_key(&stars[a]).cmp(&class_key(&stars[b])));
-    let overflow = stars.len().saturating_sub(MAX_STARS);
-    order.truncate(MAX_STARS);
+    let (order, overflow) = order_stars(stars);
     let placed = order
         .into_iter()
         .map(|idx| {
@@ -454,6 +688,18 @@ fn place(stars: &[Star<'_>], band: &Band) -> (Vec<PlacedGeo>, usize) {
         })
         .collect();
     (placed, overflow)
+}
+
+/// The order the sky takes the stars in, and how many the cap leaves out.
+/// Split out of [`place`] because the sentence the figure announces walks the
+/// same order without needing a band to place anything in — a reader hears the
+/// peers in the order they are drawn, and hears the same overflow admitted.
+fn order_stars(stars: &[Star<'_>]) -> (Vec<usize>, usize) {
+    let mut order: Vec<usize> = (0..stars.len()).collect();
+    order.sort_by(|&a, &b| class_key(&stars[a]).cmp(&class_key(&stars[b])));
+    let overflow = stars.len().saturating_sub(MAX_STARS);
+    order.truncate(MAX_STARS);
+    (order, overflow)
 }
 
 fn class_key<'s>(s: &'s Star<'_>) -> (u8, &'s str) {
@@ -497,10 +743,10 @@ fn house_grade(grade: &str) -> Option<&'static str> {
 
 fn grade_color(grade: &str) -> Color32 {
     match grade {
-        "Good" => theme::GOOD,
-        "Fair" => theme::WARN,
-        "Poor" => theme::BAD,
-        _ => theme::FAINT,
+        "Good" => theme::custody_good(),
+        "Fair" => theme::custody_stale(),
+        "Poor" => theme::custody_blocked(),
+        _ => theme::ink_faint(),
     }
 }
 
@@ -954,19 +1200,25 @@ mod tests {
 
     #[test]
     fn desired_height_for_zero_one_many_huge() {
-        assert!(approx(desired_height(600.0, 0), 372.0));
-        assert!(approx(desired_height(300.0, 0), 186.0));
+        // An empty sky stays small however wide the window is. It used to take
+        // the full ceiling for a single centre mark, pushing the peer table it
+        // introduces off the bottom of the screen.
+        assert!(approx(desired_height(600.0, 0), 150.0));
+        assert!(approx(desired_height(2000.0, 0), 150.0));
+        assert!(approx(desired_height(300.0, 0), 150.0));
         assert!(
             approx(desired_height(300.0, 1), 234.0),
-            "floor lifts with peers"
+            "one peer still gets a readable figure"
         );
         assert!(approx(desired_height(2000.0, 24), 480.0), "capped");
         assert!(
-            approx(desired_height(100.0, usize::MAX), 326.0),
-            "crowd floor caps"
+            desired_height(2000.0, usize::MAX) <= 480.0,
+            "the cap holds for any crowd"
         );
+        // Monotonic in the crowd at a fixed width.
         assert!(desired_height(300.0, 0) <= desired_height(300.0, 1));
         assert!(desired_height(300.0, 1) <= desired_height(300.0, 24));
+        assert!(desired_height(2000.0, 1) <= desired_height(2000.0, 24));
     }
 
     #[test]
@@ -1009,6 +1261,189 @@ mod tests {
         assert!(star_radius(1) < star_radius(2));
         assert!(star_radius(2) < star_radius(3));
         assert!(approx(star_radius(3), star_radius(9)), "lit caps at 3");
+    }
+
+    // ── what the sky says ──
+
+    fn named<'a>(
+        id: &'a str,
+        name: &'a str,
+        rtt: Option<u32>,
+        relayed: bool,
+        online: bool,
+    ) -> Star<'a> {
+        Star {
+            id,
+            name,
+            rtt_ms: rtt,
+            relayed,
+            online,
+            grade: None,
+        }
+    }
+
+    #[test]
+    fn the_sky_announces_one_sentence_naming_every_star() {
+        let stars = [
+            named("a", "laptop", Some(12), false, true),
+            named("b", "phone", Some(240), true, true),
+            named("c", "desk", None, false, false),
+        ];
+        assert_eq!(
+            sky_sentence(&stars),
+            "peer mesh, 3 peers: laptop direct 12 milliseconds, \
+             phone relayed 240 milliseconds, desk offline"
+        );
+    }
+
+    #[test]
+    fn a_sky_of_one_says_it_is_empty_in_the_words_it_paints() {
+        assert_eq!(sky_sentence(&[]), "peer mesh: no peers yet");
+    }
+
+    #[test]
+    fn one_peer_is_a_peer_not_peers() {
+        let stars = [named("a", "laptop", Some(1), false, true)];
+        assert_eq!(
+            sky_sentence(&stars),
+            "peer mesh, 1 peer: laptop direct 1 millisecond"
+        );
+    }
+
+    #[test]
+    fn an_offline_star_is_offline_and_carries_no_stale_round_trip() {
+        // The same refusal the rim makes on screen: a peer that is not
+        // connected has no distance, whatever number it last reported.
+        let stale = named("ghost", "desk", Some(5), false, false);
+        assert_eq!(star_phrase(&stale), "desk offline");
+        assert!(!star_phrase(&stale).contains('5'));
+        assert!(!star_phrase(&stale).contains(PATH_DIRECT));
+        // ...including one that was relayed when it was last seen.
+        let relayed = named("ghost", "desk", Some(400), true, false);
+        assert_eq!(star_phrase(&relayed), "desk offline");
+    }
+
+    #[test]
+    fn an_unmeasured_star_says_so_rather_than_guessing() {
+        let star = named("a", "tablet", None, false, true);
+        assert_eq!(star_phrase(&star), "tablet direct round-trip unmeasured");
+        let relayed = named("a", "tablet", None, true, true);
+        assert_eq!(
+            star_phrase(&relayed),
+            "tablet relayed round-trip unmeasured"
+        );
+    }
+
+    #[test]
+    fn the_units_are_spelled_out_for_a_reader() {
+        // "12 ms" is read aloud as "twelve em ess"; the drawn sub-line keeps
+        // the short form, the sentence does not.
+        let said = star_phrase(&named("a", "laptop", Some(12), false, true));
+        assert!(said.ends_with("12 milliseconds"), "{said}");
+        assert!(!said.contains(" ms"), "{said}");
+    }
+
+    #[test]
+    fn a_star_with_no_name_falls_back_to_its_id_then_to_a_word() {
+        assert_eq!(
+            star_phrase(&named("peer-7f2a", "", Some(9), false, true)),
+            "peer-7f2a direct 9 milliseconds"
+        );
+        assert_eq!(
+            star_phrase(&named("  ", "  ", None, false, false)),
+            "unnamed peer offline"
+        );
+    }
+
+    #[test]
+    fn the_sentence_names_the_stars_in_the_order_the_sky_draws_them() {
+        let stars = [
+            named("c", "desk", None, false, false),
+            named("b", "tablet", None, false, true),
+            named("a", "laptop", Some(10), false, true),
+        ];
+        let (placed, _) = place(&stars, &band());
+        let drawn: Vec<String> = placed.iter().map(|g| star_phrase(&stars[g.idx])).collect();
+        let said = sky_sentence(&stars);
+        let mut at = 0;
+        for phrase in &drawn {
+            let found = said[at..]
+                .find(phrase.as_str())
+                .unwrap_or_else(|| panic!("{phrase} is out of order in {said}"));
+            at += found + phrase.len();
+        }
+    }
+
+    #[test]
+    fn the_sentence_admits_the_stars_the_cap_leaves_out() {
+        let ids: Vec<String> = (0..30).map(|i| format!("s-{i:02}")).collect();
+        let stars: Vec<Star<'_>> = ids.iter().map(|id| s(id, Some(20), false, true)).collect();
+        let said = sky_sentence(&stars);
+        assert!(said.starts_with("peer mesh, 30 peers:"), "{said}");
+        assert!(said.ends_with("6 more not drawn"), "{said}");
+        // Exactly the drawn stars are named, and not one more.
+        assert_eq!(said.matches(" direct ").count(), MAX_STARS);
+    }
+
+    #[test]
+    fn the_sentence_holds_for_a_mesh_that_is_entirely_dark() {
+        let stars = [
+            named("a", "laptop", None, false, false),
+            named("b", "desk", None, false, false),
+        ];
+        // Every star is on the rim, so the tie falls to the id order the sky
+        // places them in.
+        assert_eq!(
+            sky_sentence(&stars),
+            "peer mesh, 2 peers: laptop offline, desk offline"
+        );
+    }
+
+    // ── the keyboard's reach ──
+
+    #[test]
+    fn the_cursor_starts_on_the_figure_and_steps_into_it() {
+        // A reader arrives at the whole sky and hears the whole sentence; the
+        // first step forward lands on the first star the sky drew.
+        assert_eq!(step_cursor(None, 3, false, false, false, false), None);
+        assert_eq!(step_cursor(None, 3, true, false, false, false), Some(0));
+        assert_eq!(step_cursor(Some(0), 3, true, false, false, false), Some(1));
+    }
+
+    #[test]
+    fn stepping_back_off_the_first_star_returns_to_the_whole_sky() {
+        assert_eq!(step_cursor(Some(1), 3, false, true, false, false), Some(0));
+        assert_eq!(step_cursor(Some(0), 3, false, true, false, false), None);
+        // ...and never wraps around to the far side of the mesh.
+        assert_eq!(step_cursor(None, 3, false, true, false, false), None);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_the_far_end_rather_than_wrapping() {
+        assert_eq!(step_cursor(Some(2), 3, true, false, false, false), Some(2));
+        assert_eq!(step_cursor(Some(2), 3, false, false, true, false), Some(0));
+        assert_eq!(step_cursor(Some(0), 3, false, false, false, true), Some(2));
+    }
+
+    #[test]
+    fn a_shrunken_mesh_clamps_a_stale_cursor() {
+        // The peer list is rebuilt every refresh; a slot from a bigger mesh
+        // must land on a star that exists, not past the end of the sky.
+        assert_eq!(step_cursor(Some(9), 3, false, false, false, false), Some(2));
+        assert_eq!(step_cursor(Some(9), 3, true, false, false, false), Some(2));
+        assert_eq!(step_cursor(Some(9), 3, false, true, false, false), Some(1));
+        // An empty sky has nothing to point at, whatever was held before.
+        assert_eq!(step_cursor(Some(4), 0, true, false, false, false), None);
+        assert_eq!(step_cursor(None, 0, false, false, true, false), None);
+    }
+
+    #[test]
+    fn two_directions_in_one_frame_resolve_the_same_way_every_time() {
+        // Both arrows down in a single frame is reachable on a key repeat;
+        // whatever it does, it must not depend on which key egui reports first.
+        assert_eq!(step_cursor(Some(1), 3, true, true, false, false), Some(2));
+        assert_eq!(step_cursor(Some(1), 3, true, true, true, false), Some(0));
+        assert_eq!(step_cursor(Some(1), 3, false, false, true, true), Some(0));
     }
 
     #[test]

@@ -8,13 +8,13 @@
 //! for degenerate inputs.
 
 use eframe::egui;
-use egui::{FontFamily, FontId, Rangef, Rect, Sense};
+use egui::{Rangef, Rect, Sense, Stroke};
 use egui::{pos2, vec2};
 
 use super::{ornament, theme};
 
 /// The vertical unit every view's spacing is a multiple of.
-pub const BASELINE: f32 = 4.0;
+pub const BASELINE: f32 = theme::space::S;
 
 /// Running-head height: text band + rule + air, on the grid.
 const HEAD_H: f32 = BASELINE * 6.0;
@@ -27,8 +27,8 @@ const SEP_W: f32 = 16.0;
 const SEP_R: f32 = 1.8;
 /// Gap reserved between the elided trail and the folio mark.
 const FOLIO_GAP: f32 = 12.0;
-/// Front-elision marker. U+2026 is present in Inter (Regular/Medium/SemiBold)
-/// and Hack — verified against the shipped font files; no tofu.
+/// Front-elision marker. U+2026 is present in every shipped Plex face —
+/// verified against the font files; no tofu.
 const ELIDE_MARK: &str = "…";
 
 /// Snaps `y` down onto the baseline grid. Returns `y` unchanged if it is not
@@ -77,8 +77,8 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
     {
         let galley = p.layout_no_wrap(
             mark.to_owned(),
-            FontId::new(10.0, FontFamily::Monospace),
-            theme::FAINT,
+            theme::font(theme::step::CAPTION, theme::fam_serif()),
+            theme::ink_faint(),
         );
         let size = galley.size();
         let zone_w = size.x.min(rect.width() * 0.5);
@@ -89,7 +89,7 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
         p.with_clip_rect(zone).galley(
             pos2(rect.right() - size.x, text_mid - size.y * 0.5),
             galley,
-            theme::FAINT,
+            theme::ink_faint(),
         );
         trail_right = zone.left() - FOLIO_GAP;
     }
@@ -109,35 +109,39 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
                 if i == last {
                     tp.layout_no_wrap(
                         (*name).to_owned(),
-                        FontId::new(11.5, theme::fam_semibold()),
-                        theme::INK,
+                        theme::font(theme::step::META, theme::fam_semibold()),
+                        theme::ink(),
                     )
                 } else {
                     tp.layout_no_wrap(
                         (*name).to_owned(),
-                        FontId::new(11.5, theme::fam_medium()),
-                        theme::DIM,
+                        theme::font(theme::step::META, theme::fam_medium()),
+                        theme::ink_muted(),
                     )
                 }
             })
             .collect();
         let marker = tp.layout_no_wrap(
             ELIDE_MARK.to_owned(),
-            FontId::new(11.5, theme::fam_medium()),
-            theme::DIM,
+            theme::font(theme::step::META, theme::fam_medium()),
+            theme::ink_muted(),
         );
         let widths: Vec<f32> = galleys.iter().map(|g| g.size().x).collect();
         let (start, lead_marker) = elide_plan(&widths, SEP_W, marker.size().x, budget);
 
         let mut items = Vec::new();
         if lead_marker {
-            items.push((marker, theme::DIM));
+            items.push((marker, theme::ink_muted()));
         }
         for (i, galley) in galleys.into_iter().enumerate() {
             if i < start {
                 continue;
             }
-            let color = if i == last { theme::INK } else { theme::DIM };
+            let color = if i == last {
+                theme::ink()
+            } else {
+                theme::ink_muted()
+            };
             items.push((galley, color));
         }
         let mut x = rect.left();
@@ -147,7 +151,7 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
                     &tp,
                     pos2(x + SEP_W * 0.5, text_mid),
                     SEP_R,
-                    theme::GOLD.linear_multiply(0.45),
+                    theme::alpha(theme::gold(), 115),
                 );
                 x += SEP_W;
             }
@@ -157,18 +161,18 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
         }
     }
 
-    let rule_y = (rect.top() + RULE_OFFSET).floor() + 0.5;
+    let rule_y = theme::snap(rect.top() + RULE_OFFSET);
     p.hline(
         Rangef::new(rect.left(), rect.right()),
         rule_y,
-        theme::stroke_faint(),
+        Stroke::new(theme::RULE_W, theme::rule_hair()),
     );
 }
 
 /// A page-foot rule: the mirror of the running head's rule, closing a view.
 /// Centre-weighted with a diamond, matching `ornament::rule_with_diamond`.
 pub fn foot_rule(ui: &mut egui::Ui) {
-    ornament::rule_with_diamond(ui, theme::GOLD.linear_multiply(0.6));
+    ornament::rule_with_diamond(ui, theme::alpha(theme::gold(), 153));
 }
 
 /// Baseline units to pixels. Total by construction: `u16::MAX * BASELINE`

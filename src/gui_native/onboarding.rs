@@ -6,13 +6,20 @@
 //! inputs.
 
 use eframe::egui;
-use egui::{Color32, FontId, Margin, Painter, Pos2, Rangef, Sense, Stroke};
+use egui::{Color32, Margin, Painter, Pos2, Rangef, Sense, Stroke};
 use egui::{pos2, vec2};
 
-use super::{ornament, theme};
+use super::{a11y, ornament, theme};
+
+/// The medallion in words. The numeral is painted, and the ring's strength is
+/// the only thing separating the step in hand from the ones still to come —
+/// neither survives being looked at without eyes.
+const STEP_LEAD: &str = "step";
+const STEP_ACTIVE: &str = "you are here";
+const STEP_FUTURE: &str = "not started yet";
 
 pub enum StepState {
-    /// The step the user is on now — gold ring, INK number.
+    /// The step the user is on now — gold ring, full-strength number.
     Active,
     /// Not yet reachable — faint ring and number.
     Future,
@@ -21,7 +28,10 @@ pub enum StepState {
 /// A numbered step medallion: a khatam-ringed disc with the step number at its
 /// center. Allocates 34x34.
 pub fn medallion(ui: &mut egui::Ui, n: u8, state: StepState) {
-    let (rect, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+    // Named, not focusable: the step's own title and hint are real labels
+    // beside it, so this rides with them rather than claiming a stop of its own.
+    a11y::describe(&resp, &step_sentence(n, &state));
     if !rect.is_finite() {
         return;
     }
@@ -29,20 +39,33 @@ pub fn medallion(ui: &mut egui::Ui, n: u8, state: StepState) {
     let p = ui.painter();
     match state {
         StepState::Active => {
-            p.circle_filled(c, 16.5, theme::GOLD.linear_multiply(0.10));
-            ornament::khatam(p, c, 15.0, theme::GOLD, false);
-            numeral(p, c, n, theme::INK);
+            p.circle_filled(c, 16.5, theme::wash::of(theme::gold(), theme::wash::TINT));
+            ornament::khatam(p, c, 15.0, theme::gold(), false);
+            numeral(p, c, n, theme::ink());
         }
         StepState::Future => {
-            ornament::khatam(p, c, 15.0, theme::FAINT, false);
-            numeral(p, c, n, theme::FAINT);
+            ornament::khatam(p, c, 15.0, theme::ink_faint(), false);
+            numeral(p, c, n, theme::ink_faint());
         }
     }
+}
+
+/// The sentence one medallion announces: its number, and whether it is the
+/// step in hand. It cannot say "of three" — the column's length belongs to the
+/// caller laying the steps out, not to one medallion.
+fn step_sentence(n: u8, state: &StepState) -> String {
+    let standing = match state {
+        StepState::Active => STEP_ACTIVE,
+        StepState::Future => STEP_FUTURE,
+    };
+    format!("{STEP_LEAD} {n}, {standing}")
 }
 
 /// The vertical strapwork thread joining medallions: a short girih-flavored
 /// strand (a hairline thread carrying a small diamond at its midpoint) of the
 /// given height, centered in a 34px column so it aligns under the medallions.
+/// Pure ornament — it joins two medallions that each say what they are, so it
+/// stays silent rather than announcing a line.
 pub fn connector(ui: &mut egui::Ui, height: f32) {
     if !height.is_finite() || height <= 0.0 {
         return;
@@ -53,17 +76,17 @@ pub fn connector(ui: &mut egui::Ui, height: f32) {
     }
     let p = ui.painter();
     // Pixel-centered so the hairline stays crisp; the diamond rides the line.
-    let x = rect.center().x.floor() + 0.5;
+    let x = theme::snap(rect.center().x);
     p.vline(
         x,
         Rangef::new(rect.top(), rect.bottom()),
-        Stroke::new(1.0, theme::GOLD.linear_multiply(0.22)),
+        Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 56)),
     );
     ornament::diamond(
         p,
         pos2(x, rect.center().y),
         2.2,
-        theme::GOLD.linear_multiply(0.4),
+        theme::alpha(theme::gold(), 102),
     );
 }
 
@@ -99,23 +122,25 @@ pub fn first_light_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ];
     ui.painter().set(
         bg,
-        egui::Shape::convex_polygon(points, theme::BG1, theme::stroke_faint()),
+        egui::Shape::convex_polygon(
+            points,
+            theme::bg_chrome(),
+            Stroke::new(theme::RULE_W, theme::rule_hair()),
+        ),
     );
     let center = pos2(rect.right() - rect.height() * 0.42, rect.center().y);
     let radius = rect.height() * 0.38;
     // Set through a painter clipped to the panel so a narrow rect cannot let
     // the ghost spill past the left edge.
-    ui.painter_at(rect).set(
-        wm,
-        ghost_khatam(center, radius, theme::GOLD.linear_multiply(0.05)),
-    );
+    ui.painter_at(rect)
+        .set(wm, ghost_khatam(center, radius, theme::gold()));
 }
 
-/// One step numeral centered on `c` (semibold 13).
+/// One step numeral centered on `c`.
 fn numeral(p: &Painter, c: Pos2, n: u8, color: Color32) {
     let galley = p.layout_no_wrap(
         n.to_string(),
-        FontId::new(13.0, theme::fam_semibold()),
+        theme::font(theme::step::LABEL, theme::fam_semibold()),
         color,
     );
     let pos = c - galley.size() / 2.0;
@@ -124,16 +149,18 @@ fn numeral(p: &Painter, c: Pos2, n: u8, color: Color32) {
 
 /// The khatam outline as one retained shape, so it can land in a reserved
 /// paint slot beneath content — `ornament::khatam` paints immediately and
-/// cannot. Same construction and alpha ramp as the ornament original.
+/// cannot. Same construction as the ornament original; `color` arrives at full
+/// strength and is washed to watermark weight here.
 fn ghost_khatam(center: Pos2, radius: f32, color: Color32) -> egui::Shape {
     if !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
         return egui::Shape::Noop;
     }
-    let outline = Stroke::new(1.0, color.linear_multiply(0.55));
+    let ghost = theme::wash::of(color, theme::wash::GHOST);
+    let outline = Stroke::new(theme::RULE_W, ghost);
     egui::Shape::Vec(vec![
         egui::Shape::closed_line(square(center, radius, std::f32::consts::FRAC_PI_4), outline),
         egui::Shape::closed_line(square(center, radius, 0.0), outline),
-        egui::Shape::circle_filled(center, radius * 0.08, color.linear_multiply(0.7)),
+        egui::Shape::circle_filled(center, radius * 0.08, ghost),
     ])
 }
 
@@ -145,4 +172,22 @@ fn square(center: Pos2, radius: f32, phase: f32) -> Vec<Pos2> {
             pos2(center.x + radius * a.cos(), center.y + radius * a.sin())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_step_in_hand_is_told_apart_from_the_ones_to_come() {
+        assert_eq!(step_sentence(1, &StepState::Active), "step 1, you are here");
+        assert_eq!(
+            step_sentence(2, &StepState::Future),
+            "step 2, not started yet"
+        );
+        assert_eq!(
+            step_sentence(3, &StepState::Future),
+            "step 3, not started yet"
+        );
+    }
 }

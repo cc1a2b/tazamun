@@ -112,18 +112,6 @@ pub fn group_files(files: &[(String, u64)], sort: SortMode) -> Vec<Group> {
     groups
 }
 
-/// A compact "3 files · 1.2 MB · 41%" summary line for a group. `size_text`
-/// is the caller's already-formatted byte string.
-pub fn group_caption(count: usize, size_text: &str, share: f32) -> String {
-    let s = if count == 1 { "" } else { "s" };
-    let pct = if share.is_finite() {
-        (share * 100.0).round().clamp(0.0, 100.0) as u32
-    } else {
-        0
-    };
-    format!("{count} file{s} · {size_text} · {pct}%")
-}
-
 /// Orders one group's indices in place under `sort`; ties always fall back to
 /// case-insensitive path so the result is total, not merely stable.
 fn sort_indices(indices: &mut [usize], files: &[(String, u64)], sort: SortMode) {
@@ -350,35 +338,5 @@ mod tests {
     #[test]
     fn default_sort_mode_is_name() {
         assert_eq!(SortMode::default(), SortMode::Name);
-    }
-
-    #[test]
-    fn caption_singular_and_plural() {
-        assert_eq!(group_caption(1, "4 KB", 0.5), "1 file · 4 KB · 50%");
-        assert_eq!(group_caption(0, "0 B", 0.0), "0 files · 0 B · 0%");
-        assert_eq!(group_caption(3, "1.2 MB", 0.41), "3 files · 1.2 MB · 41%");
-    }
-
-    #[test]
-    fn caption_rounds_and_clamps_percent() {
-        assert_eq!(group_caption(2, "x", 0.414), "2 files · x · 41%");
-        assert_eq!(group_caption(2, "x", 0.416), "2 files · x · 42%");
-        assert_eq!(group_caption(2, "x", 0.006), "2 files · x · 1%");
-        assert_eq!(group_caption(2, "x", 0.004), "2 files · x · 0%");
-        assert_eq!(group_caption(2, "x", 1.0), "2 files · x · 100%");
-        // 0.125 and 0.375 are exact in f32, so these pin the half-away-from-zero
-        // rule itself rather than an artifact of decimal-to-binary rounding.
-        assert_eq!(group_caption(2, "x", 0.125), "2 files · x · 13%");
-        assert_eq!(group_caption(2, "x", 0.375), "2 files · x · 38%");
-        // Out-of-range input clamps rather than rendering nonsense.
-        assert_eq!(group_caption(2, "x", 3.7), "2 files · x · 100%");
-        assert_eq!(group_caption(2, "x", -0.5), "2 files · x · 0%");
-    }
-
-    #[test]
-    fn caption_non_finite_share_renders_zero() {
-        assert_eq!(group_caption(1, "x", f32::NAN), "1 file · x · 0%");
-        assert_eq!(group_caption(1, "x", f32::INFINITY), "1 file · x · 0%");
-        assert_eq!(group_caption(1, "x", f32::NEG_INFINITY), "1 file · x · 0%");
     }
 }

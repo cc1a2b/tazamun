@@ -12,7 +12,7 @@ use eframe::egui;
 use egui::{Pos2, RichText, Sense, Stroke};
 use egui::{pos2, vec2};
 
-use super::{components, controls, ornament, theme};
+use super::{a11y, components, controls, ornament, theme};
 
 /// Runs shorter than this get no brace — a mark this small reads as an
 /// artifact, not an accolade.
@@ -37,11 +37,17 @@ pub struct Run {
 /// Draws one manuscript brace per run, in the margin at horizontal position `x`
 /// (the brace's spine sits on `x`, cusp pointing toward +x, i.e. toward the
 /// rows). `t` is 0..=1 for the draw-on animation; nothing is drawn at t <= 0.
+///
+/// Silent to assistive technology, and deliberately so twice over. It restates
+/// what the rows it brackets already announce — each is a selectable label
+/// carrying its own selected state — and it is handed a bare [`egui::Painter`],
+/// which owns no widget and so can carry no semantics at all. Announcing the
+/// marked set is [`bulk_bar`]'s job, where the count is.
 pub fn brace(painter: &egui::Painter, x: f32, runs: &[Run], t: f32) {
     if !x.is_finite() || !t.is_finite() || t <= 0.0 {
         return;
     }
-    let stroke = Stroke::new(1.0, theme::GOLD.linear_multiply(0.75));
+    let stroke = Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 191));
     for run in runs {
         let Some(paths) = brace_paths(x, run, t) else {
             continue;
@@ -56,7 +62,7 @@ pub fn brace(painter: &egui::Painter, x: f32, runs: &[Run], t: f32) {
             painter,
             paths.cusp,
             2.0 * paths.ease,
-            theme::GOLD.linear_multiply(0.7 * paths.ease),
+            theme::alpha(theme::gold(), (179.0 * paths.ease) as u8),
         );
     }
 }
@@ -78,22 +84,26 @@ pub fn bulk_bar(ui: &mut egui::Ui, count: usize, any_running: bool, any_stopped:
         stop: false,
         clear: false,
     };
-    components::notched_card(ui, Some(theme::GOLD), |ui| {
-        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+    components::notched_card(ui, Some(theme::gold()), |ui| {
+        ui.spacing_mut().item_spacing = vec2(theme::space::M, theme::space::M);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing.x = theme::space::S;
             controls::count_chip(ui, count);
             let word = if count == 0 {
                 "none selected"
             } else {
                 "selected"
             };
-            ui.label(
+            let counted = ui.label(
                 RichText::new(word)
-                    .size(11.5)
+                    .size(theme::sized(theme::step::META))
                     .family(theme::fam_medium())
-                    .color(theme::DIM),
+                    .color(theme::ink_muted()),
             );
+            // The chip beside this word is a painted galley, so "selected" on
+            // its own is a count with no number in it. The pair reads as one
+            // phrase on screen and has to read as one phrase out loud.
+            a11y::describe(&counted, &selection_phrase(count));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if controls::ghost_small(ui, "clear").clicked() {
                     out.clear = true;
@@ -103,7 +113,7 @@ pub fn bulk_bar(ui: &mut egui::Ui, count: usize, any_running: bool, any_stopped:
         // Two fixed-width verb slots, always allocated, so the row never
         // reflows as verbs come and go; an absent verb leaves the scribe's
         // null mark instead of a hole.
-        let gap = 8.0;
+        let gap = theme::space::M;
         let slot_w = ((ui.available_width() - gap) / 2.0).max(0.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -116,6 +126,18 @@ pub fn bulk_bar(ui: &mut egui::Ui, count: usize, any_running: bool, any_stopped:
         });
     });
     out
+}
+
+/// The marked set in words: the painted count chip and the word beside it, as
+/// one phrase. The exact count is spoken even past the hundred the chip elides
+/// to "99+" — the number is the whole content of the mark, and a reader has no
+/// column of ticked rows to count instead.
+fn selection_phrase(count: usize) -> String {
+    match count {
+        0 => "none selected".to_owned(),
+        1 => "1 selected".to_owned(),
+        n => format!("{n} selected"),
+    }
 }
 
 /// A fixed-size slot for one bulk verb: the button justified to fill it when
@@ -143,7 +165,7 @@ fn verb_slot(
             ui.painter(),
             rect.center(),
             2.2,
-            theme::FAINT.linear_multiply(0.35),
+            theme::alpha(theme::ink_faint(), 89),
         );
         false
     }
@@ -257,6 +279,15 @@ mod tests {
 
     fn poly_len(path: &[Pos2]) -> f32 {
         path.windows(2).map(|w| w[0].distance(w[1])).sum()
+    }
+
+    #[test]
+    fn the_marked_count_is_spoken_even_when_the_chip_elides_it() {
+        assert_eq!(selection_phrase(0), "none selected");
+        assert_eq!(selection_phrase(1), "1 selected");
+        assert_eq!(selection_phrase(3), "3 selected");
+        // The chip paints "99+" past a hundred; the phrase still says how many.
+        assert_eq!(selection_phrase(134), "134 selected");
     }
 
     #[test]

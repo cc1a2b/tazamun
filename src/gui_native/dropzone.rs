@@ -5,10 +5,7 @@
 //! and classification only; no I/O beyond fs metadata checks.
 
 use eframe::egui;
-use egui::{
-    Color32, CornerRadius, FontFamily, FontId, LayerId, Order, Pos2, Rect, Shape, Stroke,
-    StrokeKind,
-};
+use egui::{CornerRadius, FontFamily, LayerId, Order, Pos2, Rect, Shape, Stroke, StrokeKind};
 
 use super::{chrome, copy, theme};
 
@@ -42,14 +39,10 @@ pub fn overlay_if_hovering(ui: &egui::Ui) {
     // Dim follows the window radius: the frameless window is transparent, so a
     // square fill would tint the empty rounded corners.
     let r = chrome::radius(chrome::is_maximized(ui));
-    p.rect_filled(
-        screen,
-        CornerRadius::same(r),
-        Color32::from_black_alpha(110),
-    );
+    p.rect_filled(screen, CornerRadius::same(r), theme::scrim());
 
     let b = screen.shrink(BORDER_INSET);
-    let dash = Stroke::new(1.5, theme::GOLD.linear_multiply(0.7));
+    let dash = Stroke::new(1.5, theme::alpha(theme::gold(), 179));
     for [start, end] in [
         [b.left_top(), b.right_top()],
         [b.right_top(), b.right_bottom()],
@@ -61,36 +54,40 @@ pub fn overlay_if_hovering(ui: &egui::Ui) {
 
     let title = p.layout_no_wrap(
         copy::DROP_OVERLAY_TITLE.to_owned(),
-        FontId::new(16.0, theme::fam_semibold()),
-        theme::INK,
+        theme::font(theme::step::TITLE, theme::fam_semibold()),
+        theme::ink(),
     );
     let hint = p.layout_no_wrap(
         copy::DROP_OVERLAY_HINT.to_owned(),
-        FontId::new(11.5, FontFamily::Proportional),
-        theme::DIM,
+        theme::font(theme::step::META, FontFamily::Proportional),
+        theme::ink_muted(),
     );
     let (t_sz, h_sz) = (title.size(), hint.size());
     let line_gap = 5.0;
     let pad = egui::vec2(18.0, 14.0);
     let inner = egui::vec2(t_sz.x.max(h_sz.x), t_sz.y + line_gap + h_sz.y);
     let card = Rect::from_center_size(screen.center(), inner + pad * 2.0);
-    p.rect_filled(card, CornerRadius::same(theme::R_CARD + 2), theme::BG1);
+    p.rect_filled(
+        card,
+        CornerRadius::same(theme::R_OVERLAY),
+        theme::bg_chrome(),
+    );
     p.rect_stroke(
         card,
-        CornerRadius::same(theme::R_CARD + 2),
-        Stroke::new(1.0, theme::GOLD.linear_multiply(0.35)),
+        CornerRadius::same(theme::R_OVERLAY),
+        Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 89)),
         StrokeKind::Inside,
     );
     let top = card.top() + pad.y;
     p.galley(
         Pos2::new(card.center().x - t_sz.x / 2.0, top),
         title,
-        theme::INK,
+        theme::ink(),
     );
     p.galley(
         Pos2::new(card.center().x - h_sz.x / 2.0, top + t_sz.y + line_gap),
         hint,
-        theme::DIM,
+        theme::ink_muted(),
     );
 }
 

@@ -223,6 +223,37 @@ pub mod consts {
     /// [`IPC_LINE_MAX`] (a 100k-file folder would otherwise overflow it).
     pub const FILES_LIST_MAX: usize = 1000;
 
+    // ── Server-side UI queries (files / audit / prunable conflicts) ─────────
+    // The snapshot caps above bound one *snapshot*; these bound one *answer to
+    // a question*. A UI pages through the whole index with them, so every path
+    // stays reachable no matter where it sorts — but a single page still has to
+    // fit [`IPC_LINE_MAX`], and a pattern still has to be cheap to evaluate
+    // against a 50k-path index on the single-threaded daemon actor.
+    /// Max file rows one `files` query page may return. A client asking for
+    /// more is clamped to this and told so (`limit` is echoed in the reply).
+    pub const FILE_QUERY_LIMIT_MAX: usize = 500;
+    /// Page size served when a `files` query omits `limit`.
+    pub const FILE_QUERY_LIMIT_DEFAULT: usize = 100;
+    /// Max audit rows one `audit` query page may return.
+    pub const AUDIT_QUERY_LIMIT_MAX: usize = 500;
+    /// Page size served when an `audit` query omits `limit`.
+    pub const AUDIT_QUERY_LIMIT_DEFAULT: usize = 200;
+    /// Max `kinds` values one audit query may filter on. The honest count is a
+    /// handful; this bounds the per-line filter cost over a 50k-line ledger.
+    pub const AUDIT_QUERY_KINDS_MAX: usize = 32;
+    /// Max characters in a query pattern. Matching is a folded scan of the
+    /// pattern against every candidate path, so the pattern length is one of
+    /// the two factors in that product — capping it caps the scan.
+    pub const QUERY_PATTERN_MAX: usize = 256;
+    /// Max `*` / `?` wildcards one pattern may carry. The glob matcher is the
+    /// two-pointer kind (no recursion, no exponential backtracking), so this is
+    /// belt-and-braces rather than the thing that prevents a blow-up.
+    pub const QUERY_PATTERN_WILDCARDS_MAX: usize = 16;
+    /// Byte budget for the rows embedded in one query page, well under
+    /// [`IPC_LINE_MAX`]. A count cap alone is not enough: rows carry paths, and
+    /// a page of maximum-length paths would otherwise blow the line.
+    pub const QUERY_PAGE_BUDGET: usize = 700 * 1024;
+
     // ── P19: audit log, hooks, notifications ────────────────────────────────
     /// Line cap on the per-folder append-only audit log (`.tazamun/audit.jsonl`).
     /// Older lines past this are dropped so the trail self-bounds without

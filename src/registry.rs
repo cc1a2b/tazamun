@@ -243,6 +243,13 @@ mod tests {
 
     #[test]
     fn register_is_idempotent_sorted_and_forgettable() {
+        // `register` stores `absolute(dir)`, and what that resolves to is
+        // platform-specific — on Windows a rooted Unix path picks up the
+        // current drive, so "/a/one" comes back as "D:\\a\\one". Compare
+        // against the same resolution rather than a literal, so the test
+        // asserts the behaviour (replace, sort, forget) on every host.
+        let one = absolute(Path::new("/a/one"));
+        let two = absolute(Path::new("/b/two"));
         let mut r = Registry::default();
         r.register(Path::new("/b/two"), SessionKind::Init, 100);
         r.register(Path::new("/a/one"), SessionKind::Join, 200);
@@ -250,8 +257,9 @@ mod tests {
         r.register(Path::new("/b/two"), SessionKind::Join, 300);
         assert_eq!(r.sessions.len(), 2);
         // Sorted by path.
-        assert_eq!(r.sessions[0].path, "/a/one");
-        assert_eq!(r.sessions[1].path, "/b/two");
+        assert_eq!(r.sessions[0].path, one);
+        assert_eq!(r.sessions[1].path, two);
+        assert!(r.sessions[0].path < r.sessions[1].path, "sorted by path");
         // The replacement took the newer kind/time.
         assert_eq!(r.sessions[1].kind, SessionKind::Join);
         assert_eq!(r.sessions[1].added_ms, 300);
@@ -297,13 +305,16 @@ mod tests {
 
     #[test]
     fn prune_drops_only_absent_sessions() {
+        // As above: the stored path is `absolute`, which is host-dependent.
+        let live = absolute(Path::new("/live"));
+        let dead = absolute(Path::new("/dead"));
         let mut r = Registry::default();
         r.register(Path::new("/live"), SessionKind::Init, 1);
         r.register(Path::new("/dead"), SessionKind::Init, 2);
-        let gone = r.prune(|p| p == Path::new("/live"));
-        assert_eq!(gone, vec!["/dead".to_string()]);
+        let gone = r.prune(|p| p == Path::new(&live));
+        assert_eq!(gone, vec![dead]);
         assert_eq!(r.sessions.len(), 1);
-        assert_eq!(r.sessions[0].path, "/live");
+        assert_eq!(r.sessions[0].path, live);
     }
 
     #[test]

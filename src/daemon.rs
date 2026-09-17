@@ -2850,6 +2850,11 @@ impl Actor {
             IpcRequest::ConflictApply { id, target } => {
                 self.handle_conflict_apply(id, target, reply)
             }
+            IpcRequest::Files(q) => self.handle_file_query(q, reply),
+            IpcRequest::Audit(q) => self.handle_audit_query(q, reply),
+            IpcRequest::ConflictsPrunable { older_than_ms } => {
+                self.handle_conflicts_prunable(older_than_ms, reply)
+            }
             IpcRequest::ConflictDiscard { id } => {
                 // The ONLY single-copy deletion path besides `conflicts prune`,
                 // and it exists precisely because the user asked for it.
@@ -2880,6 +2885,12 @@ impl Actor {
         v["airgap"] = serde_json::json!(self.airgap);
         v["config"] = serde_json::json!({
             "autolock": c.autolock,
+            // Published so a UI can show these as on or off. Without them the
+            // native GUI drew both sides of each toggle unselected and the user
+            // could not tell which was in force.
+            "audit": c.audit,
+            "hooks": c.hooks,
+            "notify": c.notify,
             "strict": c.strict,
             "role": c.role.as_str(),
             "update_channel": c.update_channel,
@@ -2963,6 +2974,232 @@ impl Actor {
         let all = crate::conflicts::list(&self.dir);
         let bytes = all.iter().map(|e| e.size).sum();
         (all.len(), bytes)
+    }
+
+    /// P22 `files`: match / sort / window the whole index, server-side.
+    ///
+    /// The snapshot in `status`/`dashboardstate` still carries its capped
+    /// prefix and is untouched; this answers the question a UI actually has —
+    /// "which of my 5,000 paths match what I typed, and give me a page of
+    /// them" — so no path is unreachable from a window merely because it sorts
+    /// past [`FILES_LIST_MAX`](crate::consts::FILES_LIST_MAX).
+    fn handle_file_query(&self, q: crate::ipc::FilesQuery, reply: oneshot::Sender<IpcResponse>) {
+        let raw = q.pattern.as_deref().unwrap_or("");
+        let matcher = match compile_pattern(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = reply.send(IpcResponse::err(e.code(), e.to_string()));
+                return;
+            }
+        };
+        let sort = match parse_file_sort(q.sort.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(IpcResponse::err(e.code(), e.to_string()));
+                return;
+            }
+        };
+        let limit = clamp_limit(
+            q.limit,
+            crate::consts::FILE_QUERY_LIMIT_DEFAULT,
+            crate::consts::FILE_QUERY_LIMIT_MAX,
+        );
+        let page = select_files(
+            &self.state.files,
+            &matcher,
+            q.include_deleted,
+            sort,
+            q.desc,
+            q.offset,
+            limit,
+        );
+        let (rows, page_truncated) = fill_budget(
+            &page.rows,
+            |(path, _)| json_cost(path.as_str()) + 224,
+            |(path, record)| {
+                let holder = self.locks.holder(path);
+                serde_json::json!({
+                    "path": path.as_str(),
+                    "size": record.size,
+                    "deleted": record.deleted,
+                    "updated_at_ms": record.updated_at_ms,
+                    "locked_by": holder,
+                    "mine_lock": holder.is_some_and(|h| *h == self.me_str),
+                    "versions": self.state.history.get(*path).map_or(0, Vec::len),
+                    "pulling": self.pending_pulls.contains_key(*path),
+                })
+            },
+        );
+        let returned = rows.len();
+        let pattern = raw.trim();
+        let _ = reply.send(IpcResponse::ok(serde_json::json!({
+            "files": rows,
+            "matched": page.matched,
+            "scanned": page.scanned,
+            "returned": returned,
+            "offset": q.offset,
+            "limit": limit,
+            "next_offset": next_offset(q.offset, returned, page.matched),
+            "page_truncated": page_truncated,
+            "pattern": (!pattern.is_empty()).then_some(pattern),
+            "sort": sort.as_str(),
+            "desc": q.desc,
+            "include_deleted": q.include_deleted,
+            "index_total": self.state.files.len(),
+        })));
+    }
+
+    /// P22 `audit`: the ledger with `tazamun log`'s filters applied
+    /// server-side, paged, with an honest match total.
+    ///
+    /// The read happens off the actor: the ledger is a file of up to
+    /// [`AUDIT_MAX_LINES`](crate::consts::AUDIT_MAX_LINES) JSON lines, and
+    /// parsing that on the single state-owning task would stall sync for as
+    /// long as it took. The spawned task borrows no actor state, so it can
+    /// answer the caller itself instead of routing an event back.
+    fn handle_audit_query(&self, q: crate::ipc::AuditQuery, reply: oneshot::Sender<IpcResponse>) {
+        let path = match q.path.as_deref() {
+            Some(p) => match sanitize_rel_path(p) {
+                Ok(rel) => Some(rel.as_str().to_string()),
+                Err(e) => {
+                    let _ = reply.send(IpcResponse::err(
+                        "bad_path",
+                        format!("invalid path filter: {e}"),
+                    ));
+                    return;
+                }
+            },
+            None => None,
+        };
+        if let Some(peer) = q.peer.as_deref()
+            && !valid_peer_filter(peer)
+        {
+            let _ = reply.send(IpcResponse::err(
+                "bad_request",
+                "peer filter must be an endpoint-id prefix (up to 64 alphanumerics)",
+            ));
+            return;
+        }
+        if q.kinds.len() > crate::consts::AUDIT_QUERY_KINDS_MAX {
+            let _ = reply.send(IpcResponse::err(
+                "bad_request",
+                format!(
+                    "at most {} kind filters",
+                    crate::consts::AUDIT_QUERY_KINDS_MAX
+                ),
+            ));
+            return;
+        }
+        if let Some(bad) = q.kinds.iter().find(|k| !valid_audit_kind(k)) {
+            let _ = reply.send(IpcResponse::err(
+                "bad_request",
+                format!("{bad:?} is not an event kind"),
+            ));
+            return;
+        }
+        let filter = crate::audit::Filter {
+            path,
+            peer: q.peer,
+            since_ms: q.since_ms,
+            kinds: q.kinds,
+        };
+        let limit = clamp_limit(
+            q.limit,
+            crate::consts::AUDIT_QUERY_LIMIT_DEFAULT,
+            crate::consts::AUDIT_QUERY_LIMIT_MAX,
+        );
+        let newest_first = q.newest_first.unwrap_or(true);
+        let offset = q.offset;
+        let dir = self.dir.clone();
+        let enabled = self.state.config.audit;
+        tokio::task::spawn_blocking(move || {
+            let all = crate::audit::read(&dir, &filter);
+            let matched = all.len();
+            let page = audit_page(&all, newest_first, offset, limit);
+            let (rows, page_truncated) = fill_budget(
+                &page,
+                |e| {
+                    json_cost(&e.kind)
+                        + e.path.as_deref().map_or(0, json_cost)
+                        + e.peer.as_deref().map_or(0, json_cost)
+                        + e.detail.as_deref().map_or(0, json_cost)
+                        + 224
+                },
+                |e| {
+                    serde_json::json!({
+                        "ts_ms": e.ts_ms,
+                        "ts": guard::utc_timestamp(e.ts_ms),
+                        "kind": e.kind,
+                        "path": e.path,
+                        "peer": e.peer,
+                        "detail": e.detail,
+                    })
+                },
+            );
+            let returned = rows.len();
+            let _ = reply.send(IpcResponse::ok(serde_json::json!({
+                "events": rows,
+                "matched": matched,
+                "returned": returned,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": next_offset(offset, returned, matched),
+                "page_truncated": page_truncated,
+                "newest_first": newest_first,
+                "enabled": enabled,
+                "ledger_bytes": crate::audit::end_offset(&dir),
+            })));
+        });
+    }
+
+    /// P22 `conflictsprunable`: what a `conflicts prune --older-than` *would*
+    /// delete, and what that would cost.
+    ///
+    /// Selection only — this never removes a byte. It exists so a UI can put
+    /// the whole cost of a prune in front of the user (how many copies, which
+    /// ones, how many bytes) before asking them to confirm; the Golden
+    /// Invariant does not allow a window to delete preserved bytes on the
+    /// strength of a number the user was never shown.
+    fn handle_conflicts_prunable(&self, older_than_ms: u64, reply: oneshot::Sender<IpcResponse>) {
+        let now = crate::now_ms();
+        let all = crate::conflicts::list(&self.dir);
+        let total = all.len();
+        let total_bytes: u64 = all.iter().map(|e| e.size).sum();
+        let prunable = crate::conflicts::select_prunable(&all, now, older_than_ms);
+        let count = prunable.len();
+        let bytes: u64 = prunable.iter().map(|e| e.size).sum();
+        let (entries, entries_truncated) = fill_budget(
+            &prunable,
+            |e| {
+                json_cost(&e.name)
+                    + e.path.as_deref().map_or(0, json_cost)
+                    + e.reason.as_deref().map_or(0, json_cost)
+                    + 224
+            },
+            |e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "path": e.path,
+                    "reason": e.reason,
+                    "size": e.size,
+                    "ts_ms": e.ts_ms,
+                    "age_ms": now.saturating_sub(e.ts_ms),
+                })
+            },
+        );
+        let shown = entries.len();
+        let _ = reply.send(IpcResponse::ok(serde_json::json!({
+            "older_than_ms": older_than_ms,
+            "cutoff_ms": now.saturating_sub(older_than_ms),
+            "now_ms": now,
+            "count": count,
+            "bytes": bytes,
+            "entries": entries,
+            "shown": shown,
+            "entries_truncated": entries_truncated,
+            "conflicts_total": total,
+            "conflicts_bytes": total_bytes,
+        })));
     }
 
     /// P18 `conflicts resolve` write step: copy quarantined bytes into a
@@ -4561,6 +4798,463 @@ pub fn files_json_capped(
     (map, total, total > cap)
 }
 
+// ── P22: server-side UI queries ─────────────────────────────────────────────
+// A UI used to filter the capped `files` prefix out of the status snapshot, so
+// any path sorting past FILES_LIST_MAX could not be shown, filtered, locked or
+// restored from a window at all — only from the CLI, which takes any path.
+// Everything below answers a query against the *whole* index instead. It does
+// zero I/O, borrows throughout (nothing but the returned page is cloned), and
+// is therefore exhaustively unit-testable without a running daemon.
+
+/// Why a query was refused. The pattern rejections mirror
+/// [`sanitize_rel_path`] rule for rule: a pattern is untrusted input, and
+/// although matching only ever reads in-memory index keys, a pattern that names
+/// something outside the session root is a probe rather than a search and is
+/// answered as one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QueryError {
+    #[error(
+        "pattern is longer than {} characters",
+        crate::consts::QUERY_PATTERN_MAX
+    )]
+    PatternTooLong,
+    #[error(
+        "pattern uses more than {} wildcards",
+        crate::consts::QUERY_PATTERN_WILDCARDS_MAX
+    )]
+    TooManyWildcards,
+    #[error("NUL byte in pattern")]
+    Nul,
+    #[error("backslash in pattern (relative paths use `/`)")]
+    Backslash,
+    #[error("absolute pattern: a query cannot leave the session root")]
+    Absolute,
+    #[error("drive-letter pattern: a query cannot leave the session root")]
+    DriveLetter,
+    #[error("`.` or `..` segment in pattern: a query cannot leave the session root")]
+    BadSegment,
+    #[error("pattern names the reserved `{META_DIR}` directory")]
+    Reserved,
+    #[error("unknown sort key {0:?} (want `path` or `size`)")]
+    BadSort(String),
+}
+
+impl QueryError {
+    /// The IPC error code a refusal carries, so a UI can branch on the kind of
+    /// mistake without reading the prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            QueryError::BadSort(_) => "bad_request",
+            _ => "bad_pattern",
+        }
+    }
+}
+
+/// Case-folds one scalar for matching. Allocation-free, so folding a whole
+/// index does no heap work. A multi-scalar lowering (`İ` → `i` + U+0307) folds
+/// to its first scalar; both sides of every comparison go through this same
+/// function, so pattern and path always agree on the fold.
+fn fold(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_lowercase()
+    } else {
+        c.to_lowercase().next().unwrap_or(c)
+    }
+}
+
+/// A folded pattern in both representations it can be matched in.
+///
+/// `chars` is the general form and always present. `ascii` is the same pattern
+/// as folded bytes, present only when the pattern is pure ASCII — which a
+/// search box's contents almost always are. An ASCII pattern against an ASCII
+/// path is a byte scan needing no per-path decode, and the two representations
+/// agree exactly there, because ASCII folding of ASCII text *is* scalar folding
+/// of ASCII text. The moment either side is non-ASCII the scalar form takes
+/// over, so a scalar that lowercases into ASCII (`İ`, `K`) still folds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folded {
+    chars: Vec<char>,
+    ascii: Option<Vec<u8>>,
+}
+
+impl Folded {
+    fn new(pattern: &str) -> Self {
+        Self {
+            chars: pattern.chars().map(fold).collect(),
+            ascii: pattern
+                .is_ascii()
+                .then(|| pattern.bytes().map(|b| b.to_ascii_lowercase()).collect()),
+        }
+    }
+}
+
+/// A compiled, validated query pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathMatcher {
+    /// No pattern at all: every path matches.
+    All,
+    /// No wildcards: a folded substring of the whole relative path — what a
+    /// search box means when someone types `plan`.
+    Substring(Folded),
+    /// `*` or `?` present: a whole-path glob anchored at both ends, where `*`
+    /// spans `/` as well and `?` is one scalar. There is no escape syntax, so a
+    /// literal `*` in a file name is not searchable as a literal — deliberate:
+    /// one unambiguous rule beats a half-implemented shell grammar.
+    Glob(Folded),
+}
+
+/// Reusable fold buffers, so scanning an index allocates a handful of times
+/// rather than once or twice per path.
+#[derive(Default)]
+struct Scratch {
+    chars: Vec<char>,
+    bytes: Vec<u8>,
+}
+
+impl PathMatcher {
+    /// Matches `path`, allocating its own scratch. Convenient for a single
+    /// test; the index scan uses [`Self::matches_with`] instead.
+    pub fn matches(&self, path: &str) -> bool {
+        let mut scratch = Scratch::default();
+        self.matches_with(path, &mut scratch)
+    }
+
+    /// Matches `path` reusing caller-owned buffers, so scanning 50k paths does
+    /// not allocate 50k times.
+    fn matches_with(&self, path: &str, scratch: &mut Scratch) -> bool {
+        match self {
+            PathMatcher::All => true,
+            PathMatcher::Substring(pat) => match &pat.ascii {
+                Some(needle) if path.is_ascii() => {
+                    fold_bytes(path, &mut scratch.bytes);
+                    contains_folded(&scratch.bytes, needle)
+                }
+                _ => {
+                    fold_chars(path, &mut scratch.chars);
+                    contains_folded(&scratch.chars, &pat.chars)
+                }
+            },
+            PathMatcher::Glob(pat) => match &pat.ascii {
+                Some(needle) if path.is_ascii() => {
+                    fold_bytes(path, &mut scratch.bytes);
+                    glob_match(needle, &scratch.bytes, b'*', b'?')
+                }
+                _ => {
+                    fold_chars(path, &mut scratch.chars);
+                    glob_match(&pat.chars, &scratch.chars, '*', '?')
+                }
+            },
+        }
+    }
+}
+
+fn fold_chars(path: &str, out: &mut Vec<char>) {
+    out.clear();
+    out.extend(path.chars().map(fold));
+}
+
+fn fold_bytes(path: &str, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(path.bytes().map(|b| b.to_ascii_lowercase()));
+}
+
+/// Folded substring search with a first-element skip. Both sides are folded
+/// already, so this is a plain slice scan; [`QUERY_PATTERN_MAX`] bounds the
+/// needle, which is the only factor a caller controls.
+///
+/// [`QUERY_PATTERN_MAX`]: crate::consts::QUERY_PATTERN_MAX
+fn contains_folded<T: Copy + PartialEq>(hay: &[T], needle: &[T]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > hay.len() {
+        return false;
+    }
+    let first = needle[0];
+    for start in 0..=hay.len() - needle.len() {
+        if hay[start] == first && hay[start..start + needle.len()] == *needle {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whole-string glob with `star` and `question`, two-pointer with a single
+/// backtrack mark. Iterative and linear in the scan with no recursion, so the
+/// nested quantifiers that make a regex engine explode (`(a*)*b`) have no
+/// analogue here: `*a*a*a*…*b` against a long run of `a`s terminates in O(n·m).
+/// Generic over the element so the same algorithm serves both the scalar and
+/// the ASCII-byte representation.
+fn glob_match<T: Copy + PartialEq>(pat: &[T], s: &[T], star: T, question: T) -> bool {
+    let (mut p, mut i) = (0usize, 0usize);
+    // `last_star` is the most recent `*` in the pattern, `mark` how much of `s`
+    // it had consumed when we passed it.
+    let (mut last_star, mut mark) = (usize::MAX, 0usize);
+    while i < s.len() {
+        if p < pat.len() && (pat[p] == question || pat[p] == s[i]) {
+            p += 1;
+            i += 1;
+        } else if p < pat.len() && pat[p] == star {
+            last_star = p;
+            mark = i;
+            p += 1;
+        } else if last_star != usize::MAX {
+            mark += 1;
+            i = mark;
+            p = last_star + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == star {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Validates an untrusted pattern and compiles it. An empty or all-whitespace
+/// pattern is [`PathMatcher::All`], not an error — a UI clearing its search box
+/// must get the whole index back, not a refusal.
+pub fn compile_pattern(raw: &str) -> Result<PathMatcher, QueryError> {
+    let pattern = raw.trim();
+    if pattern.is_empty() {
+        return Ok(PathMatcher::All);
+    }
+    if pattern.chars().count() > crate::consts::QUERY_PATTERN_MAX {
+        return Err(QueryError::PatternTooLong);
+    }
+    if pattern.contains('\0') {
+        return Err(QueryError::Nul);
+    }
+    let bytes = pattern.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(QueryError::DriveLetter);
+    }
+    if pattern.contains('\\') {
+        return Err(QueryError::Backslash);
+    }
+    if pattern.starts_with('/') {
+        return Err(QueryError::Absolute);
+    }
+    // The sanitizer's segment rules, minus its empty-segment rule: a trailing
+    // or doubled `/` cannot escape anything, and `docs/` is the natural way to
+    // scope a search to a folder.
+    for seg in pattern.split('/') {
+        if seg == "." || seg == ".." {
+            return Err(QueryError::BadSegment);
+        }
+        if seg.eq_ignore_ascii_case(META_DIR) {
+            return Err(QueryError::Reserved);
+        }
+    }
+    let wildcards = pattern.chars().filter(|c| matches!(c, '*' | '?')).count();
+    if wildcards > crate::consts::QUERY_PATTERN_WILDCARDS_MAX {
+        return Err(QueryError::TooManyWildcards);
+    }
+    let folded = Folded::new(pattern);
+    Ok(if wildcards == 0 {
+        PathMatcher::Substring(folded)
+    } else {
+        PathMatcher::Glob(folded)
+    })
+}
+
+/// How a file query orders its matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileSort {
+    /// Lexicographic by relative path — the order the index is already in.
+    #[default]
+    Path,
+    /// By byte size, ties broken by path so the order is total.
+    Size,
+}
+
+impl FileSort {
+    /// The slug echoed back to the client so it can label its own column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileSort::Path => "path",
+            FileSort::Size => "size",
+        }
+    }
+}
+
+/// Parses a client sort key. `name` is accepted as a synonym for `path`
+/// because that is what the native GUI's own sort mode is called.
+pub fn parse_file_sort(raw: Option<&str>) -> Result<FileSort, QueryError> {
+    match raw.map(str::trim).unwrap_or("path") {
+        "" | "path" | "name" => Ok(FileSort::Path),
+        "size" | "bytes" => Ok(FileSort::Size),
+        other => Err(QueryError::BadSort(other.to_string())),
+    }
+}
+
+/// The page size actually served: absent means `default`, and any request is
+/// clamped to `max` so one query can never ask for the whole index in one line.
+pub fn clamp_limit(requested: Option<usize>, default: usize, max: usize) -> usize {
+    requested.unwrap_or(default).min(max)
+}
+
+/// The offset a client should ask for next, or `None` when this page ended the
+/// result set — or returned nothing at all, which would otherwise invite a
+/// pager to spin on the same offset forever.
+pub fn next_offset(offset: usize, returned: usize, matched: usize) -> Option<usize> {
+    let next = offset.saturating_add(returned);
+    (returned > 0 && next < matched).then_some(next)
+}
+
+/// One page of a file query plus the accounting a UI needs to say "showing 50
+/// of 4,812" without lying about either number.
+#[derive(Debug)]
+pub struct FilePage<'a> {
+    /// The requested window, borrowed out of the index.
+    pub rows: Vec<(&'a RelPath, &'a FileRecord)>,
+    /// Paths matching the pattern across the whole index.
+    pub matched: usize,
+    /// Paths the pattern was tested against — the index minus tombstones,
+    /// unless the query asked for those. The denominator behind `matched`.
+    pub scanned: usize,
+}
+
+/// Matches, orders and windows the live index.
+///
+/// The path sort is a single streaming pass: `files` is a `BTreeMap`, so it is
+/// already in path order and only the requested window is ever collected. The
+/// size sort has to see every match before it can order them, so it collects
+/// *borrowed* pairs — two pointers per match, no path or record cloned — and
+/// sorts those. Either way the only data copied out of the index is the page.
+pub fn select_files<'a>(
+    files: &'a BTreeMap<RelPath, FileRecord>,
+    matcher: &PathMatcher,
+    include_deleted: bool,
+    sort: FileSort,
+    desc: bool,
+    offset: usize,
+    limit: usize,
+) -> FilePage<'a> {
+    let mut scratch = Scratch::default();
+    let mut scanned = 0usize;
+    match sort {
+        FileSort::Path => {
+            let end = offset.saturating_add(limit);
+            let iter: Box<dyn Iterator<Item = (&'a RelPath, &'a FileRecord)>> = if desc {
+                Box::new(files.iter().rev())
+            } else {
+                Box::new(files.iter())
+            };
+            let mut matched = 0usize;
+            let mut rows = Vec::new();
+            for (path, record) in iter {
+                if record.deleted && !include_deleted {
+                    continue;
+                }
+                scanned += 1;
+                if !matcher.matches_with(path.as_str(), &mut scratch) {
+                    continue;
+                }
+                if matched >= offset && matched < end {
+                    rows.push((path, record));
+                }
+                matched += 1;
+            }
+            FilePage {
+                rows,
+                matched,
+                scanned,
+            }
+        }
+        FileSort::Size => {
+            let mut hits: Vec<(&'a RelPath, &'a FileRecord)> = Vec::new();
+            for (path, record) in files.iter() {
+                if record.deleted && !include_deleted {
+                    continue;
+                }
+                scanned += 1;
+                if matcher.matches_with(path.as_str(), &mut scratch) {
+                    hits.push((path, record));
+                }
+            }
+            let matched = hits.len();
+            hits.sort_unstable_by(|a, b| {
+                let ord =
+                    a.1.size
+                        .cmp(&b.1.size)
+                        .then_with(|| a.0.as_str().cmp(b.0.as_str()));
+                if desc { ord.reverse() } else { ord }
+            });
+            let rows = hits.into_iter().skip(offset).take(limit).collect();
+            FilePage {
+                rows,
+                matched,
+                scanned,
+            }
+        }
+    }
+}
+
+/// Orders and windows an already-filtered audit ledger. Pure: the filtering and
+/// the file read happen in [`crate::audit`], the accounting happens here.
+pub fn audit_page(
+    events: &[crate::audit::AuditEvent],
+    newest_first: bool,
+    offset: usize,
+    limit: usize,
+) -> Vec<&crate::audit::AuditEvent> {
+    if newest_first {
+        events.iter().rev().skip(offset).take(limit).collect()
+    } else {
+        events.iter().skip(offset).take(limit).collect()
+    }
+}
+
+/// Serializes a page row by row under a byte budget, returning the rows and
+/// whether the budget cut the page short. A count cap alone cannot keep a query
+/// line under [`IPC_LINE_MAX`](crate::consts::IPC_LINE_MAX) — rows carry paths,
+/// and a page of maximum-length paths would blow it — so `cost` must be the
+/// caller's *worst-case* estimate of a row's encoded size. The first row is
+/// always emitted, so an over-budget row is returned rather than starving the
+/// page; the caller reports `rows.len()`, never the requested limit, so the
+/// total-versus-shown accounting stays honest either way.
+fn fill_budget<T>(
+    items: &[T],
+    cost: impl Fn(&T) -> usize,
+    mut row: impl FnMut(&T) -> serde_json::Value,
+) -> (Vec<serde_json::Value>, bool) {
+    let mut out = Vec::with_capacity(items.len());
+    let mut budget = crate::consts::QUERY_PAGE_BUDGET;
+    for item in items {
+        budget = budget.saturating_sub(cost(item));
+        if budget == 0 && !out.is_empty() {
+            return (out, true);
+        }
+        out.push(row(item));
+    }
+    (out, false)
+}
+
+/// Worst-case encoded size of a string inside a JSON row. Every byte can expand
+/// to a six-byte `\uXXXX` escape (a control character in a path on Unix), so
+/// the budget assumes that rather than the length the happy path would use.
+fn json_cost(s: &str) -> usize {
+    s.len() * 6
+}
+
+/// A peer filter is an endpoint-id prefix, and ids are hex — anything else is a
+/// typo or a probe. Bounding it also bounds the per-line prefix test across a
+/// 50k-line ledger.
+fn valid_peer_filter(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// An audit `kind` is a stable slug this daemon emits (`lock`, `publish`,
+/// `peer-connected`, …), so the accepted alphabet is exactly that.
+fn valid_audit_kind(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn is_scope_reason(reason: &str) -> bool {
     reason.starts_with("junk filter")
         || reason.starts_with("ignored by")
@@ -4621,7 +5315,526 @@ fn walk_files(root: &Path, current: &Path, out: &mut Vec<RelPath>) {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_detail;
+    use super::*;
+    use crate::audit::AuditEvent;
+    use crate::proto::ManifestRef;
+    use crate::sync::vclock::VClock;
+
+    fn rec(size: u64, deleted: bool) -> FileRecord {
+        FileRecord {
+            size,
+            manifest: ManifestRef::empty(),
+            vv: VClock::new(),
+            deleted,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn index(paths: &[(&str, u64, bool)]) -> BTreeMap<RelPath, FileRecord> {
+        paths
+            .iter()
+            .map(|(p, size, deleted)| {
+                let rel = sanitize_rel_path(p).expect("test fixture path must sanitize");
+                (rel, rec(*size, *deleted))
+            })
+            .collect()
+    }
+
+    /// The witness for the bug this query surface exists to fix: 5,000 paths,
+    /// of which the interesting one sorts far past `FILES_LIST_MAX`.
+    fn big_index() -> BTreeMap<RelPath, FileRecord> {
+        let mut m = BTreeMap::new();
+        for i in 0..5_000u64 {
+            let rel = sanitize_rel_path(&format!("d{:02}/f{:05}.bin", i % 64, i))
+                .expect("generated fixture path must sanitize");
+            m.insert(rel, rec(i, false));
+        }
+        m
+    }
+
+    fn paths(page: &FilePage<'_>) -> Vec<String> {
+        page.rows.iter().map(|(p, _)| p.to_string()).collect()
+    }
+
+    #[test]
+    fn an_empty_pattern_matches_everything_and_is_not_an_error() {
+        // Clearing a search box must return the whole index, never a refusal.
+        for raw in ["", "   ", "\t\n"] {
+            assert_eq!(compile_pattern(raw), Ok(PathMatcher::All), "{raw:?}");
+        }
+        assert!(PathMatcher::All.matches("anything/at/all.txt"));
+    }
+
+    #[test]
+    fn a_pattern_cannot_leave_the_session_root() {
+        // Every rejection the path sanitizer makes, the pattern compiler makes
+        // too: a pattern naming something outside the root is a probe.
+        let cases: &[(&str, QueryError)] = &[
+            ("../secrets", QueryError::BadSegment),
+            ("a/../../etc", QueryError::BadSegment),
+            ("./a", QueryError::BadSegment),
+            ("/etc/passwd", QueryError::Absolute),
+            ("C:\\Windows", QueryError::DriveLetter),
+            ("c:x", QueryError::DriveLetter),
+            ("a\\b", QueryError::Backslash),
+            ("a\0b", QueryError::Nul),
+            (".tazamun/state.json", QueryError::Reserved),
+            ("x/.TAZAMUN/y", QueryError::Reserved),
+            (".tazamun", QueryError::Reserved),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(compile_pattern(raw), Err(want.clone()), "{raw:?}");
+        }
+        // Every pattern rejection reports one code a UI can branch on.
+        assert_eq!(
+            compile_pattern("../x").unwrap_err().code(),
+            "bad_pattern",
+            "escape attempts are pattern errors, not generic bad requests"
+        );
+        // A trailing or doubled slash is not an escape — `docs/` is how a user
+        // scopes a search to a folder, so it must compile.
+        for ok in ["docs/", "docs//sub", "a..b", "x/y.tazamunish"] {
+            assert!(compile_pattern(ok).is_ok(), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn a_pattern_cannot_be_made_pathological() {
+        let long = "a".repeat(crate::consts::QUERY_PATTERN_MAX + 1);
+        assert_eq!(compile_pattern(&long), Err(QueryError::PatternTooLong));
+        // Exactly at the cap is fine (the cap is inclusive).
+        let at_cap = "a".repeat(crate::consts::QUERY_PATTERN_MAX);
+        assert!(compile_pattern(&at_cap).is_ok());
+        // Counted in characters, not bytes: a 4-byte scalar is one character.
+        let unicode_at_cap = "😀".repeat(crate::consts::QUERY_PATTERN_MAX);
+        assert!(compile_pattern(&unicode_at_cap).is_ok());
+
+        let stars = "*".repeat(crate::consts::QUERY_PATTERN_WILDCARDS_MAX + 1);
+        assert_eq!(compile_pattern(&stars), Err(QueryError::TooManyWildcards));
+
+        // The shape that makes a backtracking regex engine explode. The glob
+        // matcher is two-pointer with a single mark, so this terminates; if it
+        // ever regresses to recursive backtracking, this test hangs.
+        let evil = compile_pattern("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b")
+            .expect("15 wildcards is within the cap");
+        assert!(!evil.matches(&"a".repeat(4096)));
+    }
+
+    #[test]
+    fn a_pattern_without_wildcards_is_a_substring_and_folds_case() {
+        let m = compile_pattern("PLAN").expect("plain pattern compiles");
+        assert!(matches!(m, PathMatcher::Substring(_)));
+        // An ASCII pattern carries the byte form the hot scan uses.
+        let PathMatcher::Substring(folded) = &m else {
+            panic!("a wildcard-free pattern is a substring matcher")
+        };
+        assert_eq!(folded.ascii.as_deref(), Some(b"plan".as_slice()));
+        assert!(m.matches("docs/plan.md"));
+        assert!(m.matches("PLAN"));
+        assert!(!m.matches("docs/notes.md"));
+        // Matching is over the whole relative path, not just the file name.
+        let m = compile_pattern("docs/").expect("folder-scoped pattern compiles");
+        assert!(m.matches("docs/plan.md"));
+        assert!(!m.matches("src/docs.rs"));
+    }
+
+    #[test]
+    fn the_ascii_fast_path_and_the_scalar_path_agree() {
+        // An ASCII pattern takes the byte scan on an ASCII path and the scalar
+        // scan the moment the path carries a non-ASCII byte. Both routes must
+        // answer identically, or a search result would depend on whether some
+        // other part of the path happened to be Latin.
+        let m = compile_pattern("plan").expect("pattern compiles");
+        assert!(m.matches("docs/PLAN.md"), "ascii path: byte scan");
+        assert!(m.matches("عربي/PLAN.md"), "non-ascii path: scalar scan");
+        assert!(!m.matches("عربي/notes.md"));
+
+        // A non-ASCII pattern has no byte form at all, so every path takes the
+        // scalar scan.
+        let m = compile_pattern("مل").expect("pattern compiles");
+        let PathMatcher::Substring(folded) = &m else {
+            panic!("a wildcard-free pattern is a substring matcher")
+        };
+        assert!(folded.ascii.is_none());
+        assert!(m.matches("عربي/ملف.txt"));
+        assert!(!m.matches("ascii-only.txt"));
+
+        // Globs take the same pair of routes.
+        let g = compile_pattern("*/plan.md").expect("glob compiles");
+        assert!(g.matches("docs/plan.md"));
+        assert!(g.matches("عربي/plan.md"));
+        assert!(!g.matches("docs/plan.md.bak"));
+    }
+
+    #[test]
+    fn unicode_paths_match_by_substring_and_by_glob() {
+        // Arabic has no case, so folding must leave it alone and still match.
+        let m = compile_pattern("ملف").expect("arabic pattern compiles");
+        assert!(m.matches("عربي/ملف.txt"));
+        assert!(!m.matches("عربي/اخر.txt"));
+        // Folding is applied to both sides, so a cased non-ASCII script matches
+        // either way round.
+        assert!(compile_pattern("ÉCOLE").unwrap().matches("notes/école.md"));
+        assert!(compile_pattern("école").unwrap().matches("notes/ÉCOLE.md"));
+        // A `?` is one scalar, not one byte: a 2-byte Arabic letter is one `?`.
+        let m = compile_pattern("عربي/?لف.txt").expect("unicode glob compiles");
+        assert!(m.matches("عربي/ملف.txt"));
+    }
+
+    #[test]
+    fn a_pattern_with_metacharacters_is_an_anchored_glob() {
+        let m = compile_pattern("docs/*.md").expect("glob compiles");
+        assert!(matches!(m, PathMatcher::Glob(_)));
+        assert!(m.matches("docs/plan.md"));
+        assert!(m.matches("docs/deep/nested.md"), "`*` spans `/`");
+        assert!(!m.matches("src/docs/plan.md"), "anchored at the start");
+        assert!(!m.matches("docs/plan.md.bak"), "anchored at the end");
+
+        let q = compile_pattern("?.txt").expect("single-char glob compiles");
+        assert!(q.matches("a.txt"));
+        assert!(!q.matches("ab.txt"));
+        assert!(!q.matches(".txt"));
+
+        // Leading/trailing/repeated stars behave.
+        assert!(compile_pattern("*").unwrap().matches("anything"));
+        assert!(compile_pattern("**").unwrap().matches("anything"));
+        assert!(compile_pattern("*plan*").unwrap().matches("docs/plan.md"));
+        assert!(compile_pattern("a*").unwrap().matches("a"));
+        assert!(!compile_pattern("a*b").unwrap().matches("a"));
+    }
+
+    #[test]
+    fn sort_keys_and_limits_are_parsed_and_capped() {
+        assert_eq!(parse_file_sort(None), Ok(FileSort::Path));
+        for raw in ["", "path", "name", " path "] {
+            assert_eq!(parse_file_sort(Some(raw)), Ok(FileSort::Path), "{raw:?}");
+        }
+        for raw in ["size", "bytes"] {
+            assert_eq!(parse_file_sort(Some(raw)), Ok(FileSort::Size), "{raw:?}");
+        }
+        let err = parse_file_sort(Some("mtime")).unwrap_err();
+        assert_eq!(err, QueryError::BadSort("mtime".into()));
+        assert_eq!(err.code(), "bad_request");
+
+        // Absent → the default; above the cap → the cap; zero stays zero
+        // (a legitimate "just count the matches" request).
+        assert_eq!(clamp_limit(None, 100, 500), 100);
+        assert_eq!(clamp_limit(Some(50), 100, 500), 50);
+        assert_eq!(clamp_limit(Some(usize::MAX), 100, 500), 500);
+        assert_eq!(clamp_limit(Some(0), 100, 500), 0);
+    }
+
+    #[test]
+    fn paging_accounting_never_lies_or_spins() {
+        // `next_offset` is None at the end of the set...
+        assert_eq!(next_offset(0, 50, 50), None);
+        assert_eq!(next_offset(40, 10, 50), None);
+        assert_eq!(next_offset(0, 50, 4_812), Some(50));
+        // ...and None for an empty page, so a pager cannot loop on one offset.
+        assert_eq!(next_offset(0, 0, 4_812), None);
+        assert_eq!(next_offset(9_000, 0, 4_812), None);
+        // Overflow-safe: a hostile offset cannot wrap the next cursor.
+        assert_eq!(next_offset(usize::MAX, 1, usize::MAX), None);
+    }
+
+    #[test]
+    fn the_path_sort_pages_the_whole_index_in_order() {
+        let files = index(&[
+            ("a.txt", 30, false),
+            ("m/b.txt", 10, false),
+            ("z.txt", 20, false),
+        ]);
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Path,
+            false,
+            0,
+            10,
+        );
+        assert_eq!(paths(&page), vec!["a.txt", "m/b.txt", "z.txt"]);
+        assert_eq!((page.matched, page.scanned), (3, 3));
+
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Path,
+            true,
+            0,
+            10,
+        );
+        assert_eq!(paths(&page), vec!["z.txt", "m/b.txt", "a.txt"]);
+
+        // A window in the middle, with the total still whole.
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Path,
+            false,
+            1,
+            1,
+        );
+        assert_eq!(paths(&page), vec!["m/b.txt"]);
+        assert_eq!(page.matched, 3, "the total counts matches, not the page");
+    }
+
+    #[test]
+    fn an_offset_past_the_end_or_a_zero_limit_returns_an_honest_empty_page() {
+        let files = index(&[("a.txt", 1, false), ("b.txt", 2, false)]);
+        for sort in [FileSort::Path, FileSort::Size] {
+            let page = select_files(&files, &PathMatcher::All, false, sort, false, 99, 10);
+            assert!(page.rows.is_empty(), "{sort:?}");
+            assert_eq!(page.matched, 2, "{sort:?}: the total is still the truth");
+
+            // limit 0 is a count-only query, not an error and not a full page.
+            let page = select_files(&files, &PathMatcher::All, false, sort, false, 0, 0);
+            assert!(page.rows.is_empty(), "{sort:?}");
+            assert_eq!(page.matched, 2, "{sort:?}");
+            assert_eq!(next_offset(0, 0, page.matched), None, "{sort:?}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_reports_zero_of_the_scanned_total() {
+        let files = index(&[("a.txt", 1, false), ("b.txt", 2, false)]);
+        let m = compile_pattern("nothing-here").expect("pattern compiles");
+        for sort in [FileSort::Path, FileSort::Size] {
+            let page = select_files(&files, &m, false, sort, false, 0, 10);
+            assert!(page.rows.is_empty(), "{sort:?}");
+            assert_eq!(page.matched, 0, "{sort:?}");
+            assert_eq!(page.scanned, 2, "{sort:?}: the denominator is still real");
+        }
+    }
+
+    #[test]
+    fn tombstones_are_excluded_unless_asked_for() {
+        let files = index(&[
+            ("live.txt", 1, false),
+            ("gone.txt", 0, true),
+            ("also-live.txt", 2, false),
+        ]);
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Path,
+            false,
+            0,
+            10,
+        );
+        assert_eq!(paths(&page), vec!["also-live.txt", "live.txt"]);
+        assert_eq!((page.matched, page.scanned), (2, 2));
+
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            true,
+            FileSort::Path,
+            false,
+            0,
+            10,
+        );
+        assert_eq!(paths(&page), vec!["also-live.txt", "gone.txt", "live.txt"]);
+        assert_eq!((page.matched, page.scanned), (3, 3));
+    }
+
+    #[test]
+    fn the_size_sort_is_total_and_breaks_ties_by_path() {
+        let files = index(&[
+            ("b.txt", 10, false),
+            ("a.txt", 10, false),
+            ("big.bin", 900, false),
+            ("small.bin", 1, false),
+        ]);
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Size,
+            false,
+            0,
+            10,
+        );
+        assert_eq!(
+            paths(&page),
+            vec!["small.bin", "a.txt", "b.txt", "big.bin"],
+            "equal sizes order by path, so the result never depends on input order"
+        );
+        let page = select_files(
+            &files,
+            &PathMatcher::All,
+            false,
+            FileSort::Size,
+            true,
+            0,
+            10,
+        );
+        assert_eq!(paths(&page), vec!["big.bin", "b.txt", "a.txt", "small.bin"]);
+
+        // Paging a size sort keeps the same total order across pages.
+        let first = select_files(&files, &PathMatcher::All, false, FileSort::Size, true, 0, 2);
+        let second = select_files(&files, &PathMatcher::All, false, FileSort::Size, true, 2, 2);
+        assert_eq!(paths(&first), vec!["big.bin", "b.txt"]);
+        assert_eq!(paths(&second), vec!["a.txt", "small.bin"]);
+        assert_eq!(next_offset(0, 2, first.matched), Some(2));
+        assert_eq!(next_offset(2, 2, second.matched), None);
+    }
+
+    #[test]
+    fn a_path_sorting_past_the_snapshot_cap_is_still_reachable() {
+        // The regression this whole surface exists for: in a 5,000-file
+        // session the status snapshot carries the first FILES_LIST_MAX paths,
+        // so anything after them was invisible to every window.
+        let files = big_index();
+        let far_past_the_cap = "d63/f04991.bin";
+        let position = files
+            .keys()
+            .position(|p| p.as_str() == far_past_the_cap)
+            .expect("fixture contains the path");
+        assert!(
+            position > crate::consts::FILES_LIST_MAX,
+            "fixture must sort past the snapshot cap (it sorts at {position})"
+        );
+        let (snapshot, _, truncated) = files_json_capped(&files, crate::consts::FILES_LIST_MAX);
+        assert!(truncated && !snapshot.contains_key(far_past_the_cap));
+
+        // The query finds it regardless of where it sorts.
+        let m = compile_pattern("f04991").expect("pattern compiles");
+        let page = select_files(&files, &m, false, FileSort::Path, false, 0, 10);
+        assert_eq!(paths(&page), vec![far_past_the_cap]);
+        assert_eq!((page.matched, page.scanned), (1, 5_000));
+
+        // And paging walks the whole index, not a prefix of it.
+        let limit = crate::consts::FILE_QUERY_LIMIT_MAX;
+        let mut offset = 0usize;
+        let mut seen = 0usize;
+        loop {
+            let page = select_files(
+                &files,
+                &PathMatcher::All,
+                false,
+                FileSort::Path,
+                false,
+                offset,
+                limit,
+            );
+            seen += page.rows.len();
+            match next_offset(offset, page.rows.len(), page.matched) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, 5_000, "paging reaches every path exactly once");
+    }
+
+    #[test]
+    fn the_audit_page_orders_and_windows_honestly() {
+        let events: Vec<AuditEvent> = (0..5)
+            .map(|i| AuditEvent {
+                ts_ms: i,
+                kind: format!("k{i}"),
+                path: None,
+                peer: None,
+                detail: None,
+            })
+            .collect();
+
+        let newest = audit_page(&events, true, 0, 2);
+        assert_eq!(
+            newest.iter().map(|e| e.ts_ms).collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+        let oldest = audit_page(&events, false, 0, 2);
+        assert_eq!(
+            oldest.iter().map(|e| e.ts_ms).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        // Second page continues where the first stopped.
+        let page2 = audit_page(&events, true, 2, 2);
+        assert_eq!(
+            page2.iter().map(|e| e.ts_ms).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        // Offset past the end and a zero limit both yield nothing, and the
+        // caller's `matched` (events.len()) stays the honest denominator.
+        assert!(audit_page(&events, true, 99, 10).is_empty());
+        assert!(audit_page(&events, true, 0, 0).is_empty());
+        assert_eq!(next_offset(0, 0, events.len()), None);
+        assert_eq!(next_offset(0, 2, events.len()), Some(2));
+    }
+
+    #[test]
+    fn the_audit_filters_the_daemon_accepts_are_the_ones_it_emits() {
+        // The kinds this daemon actually writes must all pass the gate.
+        for kind in [
+            "lock",
+            "unlock",
+            "publish",
+            "restore",
+            "peer-connected",
+            "peer-offline",
+        ] {
+            assert!(valid_audit_kind(kind), "{kind}");
+        }
+        let over_long = "k".repeat(65);
+        for bad in ["", "a/b", "a b", "kind;rm -rf", over_long.as_str()] {
+            assert!(!valid_audit_kind(bad), "{bad:?}");
+        }
+        assert!(valid_peer_filter("9f2c4a7e"));
+        for bad in ["", "9f2c/", "../x", over_long.as_str()] {
+            assert!(!valid_peer_filter(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_of_huge_rows_is_cut_by_the_byte_budget_not_the_ipc_line() {
+        // A count cap alone cannot keep the line under IPC_LINE_MAX: rows carry
+        // paths. With maximum-length paths the budget must cut the page short
+        // and say so, and the resulting line must still fit.
+        let huge: Vec<String> = (0..crate::consts::FILE_QUERY_LIMIT_MAX)
+            .map(|i| format!("{i:04}/{}", "p".repeat(crate::consts::MAX_PATH_LEN - 5)))
+            .collect();
+        let (rows, truncated) = fill_budget(
+            &huge,
+            |p| json_cost(p) + 224,
+            |p| serde_json::json!({ "path": p }),
+        );
+        assert!(truncated, "the budget must cut a page of max-length paths");
+        assert!(rows.len() < huge.len());
+        let line = serde_json::to_vec(&serde_json::json!({ "files": rows })).unwrap();
+        assert!(
+            line.len() <= crate::consts::IPC_LINE_MAX,
+            "budgeted page is {} bytes, over the IPC line",
+            line.len()
+        );
+
+        // A normal page is not cut at all.
+        let normal: Vec<String> = (0..crate::consts::FILE_QUERY_LIMIT_MAX)
+            .map(|i| format!("docs/section-{i:04}.md"))
+            .collect();
+        let (rows, truncated) = fill_budget(
+            &normal,
+            |p| json_cost(p) + 224,
+            |p| serde_json::json!({ "path": p }),
+        );
+        assert!(!truncated);
+        assert_eq!(rows.len(), normal.len());
+
+        // A row that alone exceeds the budget is still returned, so a page can
+        // never come back empty while matches remain (which would strand a
+        // pager on the same offset forever).
+        let single = vec!["only".to_string()];
+        let (rows, truncated) = fill_budget(
+            &single,
+            |_| crate::consts::QUERY_PAGE_BUDGET * 2,
+            |p| serde_json::json!({ "path": p }),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(!truncated);
+    }
 
     #[test]
     fn cap_detail_never_panics_on_multibyte_at_the_boundary() {
