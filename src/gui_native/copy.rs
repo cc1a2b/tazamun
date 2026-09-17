@@ -167,9 +167,6 @@ pub const PEERS_NAME_HINT: &str = "Give a peer a name you will recognize. It is 
 /// Toast after copying the invite in `tab_overview()`.
 pub const TOAST_TICKET_COPIED: &str = "ticket copied to the clipboard";
 
-/// Toast after copying the folder path in `session_view()`.
-pub const TOAST_PATH_COPIED: &str = "folder path copied to the clipboard";
-
 /// Toast on a successful GUI-hosted start in `start_session()`.
 pub const TOAST_STARTED_HOSTED: &str =
     "started — hosted in this window, and stopped cleanly when you close it";
@@ -310,12 +307,6 @@ pub const DROP_REJECT_NOT_FOLDER: &str = "drop a folder, not a single file";
 
 /// Hover tooltip on the "Browse…" buttons in `home()` (extra).
 pub const BROWSE_HOVER: &str = "open the system folder picker, or type the path by hand";
-
-/// Hover tooltip on the "Open folder" button in `session_view()` (extra).
-pub const OPEN_FOLDER_HOVER: &str = "reveal this folder in your file manager";
-
-/// Hover tooltip on the "Copy path" button in `session_view()` (extra).
-pub const COPY_PATH_HOVER: &str = "copy this folder's path to the clipboard";
 
 /// Title of the `?` shortcuts sheet (P34).
 pub const SHORTCUTS_TITLE: &str = "Keys";
@@ -977,9 +968,6 @@ pub const ACTION_RESUME: &str = "Resume";
 
 // ─── the session menu (P36) ──────────────────────────────────────────────────
 
-/// Opens the session's less-used operations.
-pub const MENU_MORE: &str = "More";
-
 /// Runs the daemon's connectivity self-check.
 pub const MENU_DOCTOR: &str = "Run diagnostics";
 
@@ -1231,4 +1219,194 @@ mod group_share_tests {
             assert_eq!(group_share(1, bad), "1 file · 0%");
         }
     }
+}
+
+/// Shown under the session list when the OS supervisor is installed, so a
+/// machine that restarts its own sessions says so.
+pub const SUPERVISOR_ON: &str = "supervisor on";
+
+// ─── the menu bar (P37) ──────────────────────────────────────────────────────
+// The heads are lowercase because they are column heads: the bar is the ruler
+// at the top of the register, and a ruler's headings are set the way
+// `register::Col` sets them. The titles are the sentence-case form of the same
+// word, used only when a head's menu is folded into `more` and needs a serif
+// section title inside that one popup.
+
+/// The `session` head of the menu bar (`menubar::Menu::Session`).
+pub const MENUBAR_SESSION: &str = "session";
+
+/// The `tools` head of the menu bar (`menubar::Menu::Tools`).
+pub const MENUBAR_TOOLS: &str = "tools";
+
+/// The `display` head of the menu bar (`menubar::Menu::Display`).
+pub const MENUBAR_DISPLAY: &str = "display";
+
+/// The `help` head of the menu bar (`menubar::Menu::Help`).
+pub const MENUBAR_HELP: &str = "help";
+
+/// The trailing head that holds whatever the bar was too narrow to rule
+/// (`menubar::bar`).
+pub const MENUBAR_MORE: &str = "more";
+
+/// Serif title for the session menu inside the `more` popup.
+pub const MENUBAR_SESSION_TITLE: &str = "Session";
+
+/// Serif title for the tools menu inside the `more` popup.
+pub const MENUBAR_TOOLS_TITLE: &str = "Tools";
+
+/// Serif title for the display menu inside the `more` popup.
+pub const MENUBAR_DISPLAY_TITLE: &str = "Display";
+
+/// Serif title for the help menu inside the `more` popup.
+pub const MENUBAR_HELP_TITLE: &str = "Help";
+
+/// Screen-reader name for a menu-bar head, from the word on it.
+pub fn menu_spoken(head: &str) -> String {
+    format!("{head} menu")
+}
+
+/// Appended to the first head's screen-reader name, because the key that opens
+/// the bar is the one thing a reader cannot see on it.
+pub const MENUBAR_KEY_HINT: &str = "F10 opens the menu bar";
+
+/// Section head over the start/stop/pause block of the session menu.
+pub const MENUBAR_LIFECYCLE: &str = "lifecycle";
+
+/// Section head over the open/copy/rename block of the session menu.
+pub const MENUBAR_FOLDER: &str = "folder";
+
+/// Section head over the per-session operations in the tools menu.
+pub const MENUBAR_THIS_SESSION: &str = "this session";
+
+/// Section head over the machine-wide operations in the tools menu.
+pub const MENUBAR_THIS_MACHINE: &str = "this machine";
+
+/// Section head over the palette choices in the display menu.
+pub const MENUBAR_PALETTE: &str = "palette";
+
+/// Section head over the density choices in the display menu.
+pub const MENUBAR_DENSITY: &str = "density";
+
+/// Section head over the motion choices in the display menu.
+pub const MENUBAR_MOTION: &str = "motion";
+
+/// Section head over the text-size steppers in the display menu; its value
+/// column carries the scale in force.
+pub const MENUBAR_TEXT: &str = "text size";
+
+/// Section head over the shortcuts sheet in the help menu.
+pub const MENUBAR_KEYBOARD: &str = "keyboard";
+
+/// Section head over the colophon in the help menu.
+pub const MENUBAR_ABOUT: &str = "about";
+
+/// Section head over the update block in the help menu.
+pub const MENUBAR_UPDATES: &str = "updates";
+
+/// Menu-bar item that starts the open session.
+pub const MENU_START: &str = "Start";
+
+/// Menu-bar item that stops the open session.
+pub const MENU_STOP: &str = "Stop";
+
+/// Menu-bar item that reveals the open session's folder in the file manager.
+pub const MENU_OPEN_FOLDER: &str = "Open folder";
+
+/// Menu-bar item that copies the open session's folder path.
+pub const MENU_COPY_FOLDER: &str = "Copy path";
+
+/// Menu-bar item that opens the prune-preserved-copies confirm.
+pub const MENU_PRUNE: &str = "Delete preserved copies…";
+
+/// Menu-bar item that opens the `?` shortcuts sheet.
+pub const MENU_KEYS: &str = "Keyboard shortcuts";
+
+/// Menu-bar item that opens the colophon.
+pub const MENU_ABOUT: &str = "About tazamun";
+
+/// Menu-bar item that steps the text scale up one notch.
+pub const MENU_TEXT_BIGGER: &str = "Larger";
+
+/// Menu-bar item that steps the text scale down one notch.
+pub const MENU_TEXT_SMALLER: &str = "Smaller";
+
+/// Menu-bar item that puts the text scale back where it started.
+pub const MENU_TEXT_RESET: &str = "Back to 100%";
+
+/// Menu-bar item that asks whether a newer release exists.
+pub const MENU_UPDATE_CHECK: &str = "Check for updates";
+
+/// The same item while the check is in flight.
+pub const MENU_UPDATE_CHECKING: &str = "Checking for updates";
+
+/// Menu-bar item that installs the release a check found.
+pub fn menu_update_install(version: &str) -> String {
+    format!("Install {version}")
+}
+
+/// Why every session item is refused while the sidebar has nothing open.
+pub const MENUBAR_NEEDS_SESSION: &str = "open a session from the sidebar first";
+
+/// Why an item that talks to the daemon is refused while the session is stopped.
+pub const MENUBAR_NEEDS_RUNNING: &str =
+    "start this session first — this one runs through its daemon";
+
+/// Why Start is refused.
+pub const MENUBAR_ALREADY_RUNNING: &str = "this session is already running";
+
+/// Why Stop is refused.
+pub const MENUBAR_NOT_RUNNING: &str = "this session is not running";
+
+/// Why Pause is refused.
+pub const MENUBAR_ALREADY_PAUSED: &str = "this session is already paused";
+
+/// Why Resume is refused.
+pub const MENUBAR_NOT_PAUSED: &str = "this session is not paused";
+
+/// Why Rename is refused when no file is marked to rename.
+pub const MENUBAR_NEEDS_FILE: &str = "mark a file on the Files tab to rename it";
+
+/// Why the prune item is refused when the session holds no preserved copies.
+pub const MENUBAR_NO_CONFLICTS: &str = "nothing is preserved in this session";
+
+/// Why the update item is refused while a check or an install is in flight.
+pub const MENUBAR_UPDATE_BUSY: &str = "a check is already running";
+
+/// Why Larger is refused at the top of the scale.
+pub const MENUBAR_TEXT_AT_MAX: &str = "this is the largest text the window offers";
+
+/// Why Smaller is refused at the bottom of it.
+pub const MENUBAR_TEXT_AT_MIN: &str = "this is the smallest text the window offers";
+
+/// Why the reset is refused when the scale has not been moved.
+pub const MENUBAR_TEXT_AT_DEFAULT: &str = "the text is already at its standard size";
+
+/// The update line while a check is in flight.
+pub const UPDATE_CHECKING_NOTE: &str = "looking for a newer release";
+
+/// The update line when a newer release is on offer.
+pub fn update_offer(current: &str, latest: &str) -> String {
+    format!("{current} is running, {latest} is ready to install")
+}
+
+/// The update line once the binary has been replaced. The running process is
+/// still the old one, and saying so is the difference between a user who
+/// restarts and a user who thinks the update failed.
+pub fn update_applied(version: &str) -> String {
+    format!("{version} is installed — it starts the next time you open tazamun")
+}
+
+/// The update line when the last check found nothing newer.
+pub fn update_up_to_date(current: &str, when: &str) -> String {
+    format!("{current} is the newest release, checked {when}")
+}
+
+/// The update line before any check has been made.
+pub fn update_unchecked(current: &str) -> String {
+    format!("{current} is running, not checked for a newer one yet")
+}
+
+/// The update line after a check or an install failed.
+pub fn update_failed(why: &str) -> String {
+    format!("the last check could not finish: {why}")
 }

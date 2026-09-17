@@ -31,6 +31,10 @@ pub struct Status<'a> {
     /// Optional right-aligned note (the current action, or the selected
     /// session's name).
     pub note: Option<&'a str>,
+    /// The running version, shown at the foot's right edge. It belongs here
+    /// rather than under the session list: it describes the window, not the
+    /// sessions, and the sidebar scrolls it out of sight once the list is long.
+    pub version: Option<&'a str>,
 }
 
 /// Height the caller should give the bottom panel.
@@ -181,8 +185,32 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
         }
     }
 
-    // The note takes whatever the counts left behind, right-aligned; if that
-    // is cramped it is dropped whole rather than shown as a stub.
+    // The version holds the right edge, and the note takes what is left of it.
+    // When the window is too narrow for both the note goes first: which folder
+    // is open is already named in the header above, whereas nothing else on
+    // screen says which build is running.
+    let mut bound = bound;
+    if let Some(v) = s.version.map(str::trim).filter(|v| !v.is_empty())
+        && bound - x >= NOTE_MIN_W
+    {
+        let galley = p.layout_no_wrap(v.to_owned(), font.clone(), theme::ink_faint());
+        let size = galley.size();
+        let left = (bound - size.x).max(x + NOTE_AIR);
+        let clip = p.with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(x + NOTE_AIR, rect.top()),
+            egui::pos2(bound, rect.bottom()),
+        ));
+        clip.galley(
+            egui::pos2(left, cy - size.y * 0.5),
+            galley,
+            theme::ink_faint(),
+        );
+        bound = left - NOTE_AIR;
+    }
+
+    // The note takes whatever the counts and the version left behind,
+    // right-aligned; if that is cramped it is dropped whole rather than shown
+    // as a stub.
     if let Some(note) = s.note
         && bound - x >= NOTE_MIN_W
     {
@@ -251,6 +279,9 @@ fn strip_sentence(s: &Status<'_>) -> String {
         ));
     }
     parts.push(if s.busy { BUSY } else { IDLE }.to_owned());
+    if let Some(v) = s.version.map(str::trim).filter(|v| !v.is_empty()) {
+        parts.push(format!("version {v}"));
+    }
     if let Some(note) = s.note.map(str::trim).filter(|n| !n.is_empty()) {
         parts.push(note.to_owned());
     }
@@ -273,6 +304,7 @@ mod tests {
             conflicts: 1,
             busy: true,
             note: Some("notes.txt"),
+            version: None,
         }
     }
 
@@ -291,6 +323,7 @@ mod tests {
             conflicts: 0,
             busy: false,
             note: None,
+            version: None,
             ..status()
         };
         assert_eq!(
@@ -308,6 +341,7 @@ mod tests {
             conflicts: 1,
             busy: false,
             note: None,
+            version: None,
         };
         assert_eq!(
             strip_sentence(&one),
@@ -324,6 +358,7 @@ mod tests {
             conflicts: 0,
             busy: false,
             note: Some("   "),
+            version: None,
         };
         assert_eq!(
             strip_sentence(&empty),

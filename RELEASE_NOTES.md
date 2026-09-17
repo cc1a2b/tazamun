@@ -1,3 +1,77 @@
+# Tazamun v0.2.0
+
+A menu bar in the head of the window, the high-contrast palette as the one it
+opens in, and the in-app updater that was CLI-only until now.
+
+## The bar
+
+`session · tools · display · help`, ruled across the title bar in the register's
+own hand — lowercase tracked heads with a hairline between them, exactly the way
+a column heading is set, not a File/Edit/View strip borrowed from somewhere else.
+
+- **session** — start, stop, pause, resume, open folder, copy path, rename.
+- **tools** — diagnostics, the web dashboard, reclaim disk space, rotate the
+  session key, delete preserved copies, and the machine's supervisor. Split by
+  what the operation belongs to, which is also where the enablement boundary
+  falls: the first block needs a running daemon, rekey does not, and the
+  supervisor is a property of the machine.
+- **display** — palette, density, motion and text size, which were previously
+  reachable only from Home. A reader inside a session had to leave it to make
+  the text bigger.
+- **help** — the keyboard sheet, the colophon, and **updates**.
+
+Every item is operable from the keyboard (F10 opens the bar, arrows move,
+Escape closes, Tab never traps), every unavailable item says why on hover rather
+than disappearing, and the chords printed beside items are read out of the one
+shortcut registry so the menu can never advertise a key that does nothing. At a
+narrow window the heads fold from the right into a `more` head; a menu carrying
+news — an update waiting — is pinned and never folds away.
+
+The session header's row of five ghost buttons is gone: the bar carries those
+verbs now, with their keyboard routes and their reasons, and at a large text
+size the buttons and the folder path used to collide.
+
+## Updates, in the window
+
+`tazamun update` existed only as a CLI command, so a window left open for weeks
+had no way to learn it was stale. **help → Check for updates** now reports its
+state rather than just offering a verb — not checked yet, checking, "0.1.9 is
+the newest release, checked 4 minutes ago", "0.2.1 is ready to install", or the
+reason the last check could not finish. When there is something to say, the
+`help` head carries a mark so the bar says it without being opened.
+
+A check never installs. An install reuses the same path the CLI does, so the
+archive-layout and self-replace contracts are untouched. A copy owned by npm or
+Homebrew refuses to replace itself and tells you the manager's own command
+instead — updating underneath a package manager leaves its records naming a
+version that is no longer there.
+
+## Contrast is the default palette
+
+It was built for low vision and bright rooms, and it turned out to be the
+clearest statement of the whole design: ink-black ground, white text, and the
+brand gold carrying every mark that means something. An existing `gui.json`
+names its own palette and still means exactly what it said — only a preferences
+file that never chose one takes the new default.
+
+## Fixed
+
+- **Two-line settings rows were sliced through the middle.** A register row is a
+  fixed height because the body is virtualised, and the Display rows stack a
+  name over its hint. They now declare that stack and are ruled at the height
+  the type needs, derived from the scale rather than from a constant that
+  happened to fit at 100%.
+- **Fixed columns did not grow with the text size**, so at 200% a column held
+  about a third of the text it held at 100% and the rest was clipped. They now
+  scale with the type they carry — and a flexible column has a floor, so the
+  column an entry is identified by can never be squeezed to two letters by the
+  fixed ones beside it.
+- The column ruler, the empty state, the loading skeleton, the folio margin and
+  the custody seal were all sized from constants and are now derived from the
+  type scale; each one clipped or collided somewhere above ~1.2x.
+- The running version moved from the sidebar, where a long session list scrolled
+  it out of sight, to the foot of the window, which never scrolls.
+
 # Tazamun v0.1.9
 
 The window is rebuilt as a register of custody. The GUI read as a generic dark

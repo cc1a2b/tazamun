@@ -45,8 +45,9 @@
 //! request is on the wire the daemon acts on it and this side will not pretend
 //! otherwise. It also does not interrupt an applied-but-unpublished edit, an
 //! on-disk rename waiting for its publish, a running `conflicts::prune`, or
-//! `Start`/`Stop`/`Init`/`Join`/`Rekey`/`Supervisor`, none of which have a
-//! midpoint at which stopping would leave less damage than finishing.
+//! `Start`/`Stop`/`Init`/`Join`/`Rekey`/`Supervisor`/`Update`, none of which
+//! have a midpoint at which stopping would leave less damage than finishing —
+//! least of all an update, whose midpoint is a half-replaced binary.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -124,6 +125,7 @@ pub(super) async fn worker(
         polling: Arc::new(AtomicBool::new(false)),
         next_id: Arc::new(AtomicU64::new(1)),
     };
+    record_running_version(&clerk);
     let gates = Gates::default();
     let selected: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
     let poke = Arc::new(Notify::new());
@@ -526,6 +528,17 @@ fn entry_for(cmd: &Cmd) -> Option<Entry> {
             if *install { "installing" } else { "removing" },
             "the supervisor",
         ),
+        // The binary belongs to the device, not to a folder: an update must not
+        // wait behind a wedged session, and the two halves share the device gate
+        // so a check can never run alongside an install of the same binary.
+        Cmd::Update { apply } => Entry::device(
+            if *apply { "installing" } else { "checking" },
+            if *apply {
+                "the new version"
+            } else {
+                "for a newer release"
+            },
+        ),
     })
 }
 
@@ -710,6 +723,7 @@ async fn perform(
         Cmd::Invite { dir, role, ttl_ms } => invite_action(clerk, &dir, role, ttl_ms).await,
         Cmd::Rekey { dir } => rekey_action(clerk, &dir).await,
         Cmd::Supervisor { install } => supervisor_action(clerk, install).await,
+        Cmd::Update { apply } => update_action(clerk, selected, apply).await,
     }
 }
 
@@ -1795,6 +1809,426 @@ async fn supervisor_action(clerk: &Clerk, install: bool) {
         Ok(Err(e)) => clerk.toast(e.to_string(), true),
         Err(e) => clerk.toast(e, true),
     }
+}
+
+// ─── updates ─────────────────────────────────────────────────────────────────
+
+/// Where the release list is read from. The install never needs these — it goes
+/// through [`crate::cli::run`], which owns the repository, the asset target and
+/// the archive layout — but a check has to ask GitHub directly, because the
+/// command line's own check prints its answer instead of returning it.
+const RELEASE_OWNER: &str = "cc1a2b";
+const RELEASE_REPO: &str = "tazamun";
+
+/// The version the window is running, for the menu to name before anything has
+/// been checked and with no network at all.
+///
+/// It is written here, at the top of the worker, rather than left to the poll:
+/// the poll is a round trip per session and there may be no sessions, so a
+/// window on a fresh machine would otherwise show a blank version forever. It is
+/// `CARGO_PKG_VERSION`, not `TAZAMUN_VERSION`: the latter carries a build id
+/// (`0.1.9 (9e03554b)`), which is not semver, would never compare equal to a
+/// release tag, and would make [`UpdateState::available`] permanently true.
+fn record_running_version(clerk: &Clerk) {
+    clerk.write(|s| s.update.current = self_update::cargo_crate_version!().to_string());
+}
+
+/// Holds `UpdateState.busy` for as long as the work runs, and clears it in
+/// `Drop`.
+///
+/// The same rule [`Ticket`] keeps for the in-flight list, applied to the flag
+/// the menu reads to decide whether its own items are live: there is no exit —
+/// refusal, transport error, early return, unwind — that can leave the menu
+/// permanently mid-check.
+struct UpdateBusy(Clerk);
+
+impl UpdateBusy {
+    /// Taking the flag also clears the previous failure: what is on screen from
+    /// here on belongs to this attempt.
+    fn open(clerk: &Clerk) -> Self {
+        clerk.write(|s| {
+            s.update.busy = true;
+            s.update.error = None;
+        });
+        Self(clerk.clone())
+    }
+}
+
+impl Drop for UpdateBusy {
+    fn drop(&mut self) {
+        self.0.write(|s| s.update.busy = false);
+    }
+}
+
+/// How a check or an install ended, so `UpdateState` is written exactly once —
+/// at the end, whichever way the work went.
+enum Settled {
+    /// The newest release this channel accepts, whether it beats what is
+    /// running, and the package manager that owns this install if one does.
+    /// `latest` is `None` when nothing has been published yet.
+    Checked {
+        latest: Option<String>,
+        newer: bool,
+        managed: Option<(&'static str, &'static str)>,
+    },
+    /// The binary was replaced; this version starts with the next launch.
+    Installed { version: String },
+    /// A package manager owns this install, so nothing was touched.
+    Managed {
+        manager: &'static str,
+        command: &'static str,
+    },
+    /// Nothing was touched, and this is why.
+    Failed(String),
+}
+
+/// `Cmd::Update`: `apply: false` reports, `apply: true` replaces the binary.
+///
+/// The download, the asset-target normalisation, the per-archive binary layout
+/// and the atomic self-replace are **not** repeated here — the install runs the
+/// same command a terminal runs, `tazamun update --tag <version>`, through
+/// [`crate::cli::run`]. Two things a window needs and a terminal does not are
+/// added on this side: the newest version as a value rather than a printed line,
+/// and a refusal for installs a package manager owns.
+async fn update_action(clerk: &Clerk, selected: &Arc<Mutex<Option<PathBuf>>>, apply: bool) {
+    // The release channel is a per-folder preference, so this reads it from the
+    // folder on screen — the folder `tazamun update` would be run in. With none
+    // open it falls back to the working directory, exactly as the command line
+    // does with no `--dir`.
+    let dir = selected
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let _busy = UpdateBusy::open(clerk);
+    let settled = update_run(dir, apply).await;
+    // egui's clock, the one the view ages `InFlight.started` against — and never
+    // taken while the snapshot lock is held.
+    let now = clerk.now();
+    let current = self_update::cargo_crate_version!();
+
+    match settled {
+        Settled::Checked {
+            latest,
+            newer,
+            managed,
+        } => {
+            let said = match (latest.as_deref(), newer) {
+                (None, _) => format!("no releases have been published yet — running {current}"),
+                (Some(v), true) => match managed {
+                    Some((manager, command)) => format!(
+                        "update available: {current} → {v}. This copy belongs to {manager}, so \
+                         take it with `{command}` rather than from here."
+                    ),
+                    None => {
+                        format!("update available: {current} → {v} — install it from this menu")
+                    }
+                },
+                (Some(v), false) if apply => {
+                    format!("nothing installed — running {current}, newest release {v}")
+                }
+                (Some(v), false) => format!("up to date — running {current}, newest release {v}"),
+            };
+            clerk.write(move |s| {
+                s.update.latest = latest;
+                s.update.checked_at = Some(now);
+            });
+            clerk.toast(said, false);
+        }
+        Settled::Installed { version } => {
+            let said = format!(
+                "installed {version} — it runs from the next launch. Close this window and \
+                 reopen it, then restart any session still running the old binary."
+            );
+            clerk.write(move |s| {
+                s.update.latest = Some(version);
+                s.update.applied = true;
+                s.update.checked_at = Some(now);
+            });
+            clerk.toast(said, false);
+        }
+        Settled::Managed { manager, command } => {
+            let short = format!("this copy belongs to {manager} — update it with `{command}`");
+            let full = format!(
+                "This tazamun was installed by {manager}, which keeps its own record of which \
+                 version is on this machine.\n\nReplacing the binary from here would leave that \
+                 record naming the old version, and the next {manager} operation could quietly \
+                 put the old binary back. Nothing was downloaded and nothing was \
+                 changed.\n\nUpdate it with:\n\n  {command}"
+            );
+            clerk.write({
+                let short = short.clone();
+                move |s| s.update.error = Some(short)
+            });
+            clerk.toast(short, true);
+            clerk.report("update", full, true);
+        }
+        // `checked_at` deliberately does not move: a check that failed is not a
+        // check, and the view must go on ageing the last one that worked.
+        Settled::Failed(why) => {
+            clerk.write({
+                let why = why.clone();
+                move |s| s.update.error = Some(why)
+            });
+            clerk.toast(why, true);
+        }
+    }
+}
+
+/// Resolve the newest release, and install it when asked to. Every exit is a
+/// [`Settled`]; nothing here writes the snapshot.
+async fn update_run(dir: PathBuf, apply: bool) -> Settled {
+    // Judged before any network work: an install into a tree a package manager
+    // owns is refused outright, and a check says so rather than offering a
+    // button that would only refuse later.
+    let managed = match blocking(current_install_manager).await {
+        Ok(m) => m,
+        Err(e) => return Settled::Failed(e),
+    };
+    if apply && let Some((manager, command)) = managed {
+        return Settled::Managed { manager, command };
+    }
+
+    let token = github_token();
+    let had_token = token.is_some();
+    let folder = dir.clone();
+    let resolved = blocking(move || {
+        let channel = AppState::load(&folder)
+            .map(|s| s.config.update_channel)
+            .unwrap_or_else(|_| "stable".to_string());
+        fetch_release_versions(token).map(|versions| (channel, versions))
+    })
+    .await;
+    let (channel, versions) = match resolved {
+        Ok(Ok(v)) => v,
+        Ok(Err(why)) => return Settled::Failed(why),
+        Err(e) => return Settled::Failed(e),
+    };
+
+    let current = self_update::cargo_crate_version!();
+    let latest = newest_release(&channel, &versions);
+    let newer = is_newer(current, latest.as_deref());
+    match install_target(apply, current, latest.as_deref()) {
+        Some(version) => install_release(dir, version, had_token).await,
+        None => Settled::Checked {
+            latest,
+            newer,
+            managed,
+        },
+    }
+}
+
+/// Install exactly `version` by running the command line's own `update`.
+///
+/// The tag is pinned to the release the resolution step just found rather than
+/// left for the installer to pick again, for two reasons: the window can then
+/// name the version it actually installed — `applied` is a fact, not a guess —
+/// and a prerelease published between the resolution and the swap cannot land on
+/// a machine that asked for the stable channel.
+async fn install_release(dir: PathBuf, version: String, had_token: bool) -> Settled {
+    let cli = crate::cli::Cli {
+        // The same folder the channel was read from, so this is byte for byte
+        // the command the user could have typed in it.
+        dir,
+        verbose: 0,
+        net: crate::cli::NetFlags::default(),
+        cmd: Some(crate::cli::Cmd::Update {
+            check: false,
+            tag: Some(version.clone()),
+            yes: true,
+            // Not passed through: the updater falls back to GITHUB_TOKEN /
+            // GH_TOKEN itself, which is the same token the check used.
+            token: None,
+        }),
+    };
+    match crate::cli::run(cli, crate::ui::progress::Ui::disabled()).await {
+        Ok(()) => Settled::Installed { version },
+        Err(e) => Settled::Failed(update_failure(&e.to_string(), had_token)),
+    }
+}
+
+/// The release list, newest first, as versions. Blocking: `self_update` drives
+/// reqwest's blocking client, which panics if it is built on a reactor thread.
+///
+/// It downloads no asset and replaces nothing — this is the read half of
+/// `update`, which is why a check cannot install even if it wanted to.
+fn fetch_release_versions(token: Option<String>) -> Result<Vec<String>, String> {
+    let had_token = token.is_some();
+    let mut list = self_update::backends::github::ReleaseList::configure();
+    list.repo_owner(RELEASE_OWNER).repo_name(RELEASE_REPO);
+    if let Some(t) = &token {
+        list.auth_token(t);
+    }
+    let releases = list
+        .build()
+        .map_err(|e| update_failure(&e.to_string(), had_token))?
+        .fetch()
+        .map_err(|e| update_failure(&e.to_string(), had_token))?;
+    Ok(releases.into_iter().map(|r| r.version).collect())
+}
+
+/// The token that lifts GitHub's anonymous rate limit, from the same two
+/// variables `tazamun update` reads.
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Which package manager owns the running executable, if one does.
+///
+/// Canonicalised first, because the name on `PATH` is usually a shim: the npm
+/// install is reached through `/usr/local/bin/tazamun`, and only the link target
+/// says `node_modules`.
+fn current_install_manager() -> Option<(&'static str, &'static str)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    managed_by_path(&exe)
+}
+
+/// Whether an install can safely replace itself, judged from where it lives, and
+/// if it cannot, the manager that owns it with the command that updates it.
+/// Mirrors `cli::managed_by_path`, which is what the command line prints after a
+/// self-replace; here the same judgement is made *before* one, because a window
+/// has a button where the terminal has a warning.
+///
+/// Split on both separators rather than `components()`: `components()` cannot
+/// see the segments of a Windows path on a Unix host, which would make the exact
+/// layouts users report untestable. A Unix filename containing a literal
+/// backslash could over-split, and would cost at worst one wrong refusal.
+fn managed_by_path(exe: &Path) -> Option<(&'static str, &'static str)> {
+    let s = exe.to_string_lossy();
+    for part in s.split(['/', '\\']) {
+        match part {
+            "node_modules" => return Some(("npm", "npm update -g tazamun")),
+            "Cellar" | "homebrew" | "Homebrew" => {
+                return Some(("Homebrew", "brew upgrade tazamun"));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The newest release this channel will accept, from the list GitHub returns
+/// newest-first.
+///
+/// `stable` skips prereleases, which is what `/releases/latest` — the endpoint
+/// the installer uses when it is handed no tag — already does; `beta` takes the
+/// newest of everything, matching `update`'s beta branch. Without the filter the
+/// window could offer a prerelease to a stable machine and then pin the install
+/// to it, which is looser than the command line.
+fn newest_release(channel: &str, versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .map(|v| v.trim_start_matches('v'))
+        .find(|v| channel == "beta" || !is_prerelease(v))
+        .map(str::to_string)
+}
+
+/// A semver prerelease (`0.2.0-beta.1`). Build metadata (`0.2.0+ci.7`) is not
+/// one, and its `-` must not be mistaken for one.
+fn is_prerelease(version: &str) -> bool {
+    version
+        .split('+')
+        .next()
+        .is_some_and(|core| core.contains('-'))
+}
+
+/// Whether `latest` beats what is running, by the same comparison the updater
+/// itself uses. A version neither side can parse is not an update.
+fn is_newer(current: &str, latest: Option<&str>) -> bool {
+    latest.is_some_and(|v| self_update::version::bump_is_greater(current, v).unwrap_or(false))
+}
+
+/// The version an update command should install, if any.
+///
+/// `None` for a check — read-only by construction rather than by remembering to
+/// branch — and `None` for an install with nothing newer to fetch, which keeps
+/// the updater from being pointed at the version already running or at an older
+/// one. Pure, so "a check never installs" is a property with a test rather than
+/// a claim in a comment.
+fn install_target(apply: bool, current: &str, latest: Option<&str>) -> Option<String> {
+    if !apply || !is_newer(current, latest) {
+        return None;
+    }
+    latest.map(str::to_string)
+}
+
+/// Turn an updater failure into a sentence with a next move in it.
+///
+/// Four of these actually happen, and as raw library text they all read as "the
+/// update failed": a machine with no network, an anonymous API call over
+/// GitHub's hourly cap, a release with no build for this platform, and a binary
+/// this account may not overwrite. Each needs a different action, so each is
+/// named, and the raw text is kept on the end for whoever has to diagnose it.
+///
+/// Phrased as a reason, not as a sentence: it lands in `UpdateState.error`,
+/// which the view already introduces with "the last check could not finish".
+fn update_failure(raw: &str, had_token: bool) -> String {
+    let detail = raw.trim();
+    let low = detail.to_ascii_lowercase();
+    if low.contains("status: 403") || low.contains("status: 429") || low.contains("rate limit") {
+        return format!(
+            "GitHub is rate-limiting this machine. Anonymous release queries are capped per \
+             hour — wait for the cap to reset, or set GITHUB_TOKEN or GH_TOKEN and check \
+             again. ({detail})"
+        );
+    }
+    if low.contains("404") && !had_token {
+        return format!(
+            "GitHub answered 404 — the repository is private, or it has published no releases \
+             yet. Set GITHUB_TOKEN or GH_TOKEN, or run `tazamun update --token <TOKEN>` from a \
+             terminal. ({detail})"
+        );
+    }
+    if low.contains("permission denied")
+        || low.contains("access is denied")
+        || low.contains("os error 13")
+        || low.contains("read-only file system")
+    {
+        return format!(
+            "the download succeeded but the tazamun binary could not be replaced — this account \
+             may not write over it. Run the update from an administrator or root shell, or \
+             reinstall tazamun somewhere you own. ({detail})"
+        );
+    }
+    if low.contains("no asset found")
+        || low.contains("not found in archive")
+        || low.contains("no releases found")
+    {
+        return format!(
+            "that release carries no build for this platform, so there is nothing to install — \
+             the detail below names the target it looked for. Update through whatever installed \
+             this copy instead. ({detail})"
+        );
+    }
+    if looks_offline(&low) {
+        return format!(
+            "could not reach github.com — this machine looks offline. Tazamun itself syncs \
+             without it; only the update needs the network, and only to fetch the \
+             release. ({detail})"
+        );
+    }
+    detail.to_string()
+}
+
+/// Transport failures that mean "the network is not there", as reqwest and the
+/// resolver word them.
+fn looks_offline(low: &str) -> bool {
+    const SIGNS: [&str; 8] = [
+        "dns error",
+        "failed to lookup address",
+        "temporary failure in name resolution",
+        "error sending request",
+        "connection refused",
+        "network is unreachable",
+        "no route to host",
+        "operation timed out",
+    ];
+    SIGNS.iter().any(|s| low.contains(s))
 }
 
 // ─── session lifecycle ───────────────────────────────────────────────────────
@@ -2947,6 +3381,8 @@ mod tests {
             },
             Cmd::Rekey { dir: dir.clone() },
         ];
+        // `Update` is deliberately absent: it belongs to the device, and its own
+        // test below proves it never takes a folder's gate.
         for cmd in &dispatched {
             let e = entry_for(cmd).expect("a dispatched command must earn an entry");
             assert_eq!(
@@ -3118,6 +3554,225 @@ mod tests {
         assert!(!empty.readable);
         assert_eq!(empty.files, 0);
         assert_eq!(empty.name, "one");
+    }
+
+    #[test]
+    fn the_menu_can_name_the_running_version_before_any_check() {
+        let c = clerk();
+        assert!(c.read(|s| s.update.current.is_empty()));
+        record_running_version(&c);
+        assert_eq!(
+            c.read(|s| s.update.current.clone()),
+            self_update::cargo_crate_version!()
+        );
+        // Naming the version is not the same as offering one: nothing has been
+        // checked, so nothing is on offer and nothing has been applied.
+        assert!(!c.read(|s| s.update.available()));
+        assert!(c.read(|s| s.update.latest.is_none()));
+        assert!(!c.read(|s| s.update.applied));
+        assert!(c.read(|s| s.update.checked_at.is_none()));
+    }
+
+    /// The build id in `TAZAMUN_VERSION` would break both the comparison and
+    /// `available()`, so the running version has to be the bare crate version.
+    #[test]
+    fn the_running_version_is_the_one_the_updater_compares() {
+        let current = self_update::cargo_crate_version!();
+        assert!(
+            self_update::version::bump_is_greater(current, "99.0.0").unwrap_or(false),
+            "the running version must parse as semver"
+        );
+        assert!(env!("TAZAMUN_VERSION").starts_with(current));
+    }
+
+    /// A stuck `busy` is a menu whose items never come back, so it has to clear
+    /// on every exit — including the one no call site would have covered.
+    #[test]
+    fn an_update_never_leaves_the_menu_mid_check() {
+        let c = clerk();
+        c.write(|s| s.update.error = Some("the last attempt failed".into()));
+        {
+            let _busy = UpdateBusy::open(&c);
+            assert!(c.read(|s| s.update.busy));
+            // The stale failure belongs to the previous attempt, not this one.
+            assert!(c.read(|s| s.update.error.is_none()));
+        }
+        assert!(!c.read(|s| s.update.busy));
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let c2 = c.clone();
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _busy = UpdateBusy::open(&c2);
+            panic!("github did something unspeakable");
+        }));
+        std::panic::set_hook(prev);
+        assert!(out.is_err());
+        assert!(!c.read(|s| s.update.busy));
+    }
+
+    #[test]
+    fn an_update_is_device_work_and_never_waits_on_a_folder() {
+        let check = entry_for(&Cmd::Update { apply: false }).expect("entry");
+        let apply = entry_for(&Cmd::Update { apply: true }).expect("entry");
+        for e in [&check, &apply] {
+            assert_eq!(e.gate, DEVICE_GATE);
+            assert!(e.dir.is_empty(), "an update belongs to no session");
+            assert!(!e.what.is_empty());
+            assert!(!e.subject.is_empty());
+        }
+        // One gate for both halves, so a check and an install of the same binary
+        // cannot overlap...
+        assert_eq!(check.gate, apply.gate);
+        assert_ne!(check.what, apply.what);
+        // ...and never a folder's, so a wedged session cannot hold one up.
+        let folder = entry_for(&Cmd::Gc {
+            dir: PathBuf::from("/one"),
+        })
+        .expect("entry");
+        assert_ne!(apply.gate, folder.gate);
+    }
+
+    #[test]
+    fn a_check_never_installs() {
+        // Whatever is on offer, `apply: false` resolves to nothing to install.
+        assert_eq!(install_target(false, "0.1.9", Some("0.2.0")), None);
+        assert_eq!(install_target(false, "0.1.9", Some("1.0.0")), None);
+        assert_eq!(install_target(false, "0.1.9", None), None);
+        // An install takes only a strictly newer release: never the one already
+        // running, never an older one, never nothing.
+        assert_eq!(
+            install_target(true, "0.1.9", Some("0.2.0")).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(install_target(true, "0.1.9", Some("0.1.9")), None);
+        assert_eq!(install_target(true, "0.1.9", Some("0.1.8")), None);
+        assert_eq!(install_target(true, "0.1.9", None), None);
+        // A tag neither side can parse is not an update.
+        assert_eq!(install_target(true, "0.1.9", Some("nightly")), None);
+    }
+
+    #[test]
+    fn a_stable_machine_is_never_offered_a_prerelease() {
+        let list = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let mixed = list(&["0.2.0-beta.2", "0.2.0-beta.1", "0.1.9", "0.1.8"]);
+        assert_eq!(newest_release("stable", &mixed).as_deref(), Some("0.1.9"));
+        assert_eq!(
+            newest_release("beta", &mixed).as_deref(),
+            Some("0.2.0-beta.2")
+        );
+        // The tag may still carry its `v`, and build metadata is not a
+        // prerelease — its hyphen must not hide a stable release.
+        let tagged = list(&["v0.2.0+ci-7", "v0.1.9"]);
+        assert_eq!(
+            newest_release("stable", &tagged).as_deref(),
+            Some("0.2.0+ci-7")
+        );
+        // A repository with nothing to offer is an answer, not a failure.
+        assert_eq!(newest_release("stable", &[]), None);
+        assert_eq!(newest_release("stable", &list(&["0.2.0-rc.1"])), None);
+    }
+
+    #[test]
+    fn a_package_manager_install_is_not_self_replaceable() {
+        // The exact layout a real npm-on-Windows install reports.
+        let npm_win = Path::new(
+            r"C:\Users\cc1a2b\AppData\Roaming\npm\node_modules\tazamun\node_modules\.bin_real\tazamun.exe",
+        );
+        assert_eq!(
+            managed_by_path(npm_win),
+            Some(("npm", "npm update -g tazamun"))
+        );
+        assert_eq!(
+            managed_by_path(Path::new("/usr/local/lib/node_modules/tazamun/bin/tazamun")),
+            Some(("npm", "npm update -g tazamun"))
+        );
+        for brew in [
+            "/opt/homebrew/Cellar/tazamun/0.1.2/bin/tazamun",
+            "/home/linuxbrew/.linuxbrew/Cellar/tazamun/0.1.2/bin/tazamun",
+        ] {
+            assert_eq!(
+                managed_by_path(Path::new(brew)),
+                Some(("Homebrew", "brew upgrade tazamun"))
+            );
+        }
+        // A plain install is the self-updater's home turf and must not be
+        // refused — a false positive here leaves a user with no way to update
+        // at all.
+        for plain in [
+            "/usr/local/bin/tazamun",
+            "/home/cc1a2b/.cargo/bin/tazamun",
+            r"C:\Program Files\tazamun\tazamun.exe",
+        ] {
+            assert_eq!(managed_by_path(Path::new(plain)), None, "{plain}");
+        }
+    }
+
+    #[test]
+    fn each_update_failure_tells_the_user_something_different() {
+        let offline = update_failure(
+            "ReqwestError: error sending request for url \
+             (https://api.github.com/repos/cc1a2b/tazamun/releases): dns error: failed to lookup \
+             address information",
+            false,
+        );
+        let limited = update_failure(
+            "NetworkError: api request failed with status: 403 - for: \
+             \"https://api.github.com/repos/cc1a2b/tazamun/releases\"",
+            false,
+        );
+        let private = update_failure(
+            "NetworkError: api request failed with status: 404 - for: \
+             \"https://api.github.com/repos/cc1a2b/tazamun/releases/latest\"",
+            false,
+        );
+        let no_asset = update_failure(
+            "ReleaseError: No asset found for target: `aarch64-unknown-linux-musl`",
+            false,
+        );
+        let denied = update_failure("IoError: Permission denied (os error 13)", false);
+        let unknown = update_failure("ZipError: invalid Zip archive", false);
+
+        assert!(offline.contains("offline"), "{offline}");
+        assert!(limited.contains("rate-limiting"), "{limited}");
+        assert!(limited.contains("GITHUB_TOKEN"), "{limited}");
+        assert!(private.contains("private"), "{private}");
+        assert!(
+            no_asset.contains("no build for this platform"),
+            "{no_asset}"
+        );
+        assert!(denied.contains("could not be replaced"), "{denied}");
+        assert!(denied.contains("administrator or root"), "{denied}");
+        assert!(unknown.contains("invalid Zip archive"), "{unknown}");
+
+        // Six different next moves, none of them mistakable for another at a
+        // glance.
+        let all = [&offline, &limited, &private, &no_asset, &denied, &unknown];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+            // None of them may open with a second "the update failed": the view
+            // already introduces `UpdateState.error` with one.
+            assert!(!a.starts_with("the update failed"), "{a}");
+        }
+        // Every one keeps the raw text a maintainer would need.
+        assert!(offline.contains("dns error"), "{offline}");
+        assert!(limited.contains("status: 403"), "{limited}");
+        assert!(private.contains("status: 404"), "{private}");
+        assert!(
+            no_asset.contains("aarch64-unknown-linux-musl"),
+            "{no_asset}"
+        );
+        assert!(denied.contains("os error 13"), "{denied}");
+
+        // With a token in hand a 404 is not "the repository is private"; that
+        // advice would send the user to fetch the token they already have.
+        let with_token = update_failure(
+            "NetworkError: api request failed with status: 404 - for: \"https://api.github.com/x\"",
+            true,
+        );
+        assert!(!with_token.contains("private"), "{with_token}");
     }
 
     #[test]

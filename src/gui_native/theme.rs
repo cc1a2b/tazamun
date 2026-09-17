@@ -49,14 +49,21 @@ use egui::{
 // ─── mode ────────────────────────────────────────────────────────────────────
 
 /// Which palette the window is painted in.
+///
+/// [`Mode::Contrast`] is the default. It was built for low vision and bright
+/// rooms, and it turned out to be the best expression of the whole design:
+/// ink-black ground, white text, and the brand gold carrying every mark that
+/// means something. Nothing is decorative enough to need a mid-tone, so the
+/// palette with no mid-tones reads as the most deliberate of the three — and
+/// the one that is legible to the most people is a good thing to open with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     /// Iron-gall ink on a dark desk.
-    #[default]
     Night,
     /// Ink on warm stock.
     Paper,
-    /// Maximum separation, for low vision and bright rooms.
+    /// Maximum separation. The house default.
+    #[default]
     Contrast,
 }
 
@@ -73,12 +80,12 @@ impl Mode {
         }
     }
 
-    /// Parses a persisted key; anything unknown falls back to [`Mode::Night`].
+    /// Parses a persisted key; anything unknown falls back to the default.
     pub fn from_key(k: &str) -> Self {
         match k {
+            "night" => Self::Night,
             "paper" => Self::Paper,
-            "contrast" => Self::Contrast,
-            _ => Self::Night,
+            _ => Self::default(),
         }
     }
 
@@ -106,14 +113,16 @@ impl Mode {
     }
 }
 
-static MODE: AtomicU8 = AtomicU8::new(0);
+// Seeded with the default's tag so the very first frame — painted before prefs
+// are read — is already the house palette rather than a flash of another one.
+static MODE: AtomicU8 = AtomicU8::new(2);
 
 /// The palette currently in force.
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
+        0 => Mode::Night,
         1 => Mode::Paper,
-        2 => Mode::Contrast,
-        _ => Mode::Night,
+        _ => Mode::Contrast,
     }
 }
 
@@ -311,9 +320,9 @@ const CONTRAST: Palette = Palette {
 #[inline]
 pub fn pal() -> &'static Palette {
     match MODE.load(Ordering::Relaxed) {
+        0 => &NIGHT,
         1 => &PAPER,
-        2 => &CONTRAST,
-        _ => &NIGHT,
+        _ => &CONTRAST,
     }
 }
 
@@ -1107,7 +1116,7 @@ mod tests {
         for m in Mode::ALL {
             assert_eq!(Mode::from_key(m.key()), m);
         }
-        assert_eq!(Mode::from_key("nonsense"), Mode::Night);
+        assert_eq!(Mode::from_key("nonsense"), Mode::default());
     }
 
     #[test]
