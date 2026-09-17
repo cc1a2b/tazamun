@@ -139,6 +139,20 @@ async fn keep_both_restores_as_a_new_file() {
         wait_until(|| async { !conflicts(&b).await.is_empty() }, WAIT).await,
         "not quarantined"
     );
+    // Quarantining the rival bytes and restoring the indexed version over the
+    // working file are two steps, and the assertion at the end of this test is
+    // about the second one. Waiting only for the first raced the guard — the
+    // failure showed up as `doc.txt` still holding the rival edit, which reads
+    // exactly like a Golden Invariant violation rather than the timing bug it
+    // is.
+    assert!(
+        wait_until(
+            || async { b.read_file("doc.txt").as_deref() == Some(b"original") },
+            WAIT
+        )
+        .await,
+        "the un-leased write was never reverted"
+    );
     let c = conflicts(&b).await;
     let id = c[0]["name"].as_str().unwrap().to_string();
     let both = c[0]["both_name"]
