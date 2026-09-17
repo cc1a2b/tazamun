@@ -241,11 +241,8 @@ async fn keep_theirs_discards_the_copy() {
     past_mute().await;
 
     b.force_write("f.txt", b"junk");
-    assert!(
-        wait_until(|| async { !conflicts(&b).await.is_empty() }, WAIT).await,
-        "not quarantined"
-    );
-    let id = conflicts(&b).await[0]["name"].as_str().unwrap().to_string();
+    let list = wait_for_quarantine(&b, "f.txt", b"canon").await;
+    let id = list[0]["name"].as_str().unwrap().to_string();
 
     // Keep theirs = discard the quarantined copy; the synced bytes stay.
     let d = b.handle.request(IpcRequest::ConflictDiscard { id }).await;
