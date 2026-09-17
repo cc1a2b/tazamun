@@ -14,6 +14,45 @@ async fn past_mute() {
     tokio::time::sleep(tazamun::consts::MUTE_WINDOW + Duration::from_millis(400)).await;
 }
 
+/// Waits for a quarantined copy that is fully written, then returns the list.
+///
+/// A copy becomes visible in the list before its `reason` and `path` are
+/// recorded against it, so waiting on `!is_empty()` and asserting the metadata
+/// straight afterwards races the daemon. That race presents as `reason: None`
+/// or as the working file still holding the rival bytes — the second of which
+/// reads like a Golden Invariant violation rather than the timing bug it is,
+/// which is the worst possible way for a flake to fail.
+async fn wait_for_quarantine(
+    node: &TestNode,
+    path: &str,
+    restored: &[u8],
+) -> Vec<serde_json::Value> {
+    assert!(
+        wait_until(
+            || async {
+                conflicts(node)
+                    .await
+                    .iter()
+                    .any(|c| c["reason"].as_str().is_some() && c["path"].as_str() == Some(path))
+            },
+            WAIT
+        )
+        .await,
+        "no fully-recorded quarantined copy for {path}"
+    );
+    // Putting the indexed bytes back is a separate step from recording the
+    // copy, and every caller goes on to assert it happened.
+    assert!(
+        wait_until(
+            || async { node.read_file(path).as_deref() == Some(restored) },
+            WAIT
+        )
+        .await,
+        "the indexed version of {path} was never restored"
+    );
+    conflicts(node).await
+}
+
 /// Reads the daemon's structured conflict list.
 async fn conflicts(node: &TestNode) -> Vec<serde_json::Value> {
     let r = node.handle.request(IpcRequest::Conflicts).await;
@@ -47,11 +86,7 @@ async fn forced_write_is_quarantined_with_reason_then_resolved() {
     // B force-writes the read-only file: an un-leased edit → quarantined and
     // the indexed version restored.
     b.force_write("doc.txt", b"scribbled over it");
-    assert!(
-        wait_until(|| async { !conflicts(&b).await.is_empty() }, WAIT).await,
-        "the forced write was not quarantined"
-    );
-    let list = conflicts(&b).await;
+    let list = wait_for_quarantine(&b, "doc.txt", b"original").await;
     assert_eq!(list.len(), 1);
     let c = &list[0];
     assert_eq!(
@@ -135,25 +170,7 @@ async fn keep_both_restores_as_a_new_file() {
     past_mute().await;
 
     b.force_write("doc.txt", b"my rival edit");
-    assert!(
-        wait_until(|| async { !conflicts(&b).await.is_empty() }, WAIT).await,
-        "not quarantined"
-    );
-    // Quarantining the rival bytes and restoring the indexed version over the
-    // working file are two steps, and the assertion at the end of this test is
-    // about the second one. Waiting only for the first raced the guard — the
-    // failure showed up as `doc.txt` still holding the rival edit, which reads
-    // exactly like a Golden Invariant violation rather than the timing bug it
-    // is.
-    assert!(
-        wait_until(
-            || async { b.read_file("doc.txt").as_deref() == Some(b"original") },
-            WAIT
-        )
-        .await,
-        "the un-leased write was never reverted"
-    );
-    let c = conflicts(&b).await;
+    let c = wait_for_quarantine(&b, "doc.txt", b"original").await;
     let id = c[0]["name"].as_str().unwrap().to_string();
     let both = c[0]["both_name"]
         .as_str()
