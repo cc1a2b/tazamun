@@ -29,6 +29,7 @@ mod folderpick;
 mod grouping;
 mod health;
 mod marginalia;
+mod menubar;
 mod model;
 mod onboarding;
 mod ornament;
@@ -73,6 +74,12 @@ const GUI_SHUTDOWN: Duration = Duration::from_secs(10);
 const HISTORY_MAX: usize = 200;
 /// The same promise for the Audit ledger.
 const AUDIT_MAX: usize = 200;
+/// Room the session header's own verbs claim at 100% text, so the folder path
+/// beside them truncates instead of running under them.
+const HEADER_VERBS_W: f32 = 420.0;
+/// Width the ⌘K key claims at the title bar's trailing edge. The menu bar is
+/// laid out before it, so it has to be told what is coming.
+const PALETTE_KEY_W: f32 = 52.0;
 /// How long a typed pattern must settle before it is sent. The query runs on
 /// the daemon's single actor, so a round trip per keystroke would put the whole
 /// session behind the user's typing.
@@ -438,6 +445,11 @@ struct App {
     report: Option<Report>,
     /// The daemon's answer to the current file query.
     file_page: Option<FilePage>,
+    /// Version and update status, mirrored for the menu bar.
+    update: UpdateState,
+    /// The file the Files register has marked. The bar's Rename acts on it, so
+    /// the verb is reachable without hunting for the row's context menu.
+    marked_file: Option<String>,
     /// The query already asked, so typing does not re-ask it every frame.
     file_query: Option<(String, String, bool, usize)>,
     /// Which page of a server-side file query is on screen.
@@ -544,6 +556,8 @@ impl App {
             fetched_at: BTreeMap::new(),
             report: None,
             file_page: None,
+            update: UpdateState::default(),
+            marked_file: None,
             file_query: None,
             file_offset: 0,
             file_query_due: None,
@@ -614,6 +628,163 @@ impl App {
         prefs::save(&next);
         self.prefs_last = next;
         self.prefs_saved_at = now;
+    }
+
+    /// What the menu bar reads this frame. `reserve` is how much of the bar's
+    /// trailing edge the window buttons and the palette key will take: they are
+    /// laid out right-to-left *after* the bar, so `available_width` still counts
+    /// their strip and the bar would otherwise run under them.
+    fn bar_state<'a>(
+        &'a self,
+        overview: &'a Option<Overview>,
+        reserve: f32,
+    ) -> menubar::BarState<'a> {
+        let row = self.selected.as_ref().and_then(|sel| {
+            overview
+                .as_ref()
+                .and_then(|o| o.sessions.iter().find(|r| &r.path == sel))
+        });
+        menubar::BarState {
+            session: row.map(|r| menubar::SessionState {
+                running: r.running,
+                paused: r.paused,
+                role: r.role.as_str(),
+                may_edit: role_can_edit(&r.role),
+                conflicts: r.conflicts,
+                marked_file: self.marked_file.as_deref(),
+            }),
+            update: &self.update,
+            supervisor: overview.as_ref().is_some_and(|o| o.supervisor),
+            mode: self.mode,
+            density: self.density,
+            reduced_motion: self.reduced_motion,
+            text_scale: self.text_scale,
+            reserve,
+        }
+    }
+
+    /// Carries out what the menu bar was asked for.
+    fn run_menu(&mut self, action: menubar::MenuAction, ui: &egui::Ui) {
+        use menubar::MenuAction as M;
+        let dir = self.selected.as_deref().map(PathBuf::from);
+        match action {
+            M::Start => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Start(d));
+                }
+            }
+            M::Stop => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Stop(d));
+                }
+            }
+            M::Pause => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Pause(d));
+                }
+            }
+            M::Resume => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Resume(d));
+                }
+            }
+            M::OpenFolder => {
+                if let Some(sel) = &self.selected
+                    && let Err(e) = sysopen::open_folder(Path::new(sel))
+                {
+                    self.toasts.push(
+                        format!("could not open the file manager: {e}"),
+                        toasts::Kind::Bad,
+                        ui.input(|i| i.time),
+                    );
+                }
+            }
+            M::CopyPath => {
+                if let Some(sel) = self.selected.clone() {
+                    ui.ctx().copy_text(sel);
+                }
+            }
+            M::Rename => {
+                if let Some(f) = self.marked_file.clone() {
+                    self.rename = Some((f.clone(), f));
+                }
+            }
+            M::Doctor => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Doctor { dir: d });
+                }
+            }
+            M::Dashboard => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Dashboard { dir: d });
+                }
+            }
+            M::Gc => {
+                if let Some(d) = dir {
+                    self.send(Cmd::Gc { dir: d });
+                }
+            }
+            M::Rekey => {
+                if let Some(d) = dir {
+                    self.ask(
+                        copy::REKEY_TITLE,
+                        copy::REKEY_BODY.to_string(),
+                        copy::REKEY_VERB,
+                        true,
+                        Cmd::Rekey { dir: d },
+                    );
+                }
+            }
+            // The Conflicts tab owns the cutoff and the count, and the confirm
+            // has to name exactly what it will delete — so the bar takes the
+            // user there rather than guessing on their behalf.
+            M::Prune => self.tab = Tab::Conflicts,
+            M::Supervisor { install } => {
+                if install {
+                    self.send(Cmd::Supervisor { install: true });
+                } else {
+                    self.ask(
+                        copy::SUPERVISOR_REMOVE_TITLE,
+                        copy::SUPERVISOR_REMOVE_BODY.to_string(),
+                        copy::SUPERVISOR_REMOVE,
+                        true,
+                        Cmd::Supervisor { install: false },
+                    );
+                }
+            }
+            M::Palette(m) => {
+                if m != self.mode {
+                    self.mode = m;
+                    self.style_dirty = true;
+                }
+            }
+            M::Density(d) => {
+                if d != self.density {
+                    self.density = d;
+                    self.style_dirty = true;
+                }
+            }
+            M::Motion { reduced } => {
+                if reduced != self.reduced_motion {
+                    self.reduced_motion = reduced;
+                    self.style_dirty = true;
+                }
+            }
+            M::TextScale(v) => {
+                if (v - self.text_scale).abs() > f32::EPSILON {
+                    self.text_scale = v;
+                    self.style_dirty = true;
+                }
+            }
+            M::Shortcuts => {
+                self.shortcuts_open = true;
+                self.palette_open = false;
+                self.palette_focused = false;
+            }
+            M::Colophon => self.colophon_open = true,
+            M::CheckUpdate => self.send(Cmd::Update { apply: false }),
+            M::ApplyUpdate => self.send(Cmd::Update { apply: true }),
+        }
     }
 
     /// Pushes the four appearance values into `theme` and rebuilds the style.
@@ -698,6 +869,7 @@ impl eframe::App for App {
                 self.report = s.report.take();
             }
             self.file_page = s.file_page.clone();
+            self.update = s.update.clone();
             (s.overview.clone(), s.detail.clone(), s.tick, s.busy)
         };
         let (overview, detail, tick, busy) = snapshot;
@@ -727,6 +899,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 let ov = overview.as_ref();
                 let note = self.selected.as_deref().map(base_name);
+                let version = ov.map(|o| format!("v{}", o.version));
                 statusbar::status_strip(
                     ui,
                     statusbar::Status {
@@ -742,6 +915,7 @@ impl eframe::App for App {
                             .unwrap_or(0),
                         busy,
                         note: note.as_deref(),
+                        version: version.as_deref(),
                     },
                     maximized,
                 );
@@ -775,15 +949,7 @@ impl eframe::App for App {
             }))
             .show(ui, |ui| match &self.selected {
                 None => self.home(ui, &overview),
-                Some(sel) => {
-                    // The sidebar row carries the paused flag; the detail
-                    // payload does not, and offering Pause and Resume both
-                    // enabled meant one of them was always a no-op.
-                    let paused = overview
-                        .as_ref()
-                        .is_some_and(|o| o.sessions.iter().any(|r| &r.path == sel && r.paused));
-                    self.session_view(ui, detail.as_ref(), paused)
-                }
+                Some(_) => self.session_view(ui, detail.as_ref()),
             });
 
         // Drag-a-folder-onto-the-window: overlay while hovering, route on drop.
@@ -831,6 +997,9 @@ impl App {
         maximized: bool,
     ) {
         chrome::paint_titlebar_bg(ui, maximized);
+        // Taken out of the layout closure and run after it: acting on a menu
+        // choice mutates the view, and the closure already holds it.
+        let mut chosen: Option<menubar::MenuAction> = None;
         let bar = ui.max_rect();
         chrome::titlebar_interactions(ui, bar);
         egui::Frame::new()
@@ -865,10 +1034,11 @@ impl App {
                                 theme::custody_stale(),
                             );
                         }
-                        if ov.supervisor {
-                            register::tag(ui, "supervisor", theme::custody_peer());
-                        }
                     }
+                    ui.add_space(theme::space::L);
+                    let reserve =
+                        chrome::window_buttons_width(ui.spacing().item_spacing.x) + PALETTE_KEY_W;
+                    chosen = menubar::bar(ui, &self.bar_state(overview, reserve));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
                         // Painter-drawn glyphs describe nothing on their own, so
@@ -923,6 +1093,9 @@ impl App {
                     });
                 });
             });
+        if let Some(action) = chosen {
+            self.run_menu(action, ui);
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, overview: &Option<Overview>) {
@@ -1061,32 +1234,33 @@ impl App {
                         self.multi.clear();
                     }
                 }
-                // Footer pinned under the list: version + supervisor state.
-                ui.add_space(8.0);
-                ornament::rule_with_diamond(ui, theme::gold());
-                ui.horizontal(|ui| {
-                    let (mark, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    ornament::khatam(
-                        ui.painter(),
-                        mark.center(),
-                        5.5,
-                        theme::gold().linear_multiply(0.8),
-                        true,
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("v{}", ov.version))
-                            .size(10.5)
-                            .color(theme::ink_faint()),
-                    );
-                    if ov.supervisor {
+                // The version moved to the status strip, which never scrolls;
+                // what stays here is the one fact about this machine that the
+                // foot has no room for.
+                if ov.supervisor {
+                    ui.add_space(theme::space::M);
+                    ornament::rule_with_diamond(ui, theme::gold());
+                    ui.horizontal(|ui| {
+                        let side = theme::sized(theme::step::META);
+                        let (mark, _) =
+                            ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                        ornament::khatam(
+                            ui.painter(),
+                            mark.center(),
+                            side * 0.4,
+                            theme::gold(),
+                            true,
+                        );
                         ui.label(
-                            egui::RichText::new("· supervisor on")
-                                .size(10.5)
+                            egui::RichText::new(copy::SUPERVISOR_ON)
+                                .font(theme::font(
+                                    theme::step::META,
+                                    egui::FontFamily::Proportional,
+                                ))
                                 .color(theme::custody_good()),
                         );
-                    }
-                });
+                    });
+                }
             });
     }
 
@@ -1290,10 +1464,10 @@ impl App {
             register::Col::new("", register::ColW::Flex(2.0)),
             register::Col::new("", register::ColW::Flex(3.0)),
         ];
-        register::Register::new("display", &cols).no_margin().show(
-            ui,
-            register::Content::Entries(4),
-            |e| {
+        register::Register::new("display", &cols)
+            .no_margin()
+            .stacked_rows(&[theme::step::LABEL, theme::step::META])
+            .show(ui, register::Content::Entries(4), |e| {
                 e.no_mark();
                 match e.index() {
                     0 => {
@@ -1411,8 +1585,7 @@ impl App {
                         }
                     }
                 }
-            },
-        );
+            });
     }
 
     /// The zero-session opening page: three medallioned steps joined by a
@@ -1554,7 +1727,7 @@ impl App {
         });
     }
 
-    fn session_view(&mut self, ui: &mut egui::Ui, detail: Option<&Detail>, paused: bool) {
+    fn session_view(&mut self, ui: &mut egui::Ui, detail: Option<&Detail>) {
         let Some(sel) = self.selected.clone() else {
             return;
         };
@@ -1585,11 +1758,26 @@ impl App {
                     .font(theme::font(theme::step::DISPLAY, theme::fam_serif()))
                     .color(theme::ink()),
             );
-            ui.label(
-                egui::RichText::new(&sel)
-                    .font(theme::font(theme::step::DATA, theme::fam_mono()))
-                    .color(theme::ink_faint()),
+            // Truncated rather than wrapped: the verbs to its right are laid
+            // out afterwards, so a path allowed to take its natural width runs
+            // straight under them at a large text scale. The whole path is on
+            // the row's tooltip and in Copy path.
+            let avail = (ui.available_width() - HEADER_VERBS_W * theme::scale()).max(0.0);
+            let mut job = egui::text::LayoutJob::single_section(
+                sel.clone(),
+                egui::TextFormat {
+                    font_id: theme::font(theme::step::DATA, theme::fam_mono()),
+                    color: theme::ink_faint(),
+                    ..Default::default()
+                },
             );
+            job.wrap = egui::text::TextWrapping {
+                max_width: avail,
+                max_rows: 1,
+                break_anywhere: true,
+                ..Default::default()
+            };
+            ui.label(job).on_hover_text(&sel);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
                     if controls::ghost_button(ui, "Stop").clicked() {
@@ -1600,40 +1788,12 @@ impl App {
                 }
                 // Only the verb that applies: a session is either paused or
                 // it is not, and showing both made one of them a dead control.
-                if running {
-                    let (verb, cmd) = if paused {
-                        (copy::ACTION_RESUME, Cmd::Resume(dir.clone()))
-                    } else {
-                        (copy::ACTION_PAUSE, Cmd::Pause(dir.clone()))
-                    };
-                    if controls::ghost_small(ui, verb).clicked() {
-                        self.send(cmd);
-                    }
-                }
-                self.session_menu(ui, &dir, running);
-                ui.add_space(theme::space::S);
-                if controls::ghost_small(ui, "Open folder")
-                    .on_hover_text(copy::OPEN_FOLDER_HOVER)
-                    .clicked()
-                    && let Err(e) = sysopen::open_folder(Path::new(&sel))
-                {
-                    self.toasts.push(
-                        format!("could not open the file manager: {e}"),
-                        toasts::Kind::Bad,
-                        ui.input(|i| i.time),
-                    );
-                }
-                if controls::ghost_small(ui, "Copy path")
-                    .on_hover_text(copy::COPY_PATH_HOVER)
-                    .clicked()
-                {
-                    ui.ctx().copy_text(sel.clone());
-                    self.toasts.push(
-                        copy::TOAST_PATH_COPIED.into(),
-                        toasts::Kind::Info,
-                        ui.input(|i| i.time),
-                    );
-                }
+                // Only the lifecycle verb lives here now. Pause, the folder,
+                // the path and the tools all moved to the `session` and `tools`
+                // menus, which carry them with their keyboard routes and their
+                // disabled reasons — five ghost buttons and a title cannot
+                // share one row once the reader scales the text up, and they
+                // collided.
             });
         });
         rhythm::space(ui, 2);
@@ -1871,58 +2031,6 @@ impl App {
             if let Ok(mut g) = self.shared.lock() {
                 g.refusal = None;
             }
-        }
-    }
-
-    /// The session's less-used operations, every one of which the CLI has had
-    /// all along and the window had none of.
-    fn session_menu(&mut self, ui: &mut egui::Ui, dir: &Path, running: bool) {
-        let trigger = controls::ghost_small(ui, copy::MENU_MORE);
-        let mut chosen: Option<Cmd> = None;
-        let mut rekey = false;
-        egui::Popup::menu(&trigger).show(|ui| {
-            ui.set_min_width(200.0);
-            // Everything here needs a live daemon to answer, so the menu says
-            // so rather than offering verbs that can only fail.
-            ui.add_enabled_ui(running, |ui| {
-                if ui.button(copy::MENU_DOCTOR).clicked() {
-                    chosen = Some(Cmd::Doctor {
-                        dir: dir.to_path_buf(),
-                    });
-                    ui.close();
-                }
-                if ui.button(copy::MENU_DASHBOARD).clicked() {
-                    chosen = Some(Cmd::Dashboard {
-                        dir: dir.to_path_buf(),
-                    });
-                    ui.close();
-                }
-                if ui.button(copy::MENU_GC).clicked() {
-                    chosen = Some(Cmd::Gc {
-                        dir: dir.to_path_buf(),
-                    });
-                    ui.close();
-                }
-            });
-            ui.separator();
-            if ui.button(copy::MENU_REKEY).clicked() {
-                rekey = true;
-                ui.close();
-            }
-        });
-        if let Some(c) = chosen {
-            self.send(c);
-        }
-        if rekey {
-            self.ask(
-                copy::REKEY_TITLE,
-                copy::REKEY_BODY.to_string(),
-                copy::REKEY_VERB,
-                true,
-                Cmd::Rekey {
-                    dir: dir.to_path_buf(),
-                },
-            );
         }
     }
 
@@ -2970,6 +3078,12 @@ impl App {
         let custody = file_custody(f, d.running);
         e.custody(custody);
         e.folio(folio);
+        // Clicking a row marks it, which is what the bar's Rename acts on —
+        // the verb is otherwise only reachable from the row's context menu.
+        e.selected(self.marked_file.as_deref() == Some(f.path.as_str()));
+        if e.response().clicked() {
+            self.marked_file = Some(f.path.clone());
+        }
 
         let open = self.open_versions.contains(&f.path);
         let has_versions = d.versions.contains_key(&f.path);

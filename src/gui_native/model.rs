@@ -196,6 +196,8 @@ pub(super) struct Shared {
     pub(super) report: Option<Report>,
     /// The most recent answer to a file query.
     pub(super) file_page: Option<FilePage>,
+    /// Version and update status, for the menu bar.
+    pub(super) update: UpdateState,
     /// The most recent refused edit. Persists until the user clears it or the
     /// next edit succeeds — a refusal the user must act on cannot live in a
     /// four-second toast.
@@ -262,6 +264,34 @@ pub(super) struct FilePage {
     pub(super) offset: usize,
     /// Where the next page starts, if there is one.
     pub(super) next_offset: Option<usize>,
+}
+
+/// What the window knows about its own version and whether a newer one exists.
+///
+/// `tazamun update` has always been a CLI-only command, so a window left open
+/// for weeks had no way to learn it was stale. The menu bar carries the check
+/// and the apply, and this is what it reads.
+#[derive(Clone, Default)]
+pub(super) struct UpdateState {
+    /// The running version.
+    pub(super) current: String,
+    /// The newest release found, when a check has completed and found one.
+    pub(super) latest: Option<String>,
+    /// A check or an apply is in flight.
+    pub(super) busy: bool,
+    /// The binary was replaced; the new version lands on restart.
+    pub(super) applied: bool,
+    /// Why the last check or apply failed.
+    pub(super) error: Option<String>,
+    /// When the last successful check finished, for "checked N minutes ago".
+    pub(super) checked_at: Option<f64>,
+}
+
+impl UpdateState {
+    /// Whether a strictly newer release is on offer.
+    pub(super) fn available(&self) -> bool {
+        self.latest.as_deref().is_some_and(|l| l != self.current)
+    }
 }
 
 /// A body of text the worker produced that is too long, and too worth reading,
@@ -421,6 +451,11 @@ pub(super) enum Cmd {
     },
     /// Abandon an in-flight command at its next safe boundary.
     Cancel(u64),
+    /// Look for a newer release, and optionally install it. `apply: false` only
+    /// reports; `apply: true` replaces the running binary in place.
+    Update {
+        apply: bool,
+    },
     /// Ask the daemon to match a pattern against the whole index, rather than
     /// filtering the capped list the snapshot carries.
     SearchFiles {

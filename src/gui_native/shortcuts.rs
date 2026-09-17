@@ -127,6 +127,13 @@ const SECTIONS: &[Section] = &[
                 action: Action::Sheet,
             },
             Binding {
+                // The bar consumes F10 itself — it owns which head opens and
+                // where focus lands — so the global handler must not take it.
+                keys: &["F10"],
+                what: "open the menu bar",
+                action: Action::Convention,
+            },
+            Binding {
                 keys: &["Esc"],
                 what: "close whatever is open",
                 action: Action::Convention,

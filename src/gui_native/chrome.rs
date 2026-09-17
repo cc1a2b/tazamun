@@ -142,9 +142,25 @@ pub enum WinButton {
     Close,
 }
 
+/// One window button's cell.
+pub const WIN_BUTTON_W: f32 = 30.0;
+const WIN_BUTTON_H: f32 = 26.0;
+
+/// How much of the bar's trailing edge the three window buttons take, given the
+/// bar's horizontal item spacing.
+///
+/// Anything laid out in the bar before them — the menu bar especially — is
+/// working from `available_width`, which still counts this strip because the
+/// buttons are allocated afterwards in a right-to-left layout. A menu that
+/// budgeted from the raw figure would run underneath Close, and a window whose
+/// Close cannot be clicked cannot be shut.
+pub fn window_buttons_width(spacing: f32) -> f32 {
+    WIN_BUTTON_W * 3.0 + spacing.max(0.0) * 2.0
+}
+
 /// A minimal painter-drawn window button (28×28 hover pill, crisp 1.25px icon).
 pub fn window_button(ui: &mut egui::Ui, kind: WinButton, maximized: bool) -> egui::Response {
-    let size = egui::vec2(30.0, 26.0);
+    let size = egui::vec2(WIN_BUTTON_W, WIN_BUTTON_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let hovered = resp.hovered();
     let danger = matches!(kind, WinButton::Close);

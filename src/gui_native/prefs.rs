@@ -356,9 +356,12 @@ mod tests {
         assert_eq!(sanitized(&d), d);
         assert!(approx(d.text_scale, SCALE_DEFAULT));
         // Spelled out rather than taken from `Mode::default()`: these two are a
-        // wire format, and a later change of taste about the opening palette
-        // must not silently change what an existing `gui.json` means.
-        assert_eq!(d.mode, "night");
+        // wire format, and a change of taste about the opening palette must be
+        // a deliberate edit here rather than something that slips through. The
+        // opening palette moved from "night" to "contrast" in v0.2, and only a
+        // file that never named one takes it — an existing `gui.json` carries
+        // its choice explicitly and still means exactly what it said.
+        assert_eq!(d.mode, "contrast");
         assert_eq!(d.density, "regular");
         assert_eq!(d.last_tab, DEFAULT_TAB);
         assert_eq!(d.last_session, None);
@@ -482,7 +485,7 @@ mod tests {
                 mode: bad.to_string(),
                 ..Prefs::default()
             });
-            assert_eq!(c.mode, "night", "{bad:?} survived");
+            assert_eq!(c.mode, "contrast", "{bad:?} survived");
         }
     }
 
@@ -746,7 +749,7 @@ mod tests {
         assert_eq!(p.last_session.as_deref(), Some("/home/u/proj"));
         assert_eq!(p.window, Some([1400.0, 900.0]));
         assert!(p.maximized);
-        assert_eq!(p.mode, "night");
+        assert_eq!(p.mode, "contrast");
         assert_eq!(p.density, "regular");
         assert!(!p.reduced_motion);
     }
@@ -754,7 +757,7 @@ mod tests {
     #[test]
     fn garbage_appearance_in_the_file_sanitizes_to_the_defaults() {
         let p = parse(r#"{"mode":"midnight","density":"airy","reduced_motion":true}"#);
-        assert_eq!(p.mode, "night");
+        assert_eq!(p.mode, "contrast");
         assert_eq!(p.density, "regular");
         // A bool has no invalid value, so this one is kept as written.
         assert!(p.reduced_motion);
