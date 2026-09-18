@@ -8,7 +8,7 @@ use eframe::egui;
 use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind};
 use egui::{pos2, vec2};
 
-use super::{a11y, focusnav, ornament, theme};
+use super::{a11y, components, focusnav, ornament, theme};
 
 /// What the ticket is called when it is read out rather than seen.
 const TICKET_LEAD: &str = "invite ticket";
@@ -27,16 +27,30 @@ pub fn ticket_card(ui: &mut egui::Ui, ticket: &str, qr: Option<&egui::TextureHan
     const STUB_W: f32 = 108.0;
     const PAD: f32 = 12.0;
     const NOTCH_R: f32 = 7.0;
+    /// The khatam struck at the head of the ticket string.
+    const MARK_R: f32 = 7.0;
+    /// The square the stub's QR is printed at, and therefore the shortest a
+    /// ticket carrying one can be. One number rather than the three that used
+    /// to have to agree with each other.
+    const STUB_SIDE: f32 = STUB_W - PAD * 2.0;
 
+    // The mark's own width is what the string is indented past — the two used
+    // to be separate numbers that happened to clear each other.
+    let gutter = MARK_R * 2.0 + theme::space::S;
     let width = ui.available_width().max(200.0);
-    let body_wrap = width - STUB_W - PAD * 3.0 - 18.0;
+    let body_wrap = width - STUB_W - PAD * 3.0 - gutter;
     let galley = ui.painter().layout(
         ticket.to_owned(),
         theme::font(theme::step::CAPTION, theme::fam_mono()),
         theme::ink(),
         body_wrap.max(60.0),
     );
-    let height = (galley.size().y + PAD * 2.0).max(if qr.is_some() { 118.0 } else { 66.0 });
+    let floor = if qr.is_some() {
+        STUB_SIDE + PAD * 2.0
+    } else {
+        66.0
+    };
+    let height = (galley.size().y + PAD * 2.0).max(floor);
     // The ticket string is a painted galley, so the value beside the working
     // "Copy ticket" button is otherwise unreadable: copyable but unhearable.
     // A stop on the Tab route of its own is what makes it say itself.
@@ -72,13 +86,13 @@ pub fn ticket_card(ui: &mut egui::Ui, ticket: &str, qr: Option<&egui::TextureHan
         p.circle_filled(pos2(perf_x, rect.bottom()), NOTCH_R, theme::bg_deep());
         ornament::khatam(
             p,
-            pos2(rect.left() + PAD + 7.0, rect.top() + PAD + 7.0),
-            7.0,
+            pos2(rect.left() + PAD + MARK_R, rect.top() + PAD + MARK_R),
+            MARK_R,
             theme::gold(),
             false,
         );
         p.galley(
-            pos2(rect.left() + PAD + 18.0, rect.top() + PAD),
+            pos2(rect.left() + PAD + gutter, rect.top() + PAD),
             galley,
             theme::ink(),
         );
@@ -86,7 +100,7 @@ pub fn ticket_card(ui: &mut egui::Ui, ticket: &str, qr: Option<&egui::TextureHan
 
     let stub_center = pos2(perf_x + STUB_W * 0.5, rect.center().y);
     if let Some(qr) = qr {
-        let side = (STUB_W - 20.0).min(height - 20.0);
+        let side = STUB_SIDE.min(height - PAD * 2.0);
         let qr_rect = Rect::from_center_size(stub_center, vec2(side, side));
         ui.put(
             qr_rect,
@@ -156,15 +170,18 @@ pub fn loading_mark(ui: &mut egui::Ui, size: f32) {
 }
 
 /// A tiny keyboard key cap: a sunken chip with a hairline stroke and a mono
-/// caption label, min 20px wide, 16px tall.
+/// caption label. Ruled at the line box its caption lays out into and never
+/// narrower than it is tall, so a single glyph reads as a cap rather than a
+/// sliver.
 pub fn keycap(ui: &mut egui::Ui, label: &str) {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         theme::font(theme::step::CAPTION, theme::fam_mono()),
         theme::ink_muted(),
     );
-    let w = (galley.size().x + 10.0).max(20.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 16.0), Sense::hover());
+    let h = components::chip_h(theme::step::CAPTION, galley.size().y);
+    let w = (galley.size().x + theme::space::M).max(h);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
     let cr = CornerRadius::same(theme::R_CHIP);
     let p = ui.painter();
     p.rect_filled(rect, cr, theme::bg_sunken());

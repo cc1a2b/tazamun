@@ -171,26 +171,6 @@ fn file_custody(f: &FileRow, running: bool) -> theme::Custody {
     }
 }
 
-/// A setting's name over its one-line explanation. Every appearance and config
-/// row uses this so the left column reads as one column.
-fn setting_label(ui: &mut egui::Ui, name: &str, hint: &str) {
-    ui.vertical(|ui| {
-        ui.label(
-            egui::RichText::new(name)
-                .font(theme::font(theme::step::LABEL, theme::fam_medium()))
-                .color(theme::ink()),
-        );
-        ui.label(
-            egui::RichText::new(hint)
-                .font(theme::font(
-                    theme::step::META,
-                    egui::FontFamily::Proportional,
-                ))
-                .color(theme::ink_faint()),
-        );
-    });
-}
-
 /// One option of a small exclusive choice. The selected option is stated in
 /// ink on a gold wash rather than by a stock `selectable_label`, which was the
 /// last piece of unstyled egui left in the window.
@@ -895,7 +875,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.title_bar(ui, &overview, busy, maximized));
         Panel::bottom("status")
             .frame(egui::Frame::NONE)
-            .default_size(statusbar::STRIP_H)
+            .default_size(statusbar::strip_h())
             .show(ui, |ui| {
                 let ov = overview.as_ref();
                 let note = self.selected.as_deref().map(base_name);
@@ -1088,7 +1068,7 @@ impl App {
                             self.palette_sel = 0;
                         }
                         if busy {
-                            ceremony::loading_mark(ui, 16.0);
+                            ceremony::loading_mark(ui, theme::sized(theme::step::LABEL));
                         }
                     });
                 });
@@ -1449,142 +1429,8 @@ impl App {
                 // window, and the reader who most needs it is the first-timer
                 // on the zero-session page.
                 ui.add_space(10.0);
-                self.display_section(ui);
                 rhythm::space(ui, 3);
                 rhythm::foot_rule(ui);
-            });
-    }
-
-    /// App-wide display preferences. Text size lives here rather than in a
-    /// session's Settings tab: it is a property of the window, and Settings
-    /// needs a running daemon it has no business requiring for this.
-    fn display_section(&mut self, ui: &mut egui::Ui) {
-        register::heading(ui, copy::DISPLAY_TITLE);
-        let cols = [
-            register::Col::new("", register::ColW::Flex(2.0)),
-            register::Col::new("", register::ColW::Flex(3.0)),
-        ];
-        register::Register::new("display", &cols)
-            .no_margin()
-            .stacked_rows(&[theme::step::LABEL, theme::step::META])
-            .show(ui, register::Content::Entries(4), |e| {
-                e.no_mark();
-                match e.index() {
-                    0 => {
-                        e.cell(|ui| {
-                            setting_label(ui, copy::A11Y_TEXT_SIZE, copy::A11Y_TEXT_SIZE_HINT)
-                        });
-                        let scale = self.text_scale;
-                        let mut step = None;
-                        e.cell(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    // Ends disable rather than vanish, so the row
-                                    // never reflows under the pointer.
-                                    let at_max = scale >= a11y::SCALE_MAX;
-                                    let at_min = scale <= a11y::SCALE_MIN;
-                                    let bigger = ui.add_enabled_ui(!at_max, |ui| {
-                                        controls::ghost_small(ui, "+")
-                                    });
-                                    a11y::label_button(&bigger.inner, copy::A11Y_BIGGER);
-                                    ui.add_space(theme::space::XS);
-                                    ui.label(
-                                        egui::RichText::new(a11y::scale_label(scale))
-                                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
-                                            .color(theme::ink_muted()),
-                                    );
-                                    ui.add_space(theme::space::XS);
-                                    let smaller = ui.add_enabled_ui(!at_min, |ui| {
-                                        controls::ghost_small(ui, "−")
-                                    });
-                                    a11y::label_button(&smaller.inner, copy::A11Y_SMALLER);
-                                    if bigger.inner.clicked() {
-                                        step = Some(a11y::step_scale(scale, true));
-                                    } else if smaller.inner.clicked() {
-                                        step = Some(a11y::step_scale(scale, false));
-                                    }
-                                },
-                            );
-                        });
-                        if let Some(next) = step
-                            && next != self.text_scale
-                        {
-                            self.text_scale = next;
-                            self.style_dirty = true;
-                        }
-                    }
-                    1 => {
-                        e.cell(|ui| setting_label(ui, copy::THEME_TITLE, copy::THEME_HINT));
-                        let cur = self.mode;
-                        let mut pick = None;
-                        e.cell(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for m in theme::Mode::ALL.iter().rev() {
-                                        if choice(ui, m.label(), *m == cur) {
-                                            pick = Some(*m);
-                                        }
-                                    }
-                                },
-                            );
-                        });
-                        if let Some(m) = pick
-                            && m != self.mode
-                        {
-                            self.mode = m;
-                            self.style_dirty = true;
-                        }
-                    }
-                    2 => {
-                        e.cell(|ui| setting_label(ui, copy::DENSITY_TITLE, copy::DENSITY_HINT));
-                        let cur = self.density;
-                        let mut pick = None;
-                        e.cell(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for dn in theme::Density::ALL.iter().rev() {
-                                        if choice(ui, dn.label(), *dn == cur) {
-                                            pick = Some(*dn);
-                                        }
-                                    }
-                                },
-                            );
-                        });
-                        if let Some(dn) = pick
-                            && dn != self.density
-                        {
-                            self.density = dn;
-                            self.style_dirty = true;
-                        }
-                    }
-                    _ => {
-                        e.cell(|ui| setting_label(ui, copy::MOTION_TITLE, copy::MOTION_HINT));
-                        let cur = self.reduced_motion;
-                        let mut pick = None;
-                        e.cell(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if choice(ui, copy::MOTION_REDUCED, cur) {
-                                        pick = Some(true);
-                                    }
-                                    if choice(ui, copy::MOTION_FULL, !cur) {
-                                        pick = Some(false);
-                                    }
-                                },
-                            );
-                        });
-                        if let Some(v) = pick
-                            && v != self.reduced_motion
-                        {
-                            self.reduced_motion = v;
-                            self.style_dirty = true;
-                        }
-                    }
-                }
             });
     }
 
@@ -1593,69 +1439,102 @@ impl App {
     fn first_light(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(copy::FL_TITLE)
-                .family(theme::fam_semibold())
-                .size(20.0)
+                .font(theme::font(theme::step::DISPLAY, theme::fam_serif()))
                 .color(theme::ink()),
         );
         ui.label(
             egui::RichText::new(copy::FL_SUB)
-                .size(12.0)
+                .font(theme::font(
+                    theme::step::BODY,
+                    egui::FontFamily::Proportional,
+                ))
                 .color(theme::ink_muted()),
         );
-        ui.add_space(10.0);
+        ui.add_space(theme::space::L);
         onboarding::first_light_frame(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    onboarding::medallion(ui, 1, onboarding::StepState::Active);
-                    onboarding::connector(ui, 118.0);
-                    onboarding::medallion(ui, 2, onboarding::StepState::Future);
-                    onboarding::connector(ui, 34.0);
-                    onboarding::medallion(ui, 3, onboarding::StepState::Future);
-                });
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP1_TITLE)
-                            .family(theme::fam_semibold())
-                            .size(14.5)
-                            .color(theme::ink()),
-                    );
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP1_HINT)
-                            .size(11.5)
-                            .color(theme::ink_muted()),
-                    );
-                    ui.add_space(4.0);
-                    self.create_form_row(ui);
-                    self.join_form_row(ui);
-                    ui.add_space(16.0);
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP2_TITLE)
-                            .family(theme::fam_semibold())
-                            .size(13.0)
-                            .color(theme::ink_faint()),
-                    );
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP2_HINT)
-                            .size(11.0)
-                            .color(theme::ink_faint()),
-                    );
-                    ui.add_space(14.0);
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP3_TITLE)
-                            .family(theme::fam_semibold())
-                            .size(13.0)
-                            .color(theme::ink_faint()),
-                    );
-                    ui.label(
-                        egui::RichText::new(copy::FL_STEP3_HINT)
-                            .size(11.0)
-                            .color(theme::ink_faint()),
-                    );
-                });
+            // One row per step, each numeral beside the words it belongs to.
+            // The two used to be separate columns joined by a connector whose
+            // length was a guess at how tall the words were; the guess was
+            // wrong and steps two and three floated above their own numerals.
+            let mut marks: Vec<egui::Rect> = Vec::new();
+            marks.push(self.first_light_step(
+                ui,
+                1,
+                onboarding::StepState::Active,
+                copy::FL_STEP1_TITLE,
+                copy::FL_STEP1_HINT,
+                |s, ui| {
+                    ui.add_space(theme::space::S);
+                    s.create_form_row(ui);
+                    s.join_form_row(ui);
+                },
+            ));
+            marks.push(self.first_light_step(
+                ui,
+                2,
+                onboarding::StepState::Future,
+                copy::FL_STEP2_TITLE,
+                copy::FL_STEP2_HINT,
+                |_, _| {},
+            ));
+            marks.push(self.first_light_step(
+                ui,
+                3,
+                onboarding::StepState::Future,
+                copy::FL_STEP3_TITLE,
+                copy::FL_STEP3_HINT,
+                |_, _| {},
+            ));
+            // Threaded after the fact, between rects the layout actually
+            // produced, so the line cannot disagree with the numerals.
+            let p = ui.painter();
+            for pair in marks.windows(2) {
+                onboarding::thread(p, pair[0], pair[1]);
+            }
+        });
+    }
+
+    /// One step of first light: its numeral, its words, and whatever it asks
+    /// the reader to do. Returns the numeral's rect so the caller can thread
+    /// the steps together.
+    fn first_light_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        n: u8,
+        state: onboarding::StepState,
+        title: &str,
+        hint: &str,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) -> egui::Rect {
+        let future = matches!(state, onboarding::StepState::Future);
+        let mut mark = egui::Rect::NOTHING;
+        ui.horizontal_top(|ui| {
+            mark = onboarding::medallion(ui, n, state);
+            ui.add_space(theme::space::L);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(theme::font(theme::step::TITLE, theme::fam_semibold()))
+                        .color(if future {
+                            theme::ink_faint()
+                        } else {
+                            theme::ink()
+                        }),
+                );
+                ui.label(
+                    egui::RichText::new(hint)
+                        .font(theme::font(
+                            theme::step::BODY,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .color(theme::ink_muted()),
+                );
+                body(self, ui);
             });
         });
+        ui.add_space(theme::space::XL);
+        mark
     }
 
     /// The create-session input row (shared by Home and first light).
@@ -2809,7 +2688,8 @@ impl App {
             };
             e.cell(|ui| {
                 let h = theme::density().row_h() - theme::space::M;
-                health::sparkline(ui, &series, egui::vec2(120.0, h), trend_color);
+                let w = ui.available_width();
+                health::sparkline(ui, &series, egui::vec2(w, h), trend_color);
             });
 
             let up = telemetry::fmt_rate(m.rate_tx);
@@ -3866,59 +3746,61 @@ impl App {
         } else {
             register::Content::Entries(rows.len().min(AUDIT_MAX))
         };
-        let out = register::Register::new("audit", &cols).show(ui, content, |e| {
-            let Some(a) = rows.get(e.index()).copied() else {
-                return;
-            };
-            let when = fmt_ts(a.ts_ms);
-            e.cell(|ui| {
-                ui.label(
-                    egui::RichText::new(&when)
-                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
-                        .color(theme::ink_faint()),
-                );
-            });
-            let kind = a.kind.clone();
-            let color = audit_color(&kind);
-            e.cell(|ui| register::tag(ui, &kind, color));
-            let subject = a
-                .path
-                .clone()
-                .or_else(|| a.detail.clone())
-                .unwrap_or_default();
-            let detail = match (&a.path, &a.detail) {
-                (Some(_), Some(de)) => Some(de.clone()),
-                _ => None,
-            };
-            e.cell(|ui| {
-                ui.label(
-                    egui::RichText::new(&subject)
-                        .font(theme::font(
-                            theme::step::LABEL,
-                            egui::FontFamily::Proportional,
-                        ))
-                        .color(theme::ink()),
-                );
-                if let Some(de) = &detail {
+        let out = register::Register::new("audit", &cols)
+            .stacked_rows(&[theme::step::LABEL, theme::step::META])
+            .show(ui, content, |e| {
+                let Some(a) = rows.get(e.index()).copied() else {
+                    return;
+                };
+                let when = fmt_ts(a.ts_ms);
+                e.cell(|ui| {
                     ui.label(
-                        egui::RichText::new(de)
-                            .font(theme::font(
-                                theme::step::META,
-                                egui::FontFamily::Proportional,
-                            ))
+                        egui::RichText::new(&when)
+                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
                             .color(theme::ink_faint()),
                     );
-                }
+                });
+                let kind = a.kind.clone();
+                let color = audit_color(&kind);
+                e.cell(|ui| register::tag(ui, &kind, color));
+                let subject = a
+                    .path
+                    .clone()
+                    .or_else(|| a.detail.clone())
+                    .unwrap_or_default();
+                let detail = match (&a.path, &a.detail) {
+                    (Some(_), Some(de)) => Some(de.clone()),
+                    _ => None,
+                };
+                e.cell(|ui| {
+                    ui.label(
+                        egui::RichText::new(&subject)
+                            .font(theme::font(
+                                theme::step::LABEL,
+                                egui::FontFamily::Proportional,
+                            ))
+                            .color(theme::ink()),
+                    );
+                    if let Some(de) = &detail {
+                        ui.label(
+                            egui::RichText::new(de)
+                                .font(theme::font(
+                                    theme::step::META,
+                                    egui::FontFamily::Proportional,
+                                ))
+                                .color(theme::ink_faint()),
+                        );
+                    }
+                });
+                let peer = a.peer.as_deref().map(short).unwrap_or_default();
+                e.cell(|ui| {
+                    ui.label(
+                        egui::RichText::new(&peer)
+                            .font(theme::font(theme::step::DATA, theme::fam_mono()))
+                            .color(theme::ink_muted()),
+                    );
+                });
             });
-            let peer = a.peer.as_deref().map(short).unwrap_or_default();
-            e.cell(|ui| {
-                ui.label(
-                    egui::RichText::new(&peer)
-                        .font(theme::font(theme::step::DATA, theme::fam_mono()))
-                        .color(theme::ink_muted()),
-                );
-            });
-        });
         if out.retry {
             self.send(Cmd::Refresh);
         }

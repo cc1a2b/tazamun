@@ -27,27 +27,40 @@ pub enum StepState {
 
 /// A numbered step medallion: a khatam-ringed disc with the step number at its
 /// center. Allocates 34x34.
-pub fn medallion(ui: &mut egui::Ui, n: u8, state: StepState) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+pub fn medallion(ui: &mut egui::Ui, n: u8, state: StepState) -> egui::Rect {
+    let side = mark_side();
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
     // Named, not focusable: the step's own title and hint are real labels
     // beside it, so this rides with them rather than claiming a stop of its own.
     a11y::describe(&resp, &step_sentence(n, &state));
     if !rect.is_finite() {
-        return;
+        return rect;
     }
     let c = rect.center();
+    let r = side * 0.44;
     let p = ui.painter();
     match state {
         StepState::Active => {
-            p.circle_filled(c, 16.5, theme::wash::of(theme::gold(), theme::wash::TINT));
-            ornament::khatam(p, c, 15.0, theme::gold(), false);
+            p.circle_filled(
+                c,
+                side * 0.485,
+                theme::wash::of(theme::gold(), theme::wash::TINT),
+            );
+            ornament::khatam(p, c, r, theme::gold(), false);
             numeral(p, c, n, theme::ink());
         }
         StepState::Future => {
-            ornament::khatam(p, c, 15.0, theme::ink_faint(), false);
+            ornament::khatam(p, c, r, theme::ink_faint(), false);
             numeral(p, c, n, theme::ink_faint());
         }
     }
+    rect
+}
+
+/// The medallion's side, from the type it encloses rather than a constant: a
+/// numeral set at the display step needs room whatever the reader's text size.
+pub fn mark_side() -> f32 {
+    theme::sized(theme::step::DISPLAY) * 1.7
 }
 
 /// The sentence one medallion announces: its number, and whether it is the
@@ -61,30 +74,29 @@ fn step_sentence(n: u8, state: &StepState) -> String {
     format!("{STEP_LEAD} {n}, {standing}")
 }
 
-/// The vertical strapwork thread joining medallions: a short girih-flavored
-/// strand (a hairline thread carrying a small diamond at its midpoint) of the
-/// given height, centered in a 34px column so it aligns under the medallions.
-/// Pure ornament — it joins two medallions that each say what they are, so it
-/// stays silent rather than announcing a line.
-pub fn connector(ui: &mut egui::Ui, height: f32) {
-    if !height.is_finite() || height <= 0.0 {
+/// Threads one medallion to the next, down the gutter between them.
+///
+/// Takes both measured rects rather than a length: the old signature asked the
+/// caller how tall the content beside it was, and the caller could only guess.
+/// The guess was wrong, so step two and step three floated above their own
+/// numerals.
+pub fn thread(p: &egui::Painter, from: egui::Rect, to: egui::Rect) {
+    if !from.is_finite() || !to.is_finite() {
         return;
     }
-    let (rect, _) = ui.allocate_exact_size(vec2(34.0, height), Sense::hover());
-    if !rect.is_finite() {
+    let (top, bottom) = (from.bottom(), to.top());
+    if bottom - top < theme::space::S {
         return;
     }
-    let p = ui.painter();
-    // Pixel-centered so the hairline stays crisp; the diamond rides the line.
-    let x = theme::snap(rect.center().x);
+    let x = theme::snap(from.center().x);
     p.vline(
         x,
-        Rangef::new(rect.top(), rect.bottom()),
+        Rangef::new(top, bottom),
         Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 56)),
     );
     ornament::diamond(
         p,
-        pos2(x, rect.center().y),
+        pos2(x, (top + bottom) * 0.5),
         2.2,
         theme::alpha(theme::gold(), 102),
     );

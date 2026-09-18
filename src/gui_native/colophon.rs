@@ -12,14 +12,29 @@ use egui::{pos2, vec2};
 
 use super::{controls, ornament, theme};
 
+/// A khatam's radius as a fraction of the cell it is struck in — the one part
+/// of the mark that is a proportion rather than a measure, so it holds at every
+/// text scale.
+const SEAL_R: f32 = 0.375;
+
 /// The colophon body: the wordmark under a khatam, build identity,
 /// engine facts, type credits with their licenses, and the Golden Invariant
 /// as the closing line under a diamond rule. Width-filling; the caller owns
 /// the surrounding frame/overlay.
 pub fn colophon(ui: &mut egui::Ui, version: &str) {
     ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-        ornament::khatam(ui.painter(), rect.center(), 15.0, theme::gold(), false);
+        // The seal is set against the wordmark under it, so it is cut from the
+        // same step: a fixed 40px mark over type that doubles is a wordmark
+        // wearing a button.
+        let cell = theme::sized(theme::step::DISPLAY) * 2.0;
+        let (rect, _) = ui.allocate_exact_size(vec2(cell, cell), Sense::hover());
+        ornament::khatam(
+            ui.painter(),
+            rect.center(),
+            cell * SEAL_R,
+            theme::gold(),
+            false,
+        );
         ui.add_space(theme::space::XS);
         super::chrome::wordmark(ui, theme::sized(theme::step::DISPLAY));
     });
@@ -72,8 +87,15 @@ pub fn colophon(ui: &mut egui::Ui, version: &str) {
 
     // Closing seal: a small filled khatam over the Golden Invariant promise.
     ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-        ornament::khatam(ui.painter(), rect.center(), 6.0, theme::gold(), true);
+        let cell = theme::sized(theme::step::TITLE);
+        let (rect, _) = ui.allocate_exact_size(vec2(cell, cell), Sense::hover());
+        ornament::khatam(
+            ui.painter(),
+            rect.center(),
+            cell * SEAL_R,
+            theme::gold(),
+            true,
+        );
     });
     ui.add_space(theme::space::S);
     centered_text(

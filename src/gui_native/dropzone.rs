@@ -63,8 +63,8 @@ pub fn overlay_if_hovering(ui: &egui::Ui) {
         theme::ink_muted(),
     );
     let (t_sz, h_sz) = (title.size(), hint.size());
-    let line_gap = 5.0;
-    let pad = egui::vec2(18.0, 14.0);
+    let line_gap = theme::space::S;
+    let pad = egui::vec2(theme::space::XL, theme::space::L);
     let inner = egui::vec2(t_sz.x.max(h_sz.x), t_sz.y + line_gap + h_sz.y);
     let card = Rect::from_center_size(screen.center(), inner + pad * 2.0);
     p.rect_filled(

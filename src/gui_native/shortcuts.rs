@@ -9,7 +9,7 @@ use eframe::egui;
 use egui::{FontFamily, RichText, Sense};
 use egui::{pos2, vec2};
 
-use super::{ceremony, ornament, theme};
+use super::{ceremony, ornament, register, theme};
 
 /// One binding: the keys as they should appear on caps, what it does, and the
 /// action the window takes when it fires.
@@ -286,8 +286,12 @@ fn binding_row(ui: &mut egui::Ui, binding: &Binding) {
         for key in binding.keys {
             ceremony::keycap(ui, key);
         }
+        // The meaning's own line box, the same measure `controls::leader_row`
+        // rules its line at. A fixed 16 held the caps and clipped the words
+        // beside them the moment the text scale moved.
+        let h = register::line_h(theme::step::LABEL);
         let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width().max(0.0), 16.0), Sense::hover());
+            ui.allocate_exact_size(vec2(ui.available_width().max(0.0), h), Sense::hover());
         if rect.width() <= 0.0 {
             return;
         }
@@ -298,15 +302,17 @@ fn binding_row(ui: &mut egui::Ui, binding: &Binding) {
             theme::ink_muted(),
         );
         let size = galley.size();
-        let dots_from = rect.left() + 8.0;
-        let dots_to = rect.right() - size.x - 8.0;
+        let dots_from = rect.left() + theme::space::M;
+        let dots_to = rect.right() - size.x - theme::space::M;
         // Leaders only when a real gap remains; a long meaning just clips.
-        if dots_to - dots_from >= 12.0 {
-            let y = rect.bottom() - 4.0;
-            let count = (((dots_to - dots_from) / 4.0).floor() as usize + 1).min(2048);
+        if dots_to - dots_from >= theme::space::L {
+            // The meaning's own metrics, so the dots sit on its baseline at
+            // every text scale rather than on the row's foot.
+            let y = rect.center().y + size.y * 0.3;
+            let count = (((dots_to - dots_from) / theme::space::S).floor() as usize + 1).min(2048);
             for k in 0..count {
                 p.circle_filled(
-                    pos2(dots_from + k as f32 * 4.0, y),
+                    pos2(dots_from + k as f32 * theme::space::S, y),
                     0.7,
                     theme::alpha(theme::ink_faint(), 102),
                 );

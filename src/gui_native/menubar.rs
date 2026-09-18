@@ -1,11 +1,22 @@
-//! The menu bar: the register's own head, ruled across the title bar.
+//! The menu bar: the register's own head-band, ruled across the title bar.
 //!
-//! This window is a deed book, so the bar at the top of it is the ruler over
-//! the page rather than a strip of File/Edit/View. The heads are lowercase and
-//! tracked, exactly as [`super::register::Col`] sets a column heading; a
-//! hairline rules the gap between them the way a ledger rules its columns; and
-//! each one drops a short ruled page of verbs under it, sectioned by the same
-//! tracked heads and ruled by the same hairlines as the registers below.
+//! This window is a deed book, so the bar at the top of it is the head-band
+//! over the page rather than a strip of File/Edit/View. Each head is a *ruled
+//! compartment*: the lowercase tracked word of [`super::register::Col`] with a
+//! rule capping it and a rule under its foot, and the house diamond pivoting
+//! between two hairline stubs in the gap to the next one. Reaching a head
+//! closes those two rules on the word from opposite ends, the way a scribe
+//! rules a compartment before writing in it; opening one widens them to the
+//! whole compartment in gold, so the head reads as the mouth the page dropped
+//! out of.
+//!
+//! What drops out is a *leaf*: the engraved title with the head rule running
+//! through the line to a folio numeral at its outer end, a ruled gutter down
+//! the spine of each block of entries, the choice in force marked by a swell in
+//! that gutter rather than by a bar at the page edge, and a cusp of
+//! [`super::ornament::corner_flourish`] at each end of the spine — the same
+//! illumination [`super::ceremony::adorn_dialog`] puts on a dialog, because a
+//! menu here is the same kind of floating leaf and not a control.
 //!
 //! What it holds is what was buried. The session lifecycle was three buttons on
 //! one tab; the operations the CLI has always had — doctor, dashboard, gc,
@@ -22,10 +33,10 @@
 //! nothing else; what an action *means* stays in `gui_native.rs`.
 
 use eframe::egui;
-use egui::{Id, Key, Modifiers, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Id, Key, Modifiers, Rangef, Rect, Sense, Stroke, pos2, vec2};
 
 use super::model::UpdateState;
-use super::{a11y, chrome, copy, figures, focusnav, ornament, register, shortcuts, theme};
+use super::{a11y, chrome, copy, figures, focusnav, ornament, shortcuts, theme};
 
 // ─── what the bar can ask the window for ─────────────────────────────────────
 
@@ -132,6 +143,14 @@ pub struct SessionState<'a> {
 }
 
 // ─── the heads ───────────────────────────────────────────────────────────────
+
+/// The leaf the capture hook was told to open, if any.
+fn shot_menu() -> Option<String> {
+    std::env::var("TAZAMUN_GUI_SHOT_MENU")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
 
 /// The heads, in the order they are ruled across the bar.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -704,21 +723,39 @@ fn step_focus(ids: &[Id], focused: Option<Id>, step: isize) -> Option<Id> {
 
 // ─── painting ────────────────────────────────────────────────────────────────
 
-/// The gutter either side of a head's word.
-const HEAD_PAD_X: f32 = theme::space::L;
+/// The gutter either side of a head's word. Measured off the type rather than
+/// fixed, so a compartment keeps its proportion to the word in it when the
+/// reader enlarges the text — a literal that fit at 100% squeezed the word at
+/// 220%.
+fn head_pad_x() -> f32 {
+    theme::sized(theme::step::META)
+}
 /// The head strip's own height inside the title bar, leaving the girih band at
 /// the bar's foot clear.
 fn strip_h() -> f32 {
     theme::sized(theme::step::META) + theme::space::L * 2.0
 }
-/// The diamond that marks a head or a chosen row, sized off the type so it
-/// keeps its proportion at every text scale.
+/// The diamond that marks a head, pivots a separator, or stands for a choice in
+/// force — one mark size for the whole module, sized off the type so it keeps
+/// its proportion at every text scale.
 fn mark_r() -> f32 {
     theme::sized(theme::step::CAPTION) * 0.26
 }
-/// The margin a menu row keeps at its leading edge for the choice mark — the
-/// register's folio gutter, in a narrower page.
-const ROW_GUTTER: f32 = theme::space::XL;
+/// The mark margin of a leaf: the column left of the gutter rule that the
+/// choice diamond and the null mark sit in, and nothing else.
+fn margin_w() -> f32 {
+    theme::sized(theme::step::LABEL)
+}
+/// Where an entry's text begins — past the mark margin and the rule that closes
+/// it.
+fn row_gutter() -> f32 {
+    margin_w() + theme::space::M
+}
+/// The narrowest a leaf may be ruled. A page has a measure: a two-word menu
+/// that came out as wide as its longest word would read as a tooltip.
+fn min_page_w() -> f32 {
+    theme::sized(theme::step::LABEL) * 16.0
+}
 
 /// What was clicked: one of the heads, or the head holding the folded ones.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -804,6 +841,7 @@ pub fn bar(ui: &mut egui::Ui, state: &BarState<'_>) -> Option<MenuAction> {
     }
 
     let mut nav = read_nav(ui);
+    let bar_rect = ui.max_rect();
     let mut heads: Vec<(Trigger, egui::Response)> = Vec::new();
     for (i, menu) in layout.shown.iter().enumerate() {
         let width = widths
@@ -813,13 +851,23 @@ pub fn bar(ui: &mut egui::Ui, state: &BarState<'_>) -> Option<MenuAction> {
             .unwrap_or_default();
         let resp = draw_head(
             ui,
-            Trigger::Menu(*menu),
-            width,
-            height,
-            i > 0,
-            mark_of(*menu, mark),
-            i == 0,
+            &Head {
+                trigger: Trigger::Menu(*menu),
+                width,
+                height,
+                gap_before: (i > 0).then_some(gap),
+                mark: mark_of(*menu, mark),
+                hint: i == 0,
+                bar: bar_rect,
+            },
         );
+        // The capture hook opens a named leaf, so a docs shot can show a menu
+        // as the reader meets it. Same contract as the tab and palette
+        // overrides: it pins what is on screen so a capture does not depend on
+        // whatever the last run left behind.
+        if shot_menu().is_some_and(|w| menu.head().eq_ignore_ascii_case(&w)) {
+            egui::Popup::open_id(ui.ctx(), popup_id(&resp));
+        }
         heads.push((Trigger::Menu(*menu), resp));
     }
     if !layout.folded.is_empty() {
@@ -829,12 +877,15 @@ pub fn bar(ui: &mut egui::Ui, state: &BarState<'_>) -> Option<MenuAction> {
         let first = heads.is_empty();
         let resp = draw_head(
             ui,
-            Trigger::More,
-            more_w,
-            height,
-            !first,
-            folded_mark,
-            first,
+            &Head {
+                trigger: Trigger::More,
+                width: more_w,
+                height,
+                gap_before: (!first).then_some(gap),
+                mark: folded_mark,
+                hint: first,
+                bar: bar_rect,
+            },
         );
         heads.push((Trigger::More, resp));
     }
@@ -916,20 +967,35 @@ fn popup_id(resp: &egui::Response) -> Id {
     egui::Popup::default_response_id(resp)
 }
 
-/// The rows behind one head. The `more` head carries every folded menu on one
-/// page, each under its own serif title.
+/// The rows behind one head, as a leaf: its engraved title first, then its
+/// sections. The `more` head carries every folded menu on one leaf, each under
+/// its own title and folio.
+///
+/// A leaf is titled even when the head above it carries the same word, because
+/// a page that is scrolled, or reached by the keyboard from another head, has
+/// nothing else on it that says which register it belongs to.
 fn content_of(trigger: Trigger, folded: &[Menu], state: &BarState<'_>, now: f64) -> Vec<Row> {
+    let leaf = |m: &Menu| {
+        let mut page = vec![Row::Title(m.title())];
+        page.extend(rows(*m, state, now));
+        page
+    };
     match trigger {
-        Trigger::Menu(m) => rows(m, state, now),
-        Trigger::More => folded
-            .iter()
-            .flat_map(|m| {
-                let mut page = vec![Row::Title(m.title())];
-                page.extend(rows(*m, state, now));
-                page
-            })
-            .collect(),
+        Trigger::Menu(m) => leaf(&m),
+        Trigger::More => folded.iter().flat_map(leaf).collect(),
     }
+}
+
+/// The folio numeral a leaf carries at the outer end of its head rule: the
+/// menu's place in the bar's reading order, set the way a deed book numbers its
+/// leaves.
+///
+/// Read back from the title rather than carried on [`Row::Title`], so the one
+/// leaf assembled out of several menus — `more` — numbers each of its sections
+/// without the row type having to know it is on one.
+fn folio_of(title: &str) -> Option<&'static str> {
+    let at = Menu::ALL.iter().position(|m| m.title() == title)?;
+    copy::MENUBAR_FOLIO.get(at).copied()
 }
 
 /// F10 opens the bar and closes it again; the horizontal arrows walk from one
@@ -1047,19 +1113,93 @@ fn step_items(ui: &egui::Ui, ids: &[Id]) {
     }
 }
 
-/// One head: the tracked lowercase word, the hairline ruling it off from its
-/// neighbour, and the gold rule that sweeps under it as it is reached.
-fn draw_head(
-    ui: &mut egui::Ui,
+/// Everything one head needs of the bar, bundled: a head is decided by six
+/// independent facts, and a positional argument list that long is a transposed
+/// pair waiting to happen.
+struct Head {
     trigger: Trigger,
     width: f32,
     height: f32,
-    rule_before: bool,
+    /// The layout gap before this head, or `None` for the leading one — the
+    /// separator is ruled in that gap, and the leading head has no gap to rule.
+    gap_before: Option<f32>,
+    /// What this head has to report on its own face.
     mark: Option<Tone>,
-    first: bool,
-) -> egui::Response {
-    let id = ui.id().with(("tzm-menubar", trigger.key()));
-    let (_, rect) = ui.allocate_space(vec2(width, height));
+    /// Whether this head also speaks the key that opens the bar.
+    hint: bool,
+    /// The whole title bar the strip was laid into — where an open head looks
+    /// for the girih band it cuts its doorway through.
+    bar: Rect,
+}
+
+/// Where a head's two compartment rules sit: the cap over the word and the foot
+/// under it, both snapped to the pixel grid.
+///
+/// `None` when the strip is too short to carry them. The title bar's height is
+/// fixed while the type is not, so at a large text scale the strip is squeezed
+/// around the word — and a rule ruled through the word is worse than no rule.
+fn compartment_rules(strip: Rect, text: Rect) -> Option<(f32, f32)> {
+    let cap = theme::snap(text.top() - theme::space::S);
+    let foot = theme::snap(text.bottom() + theme::space::S);
+    (cap > strip.top() && foot < strip.bottom() && cap < foot).then_some((cap, foot))
+}
+
+/// The two hairline stubs of a head separator: one from the strip's top down to
+/// the diamond that pivots it, one from that diamond down to the strip's foot.
+///
+/// `None` when the diamond fills the gap on its own — a stub shorter than the
+/// space step reads as a speck beside it, not as a rule.
+fn separator_stubs(strip: Rangef, r: f32) -> Option<(Rangef, Rangef)> {
+    let clear = r + theme::space::S;
+    let top = Rangef::new(strip.min + theme::space::S, strip.center() - clear);
+    let foot = Rangef::new(strip.center() + clear, strip.max - theme::space::S);
+    (top.span() >= theme::space::S && foot.span() >= theme::space::S).then_some((top, foot))
+}
+
+/// The doorway an open head cuts through the girih band at the bar's foot: the
+/// strip of band left below the head's own compartment, taken down to the seam.
+///
+/// This is what stops the head-band and the brand band reading as two strips of
+/// chrome stacked on one another — an open head interrupts the strapwork and
+/// its raised ground runs unbroken from the word down to the seam the page
+/// hangs off.
+///
+/// `None` when the band is not in fact under this head. The title bar is laid
+/// out by the window, not by this module, so the band is found rather than
+/// assumed: a block of ground painted over a rect that turned out to be
+/// somewhere else would be a hole punched in the chrome.
+fn open_notch(strip: Rect, bar: Rect) -> Option<Rect> {
+    let band = chrome::band_rect(bar);
+    let reaches =
+        band.is_positive() && band.top() <= strip.bottom() && band.bottom() > strip.bottom();
+    reaches.then(|| {
+        Rect::from_min_max(
+            pos2(strip.left(), strip.bottom()),
+            pos2(strip.right(), band.bottom()),
+        )
+    })
+}
+
+/// The division between two compartments: the house diamond pivoting between
+/// two hairline stubs, ruled in the gap the layout left so the gap still drags
+/// the window.
+fn separator(p: &egui::Painter, x: f32, strip: Rangef) {
+    let x = theme::snap(x);
+    let r = mark_r();
+    if let Some((top, foot)) = separator_stubs(strip, r) {
+        let hair = Stroke::new(theme::RULE_W, theme::rule_divider());
+        p.vline(x, top, hair);
+        p.vline(x, foot, hair);
+    }
+    ornament::diamond(p, pos2(x, strip.center()), r, theme::gold_deep());
+}
+
+/// One compartment of the head-band: the tracked lowercase word between the two
+/// rules that make it furniture rather than a link, the division to its
+/// neighbour, and whatever the head has to report.
+fn draw_head(ui: &mut egui::Ui, head: &Head) -> egui::Response {
+    let id = ui.id().with(("tzm-menubar", head.trigger.key()));
+    let (_, rect) = ui.allocate_space(vec2(head.width, head.height));
     // Click *and* drag: the title bar behind this is a drag surface, and a
     // head that sensed clicks alone would hand every press to it and never
     // open. Drags are simply ignored here, which is what stops the window
@@ -1071,14 +1211,14 @@ fn draw_head(
     let hovered = resp.hovered();
     let focused = resp.has_focus();
 
-    let spoken = if first {
+    let spoken = if head.hint {
         format!(
             "{}, {}",
-            copy::menu_spoken(trigger.label()),
+            copy::menu_spoken(head.trigger.label()),
             copy::MENUBAR_KEY_HINT
         )
     } else {
-        copy::menu_spoken(trigger.label())
+        copy::menu_spoken(head.trigger.label())
     };
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, &spoken));
     if hovered {
@@ -1095,44 +1235,67 @@ fn draw_head(
     } else {
         theme::ink_muted()
     };
-    let galley = head_galley(ui, trigger.label(), color);
+    let galley = head_galley(ui, head.trigger.label(), color);
     let text_at = pos2(
-        rect.left() + HEAD_PAD_X,
+        rect.left() + head_pad_x(),
         rect.center().y - galley.size().y * 0.5,
     );
     let text_rect = Rect::from_min_size(text_at, galley.size());
 
+    let notch = if open {
+        open_notch(rect, head.bar)
+    } else {
+        None
+    };
     let p = ui.painter();
     if open {
         p.rect_filled(rect, theme::R_NONE, theme::bg_raise());
+        if let Some(notch) = notch {
+            p.rect_filled(notch, theme::R_NONE, theme::bg_raise());
+        }
     }
-    if rule_before {
-        // The ledger's column ruling, drawn in the gap the layout left.
-        let x = theme::snap(rect.left() - HEAD_PAD_X * 0.5);
-        p.vline(
-            x,
-            egui::Rangef::new(
-                rect.top() + theme::space::S,
-                rect.bottom() - theme::space::S,
-            ),
-            Stroke::new(theme::RULE_W, theme::rule_hair()),
-        );
+    if let Some(gap) = head.gap_before {
+        separator(p, rect.left() - gap * 0.5, rect.y_range());
+    }
+    if let Some((cap_y, foot_y)) = compartment_rules(rect, text_rect) {
+        let word = text_rect.x_range();
+        let hair = Stroke::new(theme::RULE_W, theme::rule_divider());
+        p.hline(word, cap_y, hair);
+        p.hline(word, foot_y, hair);
+        if open {
+            // The page hangs from the whole compartment, so the rules widen to
+            // it: a lintel over the word, and a sill at the foot of whatever
+            // ground the head opened — the doorway's own sill when the band
+            // gave way to it, the compartment's foot when it did not.
+            p.hline(
+                rect.x_range(),
+                cap_y,
+                Stroke::new(theme::RULE_W, theme::gold_deep()),
+            );
+            let sill = notch.map_or(foot_y, |n| theme::snap(n.bottom()));
+            p.hline(
+                rect.x_range(),
+                sill,
+                Stroke::new(theme::RULE_ACCENT_W, theme::gold()),
+            );
+        } else if reached > 0.0 {
+            // Reaching a head closes its two rules on the word from opposite
+            // ends — the gesture of ruling a compartment before writing in it.
+            // Under reduced motion `dur` is zero, so both arrive whole.
+            let span = word.span() * reached;
+            let ink = Stroke::new(theme::RULE_W, theme::gold_deep());
+            p.hline(Rangef::new(word.min, word.min + span), foot_y, ink);
+            p.hline(Rangef::new(word.max - span, word.max), cap_y, ink);
+        }
+        if let Some(tone) = head.mark {
+            // What a head has to report outranks its resting ink: the cap
+            // carries it at the accent weight, so the bar says it without being
+            // opened and without a coloured word to read past.
+            p.hline(word, cap_y, Stroke::new(theme::RULE_ACCENT_W, tone.color()));
+        }
     }
     p.galley(text_at, galley, color);
-    if reached > 0.0 {
-        let (weight, ink) = if open {
-            (theme::RULE_ACCENT_W, theme::gold())
-        } else {
-            (theme::RULE_W, theme::gold_deep())
-        };
-        let span = text_rect.width() * reached;
-        p.hline(
-            egui::Rangef::new(text_rect.left(), text_rect.left() + span),
-            theme::snap(text_rect.bottom() + theme::space::XS),
-            Stroke::new(weight, ink),
-        );
-    }
-    if let Some(tone) = mark {
+    if let Some(tone) = head.mark {
         let r = mark_r();
         ornament::diamond(
             p,
@@ -1169,7 +1332,7 @@ fn head_width(ui: &egui::Ui, label: &str, marked: bool) -> f32 {
     } else {
         0.0
     };
-    text + HEAD_PAD_X * 2.0 + mark
+    text + head_pad_x() * 2.0 + mark
 }
 
 /// What one menu answered with this frame.
@@ -1181,8 +1344,82 @@ struct MenuOut {
     open: bool,
 }
 
-/// The page under a head: a ruled list on the one surface this design lets
-/// float.
+/// The leaf itself: the chrome ground, a ruled edge, and the one shadow this
+/// design allows. Tighter at the sides than [`super::register::overlay`]
+/// because the entries on it rule themselves edge to edge.
+fn page_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::bg_chrome())
+        .stroke(Stroke::new(theme::RULE_W, theme::rule_emphasis()))
+        .corner_radius(theme::R_OVERLAY)
+        .inner_margin(egui::Margin::same(theme::space::M as i8))
+        .shadow(theme::elevation::overlay())
+}
+
+/// The leaf's illumination: a cusp at each end of its spine, in the gesture
+/// [`super::ceremony::adorn_dialog`] already puts on a dialog. Sized off the
+/// type and set in from the corner radius, so it stays inside the rounded
+/// corner and clear of the title beside it at every text scale.
+fn adorn_page(p: &egui::Painter, rect: Rect) {
+    if !rect.is_finite() || !rect.is_positive() {
+        return;
+    }
+    let inset = f32::from(theme::R_OVERLAY);
+    let size = theme::sized(theme::step::LABEL);
+    ornament::corner_flourish(
+        p,
+        rect.left_top() + vec2(inset, inset),
+        vec2(1.0, 1.0),
+        size,
+        theme::gold(),
+    );
+    ornament::corner_flourish(
+        p,
+        rect.left_bottom() + vec2(inset, -inset),
+        vec2(1.0, -1.0),
+        size,
+        theme::gold(),
+    );
+}
+
+/// The gutter rule, accumulated as the leaf is laid out.
+///
+/// Ruled per block rather than down the whole leaf: a section head is
+/// out-dented into the margin, and one rule running the full height would
+/// strike every head on the page through.
+#[derive(Default)]
+struct Gutter {
+    open: Option<(f32, Rangef)>,
+    runs: Vec<(f32, Rangef)>,
+}
+
+impl Gutter {
+    /// Extends the run in hand over one more entry.
+    fn entry(&mut self, rect: Rect) {
+        self.open = Some(match self.open.take() {
+            Some((x, span)) => (
+                x,
+                Rangef::new(span.min.min(rect.top()), span.max.max(rect.bottom())),
+            ),
+            None => (rect.left() + margin_w(), rect.y_range()),
+        });
+    }
+
+    /// Closes the run in hand — a head, a title, or the foot of the leaf.
+    fn brk(&mut self) {
+        if let Some(run) = self.open.take() {
+            self.runs.push(run);
+        }
+    }
+
+    fn finish(mut self) -> Vec<(f32, Rangef)> {
+        self.brk();
+        self.runs
+    }
+}
+
+/// The leaf under a head: a titled, ruled page on the one surface this design
+/// lets float.
 fn show_menu(
     ui: &egui::Ui,
     trigger: &egui::Response,
@@ -1191,7 +1428,7 @@ fn show_menu(
     width: f32,
 ) -> MenuOut {
     let mut out = MenuOut::default();
-    let mut popup = egui::Popup::menu(trigger).width(width);
+    let mut popup = egui::Popup::menu(trigger).width(width).frame(page_frame());
     if settings {
         // A page of settings stays put while it is being used: a reader
         // comparing two palettes should not have to re-open the menu between
@@ -1207,13 +1444,21 @@ fn show_menu(
             .max_height(max_h)
             .auto_shrink([false, true])
             .show(ui, |ui| {
+                let mut gutter = Gutter::default();
                 for row in content {
                     match row {
-                        Row::Title(title) => register::heading(ui, title),
-                        Row::Head { title, value } => section_row(ui, title, value.as_deref()),
-                        Row::Note { text, tone } => note_row(ui, text, *tone),
+                        Row::Title(title) => {
+                            gutter.brk();
+                            page_head(ui, title);
+                        }
+                        Row::Head { title, value } => {
+                            gutter.brk();
+                            section_row(ui, title, value.as_deref());
+                        }
+                        Row::Note { text, tone } => gutter.entry(note_row(ui, text, *tone)),
                         Row::Item(item) => {
                             let resp = item_row(ui, item);
+                            gutter.entry(resp.rect);
                             if resp.enabled() {
                                 out.ids.push(resp.id);
                             }
@@ -1229,14 +1474,94 @@ fn show_menu(
                         }
                     }
                 }
+                // Last, so the ruling sits over the washes the rows painted
+                // rather than under them — a ledger is ruled before it is
+                // written in, and the rule stays visible where it is.
+                let hair = Stroke::new(theme::RULE_W, theme::rule_hair());
+                for (x, span) in gutter.finish() {
+                    ui.painter().vline(theme::snap(x), span, hair);
+                }
             });
     });
+    if let Some(shown) = &shown {
+        adorn_page(
+            &ui.ctx().layer_painter(shown.response.layer_id),
+            shown.response.rect,
+        );
+    }
     out.open = shown.is_some();
     out
 }
 
-/// A section head inside a menu: the register's ruler, one column wide, with
-/// its value on the right when it has one.
+/// The head of a leaf: the engraved title, the rule that carries it across the
+/// page, and the folio at the outer end of that rule.
+///
+/// Silent to assistive technology, and deliberately: the head that opened this
+/// leaf is a button that already announces the same word, and a painted title
+/// repeating it would make every menu say its own name twice.
+fn page_head(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(theme::space::S);
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(
+        title.to_owned(),
+        theme::font(theme::step::TITLE, theme::fam_serif()),
+        theme::ink(),
+    );
+    let folio = folio_of(title).map(|f| {
+        p.layout_no_wrap(
+            f.to_owned(),
+            theme::font(theme::step::LABEL, theme::fam_serif()),
+            theme::gold(),
+        )
+    });
+    let h = galley
+        .size()
+        .y
+        .max(folio.as_ref().map_or(0.0, |g| g.size().y));
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), h + theme::space::S),
+        Sense::hover(),
+    );
+    if !rect.is_positive() {
+        return;
+    }
+    let p = ui.painter();
+    // On the text column, with the entries it heads — which also keeps it clear
+    // of the cusp `adorn_page` sets in the corner beside it.
+    let title_left = rect.left() + row_gutter();
+    let title_right = title_left + galley.size().x;
+    p.galley(
+        pos2(title_left, rect.center().y - galley.size().y * 0.5),
+        galley,
+        theme::ink(),
+    );
+    let edge = rect.right() - theme::space::M;
+    let folio_left = folio.as_ref().map_or(edge, |g| edge - g.size().x);
+    // The rule runs *through* the line between the two marks rather than under
+    // it, the way a ledger's head rule does, so the title and the folio read as
+    // the two ends of one gesture instead of a label over a separator. With no
+    // folio to stop it, it runs the full measure of the page.
+    let from = title_right + theme::space::M;
+    let to = folio
+        .as_ref()
+        .map_or(edge, |_| folio_left - theme::space::M);
+    if to > from {
+        p.hline(
+            Rangef::new(from, to),
+            theme::snap(rect.center().y),
+            Stroke::new(theme::RULE_W, theme::rule_emphasis()),
+        );
+    }
+    if let Some(g) = folio {
+        let at = pos2(folio_left, rect.center().y - g.size().y * 0.5);
+        p.galley(at, g, theme::gold());
+    }
+    ui.add_space(theme::space::XS);
+}
+
+/// A section head inside a leaf: the tracked word out-dented into the margin,
+/// the rule carrying it across the page, and its value at the far end when it
+/// has one.
 fn section_row(ui: &mut egui::Ui, title: &str, value: Option<&str>) {
     ui.add_space(theme::space::M);
     let h = theme::sized(theme::step::META) + theme::space::S;
@@ -1245,31 +1570,43 @@ fn section_row(ui: &mut egui::Ui, title: &str, value: Option<&str>) {
         return;
     }
     let galley = head_galley(ui, title, theme::ink_faint());
+    let value = value.map(|v| {
+        ui.painter().layout_no_wrap(
+            v.to_owned(),
+            theme::font(theme::step::DATA, theme::fam_mono()),
+            theme::ink_muted(),
+        )
+    });
     let p = ui.painter();
+    let word_right = rect.left() + galley.size().x;
     p.galley(
         pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
         galley,
         theme::ink_faint(),
     );
-    if let Some(value) = value {
-        p.text(
-            pos2(rect.right(), rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            value,
-            theme::font(theme::step::DATA, theme::fam_mono()),
-            theme::ink_muted(),
+    let edge = rect.right() - theme::space::M;
+    let value_left = value.as_ref().map_or(edge, |g| edge - g.size().x);
+    let from = word_right + theme::space::M;
+    let to = value
+        .as_ref()
+        .map_or(edge, |_| value_left - theme::space::M);
+    if to > from {
+        p.hline(
+            Rangef::new(from, to),
+            theme::snap(rect.center().y),
+            Stroke::new(theme::RULE_W, theme::rule_hair()),
         );
     }
-    p.hline(
-        rect.x_range(),
-        theme::snap(rect.bottom()),
-        Stroke::new(theme::RULE_W, theme::rule_divider()),
-    );
+    if let Some(g) = value {
+        let at = pos2(value_left, rect.center().y - g.size().y * 0.5);
+        p.galley(at, g, theme::ink_muted());
+    }
 }
 
 /// A line that only reports — the update status, and nothing else so far.
-fn note_row(ui: &mut egui::Ui, text: &str, tone: Tone) {
-    let width = (ui.available_width() - ROW_GUTTER).max(0.0);
+/// Returns the space it took, so the gutter can be ruled beside it.
+fn note_row(ui: &mut egui::Ui, text: &str, tone: Tone) -> Rect {
+    let width = (ui.available_width() - row_gutter()).max(0.0);
     let galley = ui.painter().layout(
         text.to_owned(),
         theme::font(theme::step::META, egui::FontFamily::Proportional),
@@ -1281,12 +1618,16 @@ fn note_row(ui: &mut egui::Ui, text: &str, tone: Tone) {
         Sense::hover(),
     );
     a11y::describe(&resp, text);
-    let at = pos2(rect.left() + ROW_GUTTER, rect.top() + theme::space::S * 0.5);
+    let at = pos2(
+        rect.left() + row_gutter(),
+        rect.top() + theme::space::S * 0.5,
+    );
     ui.painter().galley(at, galley, tone.color());
+    rect
 }
 
-/// One verb: the label, its chord in the right column, a hairline under it, and
-/// the house diamond in the gutter when it is the choice in force.
+/// One entry of the leaf: the verb, its chord in the right column, the hairline
+/// ruling it off from the next, and the mark it earns in the margin.
 fn item_row(ui: &mut egui::Ui, item: &Item) -> egui::Response {
     let enabled = item.enabled();
     let resp = ui.add_enabled_ui(enabled, |ui| item_body(ui, item)).inner;
@@ -1324,11 +1665,6 @@ fn item_body(ui: &mut egui::Ui, item: &Item) -> egui::Response {
             theme::R_NONE,
             theme::wash::of(theme::gold(), theme::wash::SELECT),
         );
-        p.rect_filled(
-            Rect::from_min_size(rect.min, vec2(theme::RULE_ACCENT_W, rect.height())),
-            theme::R_NONE,
-            theme::gold(),
-        );
     } else if hovered || focused {
         p.rect_filled(rect, theme::R_NONE, theme::bg_raise());
     }
@@ -1341,7 +1677,7 @@ fn item_body(ui: &mut egui::Ui, item: &Item) -> egui::Response {
         theme::ink_muted()
     };
     p.text(
-        pos2(rect.left() + ROW_GUTTER, rect.center().y),
+        pos2(rect.left() + row_gutter(), rect.center().y),
         egui::Align2::LEFT_CENTER,
         &item.label,
         theme::font(theme::step::LABEL, theme::fam_medium()),
@@ -1360,37 +1696,75 @@ fn item_body(ui: &mut egui::Ui, item: &Item) -> egui::Response {
             },
         );
     }
+    // The margin says at a glance what the row is worth reaching for: the gold
+    // diamond against the choice in force, the scribe's null mark against a
+    // verb that is refused. The gutter rule swells behind the choice rather
+    // than a second bar appearing at the page edge, because there is one column
+    // rule on this page and a selection belongs on it.
     if item.marked() {
+        p.vline(
+            theme::snap(rect.left() + margin_w()),
+            rect.y_range(),
+            Stroke::new(theme::RULE_ACCENT_W, theme::gold()),
+        );
+    }
+    if item.marked() || !enabled {
+        let ink = if enabled {
+            theme::gold()
+        } else {
+            theme::ink_disabled()
+        };
         ornament::diamond(
             p,
-            pos2(rect.left() + ROW_GUTTER * 0.5, rect.center().y),
+            pos2(rect.left() + margin_w() * 0.5, rect.center().y),
             mark_r(),
-            theme::gold(),
+            ink,
         );
     }
     p.hline(
         rect.x_range(),
         theme::snap(rect.bottom()),
-        Stroke::new(theme::RULE_W, theme::rule_hair()),
+        Stroke::new(
+            theme::RULE_W,
+            if hovered || focused {
+                theme::gold_deep()
+            } else {
+                theme::rule_hair()
+            },
+        ),
     );
     focusnav::ring(ui, &resp);
     resp
 }
 
-/// How wide a menu has to be to hold its longest line without eliding it.
+/// How wide a leaf has to be ruled to hold its longest line without eliding it,
+/// and never narrower than a page's measure.
 fn content_width(ui: &egui::Ui, content: &[Row]) -> f32 {
     let p = ui.painter();
-    let mut widest: f32 = 0.0;
+    let mut widest: f32 = min_page_w();
     for row in content {
         let w = match row {
             Row::Title(title) => {
-                p.layout_no_wrap(
-                    (*title).to_owned(),
-                    theme::font(theme::step::TITLE, theme::fam_serif()),
-                    theme::ink(),
-                )
-                .size()
-                .x
+                let head = p
+                    .layout_no_wrap(
+                        (*title).to_owned(),
+                        theme::font(theme::step::TITLE, theme::fam_serif()),
+                        theme::ink(),
+                    )
+                    .size()
+                    .x;
+                let folio = folio_of(title)
+                    .map(|f| {
+                        p.layout_no_wrap(
+                            f.to_owned(),
+                            theme::font(theme::step::LABEL, theme::fam_serif()),
+                            theme::gold(),
+                        )
+                        .size()
+                        .x + theme::space::XXL
+                    })
+                    .unwrap_or_default();
+                row_gutter() + head + folio
             }
             Row::Head { title, value } => {
                 let head = head_galley(ui, title, theme::ink_faint()).size().x;
@@ -1432,7 +1806,7 @@ fn content_width(ui: &egui::Ui, content: &[Row]) -> f32 {
                         .x + theme::space::XXL
                     })
                     .unwrap_or_default();
-                ROW_GUTTER + label + chord
+                row_gutter() + label + chord
             }
         };
         widest = widest.max(w);
@@ -2047,5 +2421,167 @@ mod tests {
             assert_eq!(menu.head(), menu.head().to_lowercase());
             assert!(menu.title().starts_with(|c: char| c.is_uppercase()));
         }
+    }
+
+    // ─── the leaf ────────────────────────────────────────────────────────────
+
+    /// A page reached from the keyboard, or scrolled away from its head, has
+    /// only its own title to say which register it belongs to.
+    #[test]
+    fn every_leaf_opens_with_its_own_engraved_title() {
+        let u = update("0.1.9");
+        let s = state(Some(session(true, false)), &u);
+        for menu in Menu::ALL {
+            let page = content_of(Trigger::Menu(menu), &[], &s, 0.0);
+            assert_eq!(page.first(), Some(&Row::Title(menu.title())), "{menu:?}");
+        }
+    }
+
+    /// The folded leaf is several pages bound into one, so each of them keeps
+    /// its own title — and nothing else is titled.
+    #[test]
+    fn the_folded_leaf_titles_every_menu_it_carries() {
+        let u = update("0.1.9");
+        let s = state(None, &u);
+        let folded = [Menu::Display, Menu::Help];
+        let page = content_of(Trigger::More, &folded, &s, 0.0);
+        let titles: Vec<&str> = page
+            .iter()
+            .filter_map(|r| match r {
+                Row::Title(t) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![Menu::Display.title(), Menu::Help.title()],
+            "{titles:?}"
+        );
+    }
+
+    #[test]
+    fn every_menu_is_numbered_in_the_bars_reading_order() {
+        let numerals: Vec<Option<&str>> = Menu::ALL.iter().map(|m| folio_of(m.title())).collect();
+        assert_eq!(
+            numerals,
+            vec![Some("I"), Some("II"), Some("III"), Some("IV")]
+        );
+    }
+
+    /// Only a leaf of this register carries a folio; a title from anywhere else
+    /// gets a bare head rule rather than somebody else's number.
+    #[test]
+    fn a_title_that_is_not_a_menu_carries_no_folio() {
+        assert_eq!(folio_of("Conflicts"), None);
+        assert_eq!(folio_of(""), None);
+        assert_eq!(folio_of(&Menu::Help.title().to_lowercase()), None);
+    }
+
+    // ─── the ruling (pure geometry) ──────────────────────────────────────────
+
+    fn head_strip(h: f32) -> Rect {
+        Rect::from_min_size(pos2(0.0, 0.0), vec2(80.0, h))
+    }
+
+    /// The word of a head is between its two rules, never under both of them.
+    #[test]
+    fn a_roomy_compartment_is_ruled_over_and_under_its_word() {
+        let strip = head_strip(36.0);
+        let text = Rect::from_min_size(pos2(12.0, 11.0), vec2(48.0, 14.0));
+        let (cap, foot) = compartment_rules(strip, text).expect("room for both rules");
+        assert!(cap < text.top(), "cap {cap} is not over the word");
+        assert!(foot > text.bottom(), "foot {foot} is not under the word");
+        assert!(cap > strip.top() && foot < strip.bottom());
+    }
+
+    /// The title bar's height is fixed while the type is not, so a large text
+    /// scale squeezes the strip around the word. A rule struck through the word
+    /// is worse than no rule at all.
+    #[test]
+    fn a_squeezed_compartment_is_left_unruled() {
+        let text = Rect::from_min_size(pos2(12.0, 1.0), vec2(48.0, 14.0));
+        assert_eq!(compartment_rules(head_strip(16.0), text), None);
+        // And the degenerate case, where the strip has collapsed entirely.
+        assert_eq!(compartment_rules(head_strip(0.0), text), None);
+    }
+
+    /// The strip is laid out inside the title bar with the band across its
+    /// foot, so an open head has a band to interrupt: the doorway starts where
+    /// the compartment ends and runs to the band's own foot.
+    #[test]
+    fn an_open_head_cuts_its_doorway_through_the_band() {
+        let bar = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, chrome::TITLEBAR_H));
+        let strip = Rect::from_center_size(bar.center(), vec2(80.0, strip_h()));
+        let notch = open_notch(strip, bar).expect("the band crosses the strip's foot");
+        assert_eq!(notch.top(), strip.bottom());
+        assert_eq!(notch.x_range(), strip.x_range());
+        assert!(notch.bottom() < bar.bottom(), "{notch:?}");
+        assert!(notch.bottom() > strip.bottom(), "{notch:?}");
+    }
+
+    /// Only the window knows where the bar really is. A strip already reaching
+    /// the foot, one handed a bar it was never laid into, and one over a window
+    /// too narrow to carry a band all cut nothing rather than punching a hole
+    /// in the chrome.
+    #[test]
+    fn a_head_that_cannot_find_the_band_cuts_nothing() {
+        let bar = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, chrome::TITLEBAR_H));
+        let strip = Rect::from_min_size(pos2(0.0, 0.0), vec2(80.0, 34.0));
+        assert_eq!(open_notch(bar, bar), None);
+        let tall = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0));
+        assert_eq!(open_notch(strip, tall), None);
+        assert_eq!(
+            open_notch(strip, Rect::from_min_size(pos2(0.0, 0.0), vec2(8.0, 46.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_separator_leaves_its_diamond_clear_of_both_stubs() {
+        let span = Rangef::new(0.0, 36.0);
+        let r = 3.0;
+        let (top, foot) = separator_stubs(span, r).expect("room for both stubs");
+        assert!(top.max <= span.center() - r, "{top:?}");
+        assert!(foot.min >= span.center() + r, "{foot:?}");
+        assert!(top.min >= span.min && foot.max <= span.max);
+    }
+
+    /// A stub shorter than the space step reads as a speck beside the diamond,
+    /// so a squeezed bar is pivoted by the diamond alone.
+    #[test]
+    fn a_short_separator_is_the_diamond_alone() {
+        assert_eq!(separator_stubs(Rangef::new(0.0, 14.0), 3.0), None);
+        assert_eq!(separator_stubs(Rangef::new(0.0, 0.0), 3.0), None);
+    }
+
+    // ─── the gutter ──────────────────────────────────────────────────────────
+
+    fn entry_at(top: f32) -> Rect {
+        Rect::from_min_size(pos2(0.0, top), vec2(200.0, 20.0))
+    }
+
+    /// The rule brackets each block of entries. One rule down the whole leaf
+    /// would strike every out-dented section head on the page through.
+    #[test]
+    fn the_gutter_is_ruled_once_per_block_of_entries() {
+        let mut g = Gutter::default();
+        g.entry(entry_at(0.0));
+        g.entry(entry_at(20.0));
+        g.brk();
+        g.entry(entry_at(60.0));
+        let runs = g.finish();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].1, Rangef::new(0.0, 40.0));
+        assert_eq!(runs[1].1, Rangef::new(60.0, 80.0));
+    }
+
+    /// A leaf of nothing but heads, and a break with no run in hand, both rule
+    /// nothing rather than a zero-length line.
+    #[test]
+    fn a_leaf_with_no_entries_is_not_ruled() {
+        let mut g = Gutter::default();
+        g.brk();
+        g.brk();
+        assert!(g.finish().is_empty());
     }
 }
