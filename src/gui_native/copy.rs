@@ -314,12 +314,6 @@ pub const SHORTCUTS_TITLE: &str = "Keys";
 /// Subtitle under the shortcuts sheet title (P34).
 pub const SHORTCUTS_SUB: &str = "everything this window answers to";
 
-/// Label above the text-size stepper in Settings (P34).
-pub const A11Y_TEXT_SIZE: &str = "Text size";
-
-/// Hint under the text-size stepper in Settings (P34).
-pub const A11Y_TEXT_SIZE_HINT: &str = "scales every label in the window; Ctrl+0 puts it back";
-
 /// Screen-reader label for the close button in the custom title bar (P34).
 pub const WIN_CLOSE: &str = "close window";
 
@@ -334,15 +328,6 @@ pub const WIN_MINIMIZE: &str = "minimize window";
 
 /// Label on the skip-to-content link, revealed only while it holds focus (P34).
 pub const SKIP_TO_CONTENT: &str = "skip to content";
-
-/// Heading of the app-wide display preferences card on the Home screen (P34).
-pub const DISPLAY_TITLE: &str = "Display";
-
-/// Screen-reader label for the text-size increase stepper (P34).
-pub const A11Y_BIGGER: &str = "larger text";
-
-/// Screen-reader label for the text-size decrease stepper (P34).
-pub const A11Y_SMALLER: &str = "smaller text";
 
 // ─── custody vocabulary (P35) ────────────────────────────────────────────────
 // One word per state, used wherever custody is named so the register reads the
@@ -494,24 +479,6 @@ pub fn peer_lifetime(up: &str, down: &str, ttd_ms: Option<u64>) -> String {
 }
 
 // ─── appearance (P35) ────────────────────────────────────────────────────────
-
-/// Name of the palette setting.
-pub const THEME_TITLE: &str = "Palette";
-
-/// What the palette setting does.
-pub const THEME_HINT: &str = "ink on a dark desk, ink on paper, or maximum separation";
-
-/// Name of the register-density setting.
-pub const DENSITY_TITLE: &str = "Density";
-
-/// What the density setting does.
-pub const DENSITY_HINT: &str = "how many entries a register fits on one screen";
-
-/// Name of the motion setting.
-pub const MOTION_TITLE: &str = "Motion";
-
-/// What the motion setting does.
-pub const MOTION_HINT: &str = "reveals, sweeps and the breathing seal can be turned off";
 
 /// The option that keeps animation.
 pub const MOTION_FULL: &str = "Full";
@@ -1248,17 +1215,24 @@ pub const MENUBAR_HELP: &str = "help";
 /// (`menubar::bar`).
 pub const MENUBAR_MORE: &str = "more";
 
-/// Serif title for the session menu inside the `more` popup.
+/// Serif title at the head of the session menu's page.
 pub const MENUBAR_SESSION_TITLE: &str = "Session";
 
-/// Serif title for the tools menu inside the `more` popup.
+/// Serif title at the head of the tools menu's page.
 pub const MENUBAR_TOOLS_TITLE: &str = "Tools";
 
-/// Serif title for the display menu inside the `more` popup.
+/// Serif title at the head of the display menu's page.
 pub const MENUBAR_DISPLAY_TITLE: &str = "Display";
 
-/// Serif title for the help menu inside the `more` popup.
+/// Serif title at the head of the help menu's page.
 pub const MENUBAR_HELP_TITLE: &str = "Help";
+
+/// The folio numeral each menu's page carries at the outer end of its head
+/// rule, in the bar's reading order (`menubar::folio_of`).
+///
+/// Roman because a deed book numbers its leaves in roman, and because an arabic
+/// numeral beside a menu title would be read as a key to press.
+pub const MENUBAR_FOLIO: [&str; 4] = ["I", "II", "III", "IV"];
 
 /// Screen-reader name for a menu-bar head, from the word on it.
 pub fn menu_spoken(head: &str) -> String {

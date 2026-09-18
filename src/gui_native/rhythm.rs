@@ -11,22 +11,16 @@ use eframe::egui;
 use egui::{Rangef, Rect, Sense, Stroke};
 use egui::{pos2, vec2};
 
-use super::{ornament, theme};
+use super::{ornament, register, theme};
 
 /// The vertical unit every view's spacing is a multiple of.
 pub const BASELINE: f32 = theme::space::S;
 
-/// Running-head height: text band + rule + air, on the grid.
-const HEAD_H: f32 = BASELINE * 6.0;
-/// The band the trail and folio center in; the rule sits below it.
-const TEXT_BAND: f32 = 18.0;
-/// Crisp hairline offset from the head's top (drawn at the half-pixel).
-const RULE_OFFSET: f32 = 20.0;
 /// Width of the diamond separator cell between trail names.
-const SEP_W: f32 = 16.0;
+const SEP_W: f32 = theme::space::XL;
 const SEP_R: f32 = 1.8;
 /// Gap reserved between the elided trail and the folio mark.
-const FOLIO_GAP: f32 = 12.0;
+const FOLIO_GAP: f32 = theme::space::L;
 /// Front-elision marker. U+2026 is present in every shipped Plex face —
 /// verified against the font files; no tofu.
 const ELIDE_MARK: &str = "…";
@@ -61,12 +55,14 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
         return;
     }
     let width = ui.available_width().max(0.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, HEAD_H), Sense::hover());
+    let band = text_band();
+    let (rule_offset, head_h) = stations(band);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, head_h), Sense::hover());
     if !rect.is_finite() || rect.width() < 1.0 {
         return;
     }
     let p = ui.painter().with_clip_rect(rect);
-    let text_mid = rect.top() + TEXT_BAND * 0.5;
+    let text_mid = rect.top() + band * 0.5;
 
     // Folio first: it owns the outer edge and the trail elides into what
     // remains. Reservation is capped at half the head so a pathological folio
@@ -84,7 +80,7 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
         let zone_w = size.x.min(rect.width() * 0.5);
         let zone = Rect::from_min_max(
             pos2(rect.right() - zone_w, rect.top()),
-            pos2(rect.right(), rect.top() + TEXT_BAND),
+            pos2(rect.right(), rect.top() + band),
         );
         p.with_clip_rect(zone).galley(
             pos2(rect.right() - size.x, text_mid - size.y * 0.5),
@@ -98,7 +94,7 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
     if budget >= 1.0 {
         let zone = Rect::from_min_max(
             pos2(rect.left(), rect.top()),
-            pos2(trail_right, rect.top() + TEXT_BAND),
+            pos2(trail_right, rect.top() + band),
         );
         let tp = p.with_clip_rect(zone);
         let last = trail.len() - 1;
@@ -161,7 +157,7 @@ pub fn running_head(ui: &mut egui::Ui, trail: &[&str], folio: Option<&str>) {
         }
     }
 
-    let rule_y = theme::snap(rect.top() + RULE_OFFSET);
+    let rule_y = theme::snap(rect.top() + rule_offset);
     p.hline(
         Rangef::new(rect.left(), rect.right()),
         rule_y,
@@ -179,6 +175,23 @@ pub fn foot_rule(ui: &mut egui::Ui) {
 /// is far inside f32 range, so the result is always finite and non-negative.
 fn units_to_px(units: u16) -> f32 {
     f32::from(units) * BASELINE
+}
+
+/// The band the trail and the folio are centred in and clipped to: the line box
+/// the head's type lays out into. It was 18, which is one line of meta type at
+/// 100% and two thirds of one at 200%.
+fn text_band() -> f32 {
+    register::line_h(theme::step::META)
+}
+
+/// Where the hairline under the head is drawn, and how tall the head is. Both
+/// follow the band rather than standing beside it as numbers that agreed with
+/// it at one text scale; the head then rounds up onto the baseline grid, which
+/// is the whole point of this module.
+fn stations(band: f32) -> (f32, f32) {
+    let rule = band + theme::space::XS;
+    let h = ((rule + theme::space::S) / BASELINE).ceil() * BASELINE;
+    (rule, h)
 }
 
 /// Given per-name widths, the separator cell width, the elision-marker width,
@@ -300,5 +313,61 @@ mod tests {
         assert_eq!(elide_plan(&[f32::NAN, 10.0], 5.0, 8.0, 50.0), (0, false));
         assert_eq!(elide_plan(&[10.0], f32::INFINITY, 8.0, 50.0), (0, false));
         assert_eq!(elide_plan(&[10.0], 5.0, f32::NAN, 50.0), (0, false));
+    }
+
+    // ── the head's own measure ──
+
+    /// Every text scale the control can actually reach.
+    fn scales() -> impl Iterator<Item = f32> {
+        (14..=44).map(|k| k as f32 / 20.0)
+    }
+
+    /// What `register::line_h` returns, as arithmetic.
+    fn line_box(step: f32, scale: f32) -> f32 {
+        step * scale * 1.5
+    }
+
+    /// The trail is clipped to the band, so a band shorter than the type in it
+    /// slices the names horizontally — the defect, at the head this time.
+    #[test]
+    fn the_head_clears_the_trail_set_in_it() {
+        for scale in scales() {
+            let band = line_box(theme::step::META, scale);
+            let (rule, h) = stations(band);
+            assert!(
+                rule > band,
+                "the rule is drawn through the trail at {scale}"
+            );
+            assert!(h > rule, "the head ends on its own rule at {scale}");
+        }
+    }
+
+    /// The head is on the grid at every scale, or the module's one promise —
+    /// that vertical space is stated in baseline units — stops holding.
+    #[test]
+    fn the_head_lands_on_the_baseline_grid() {
+        for scale in scales() {
+            let (_, h) = stations(line_box(theme::step::META, scale));
+            assert_eq!(h, snap(h), "head {h} is off the grid at {scale}");
+        }
+    }
+
+    #[test]
+    fn the_head_grows_with_the_text_scale() {
+        let mut prev: Option<(f32, f32)> = None;
+        for scale in scales() {
+            let (_, h) = stations(line_box(theme::step::META, scale));
+            if let Some((was, before)) = prev {
+                assert!(h >= before, "head shrank from {was} to {scale}");
+            }
+            prev = Some((scale, h));
+        }
+        // Across the whole range it must actually move, not merely not shrink.
+        let (_, small) = stations(line_box(theme::step::META, 0.7));
+        let (_, large) = stations(line_box(theme::step::META, 2.2));
+        assert!(
+            large > small * 2.0,
+            "{small} to {large} is not a text scale"
+        );
     }
 }

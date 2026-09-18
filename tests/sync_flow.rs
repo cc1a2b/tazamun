@@ -4,7 +4,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestNode, WAIT, assert_converged, pseudo_random, wait_until};
+use common::{TestNode, WAIT, assert_converged, pseudo_random, test_net, wait_until};
+use tazamun::locks::LockTimings;
 
 /// Strict checkout applies to the genesis importer too: the moment an imported
 /// file is published, the *importer's own copy* goes read-only — not only after
@@ -201,7 +202,24 @@ async fn rename_under_lease_propagates_as_a_move() {
     std::fs::write(dir.path().join("old.txt"), b"the same bytes").unwrap();
     // Default (strict) mode — the harder case: the new name must be published
     // explicitly, exactly the sequence `tazamun mv` runs.
-    let a = TestNode::start(dir).await;
+    //
+    // The lease on the old name has to outlive two more round trips and a
+    // publish, so this is one of the tests the harness's 2s TTL is too short
+    // for: on a loaded Windows runner the publish of `new.txt` (history copy,
+    // blob write, state persist) can hold the actor past 2s, the lease expires
+    // exactly as designed, and the final unlock is correctly refused. The real
+    // `tazamun mv` runs against the 90s default; 30s here is long enough to
+    // model that and still bounded.
+    let a = TestNode::start_with_timings(
+        dir,
+        test_net(),
+        LockTimings {
+            ttl: Duration::from_secs(30),
+            renew: Duration::from_secs(10),
+            acquire_timeout: Duration::from_secs(3),
+        },
+    )
+    .await;
     let b = TestNode::join(&a.invite().await).await;
 
     assert!(

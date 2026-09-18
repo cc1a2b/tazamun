@@ -9,7 +9,7 @@
 //! behind an empty page, which is `ornament`'s.
 
 use eframe::egui;
-use egui::{Align2, Color32, FontFamily, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind};
+use egui::{Color32, FontFamily, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind};
 use egui::{pos2, vec2};
 
 use super::{ornament, register, theme};
@@ -22,10 +22,8 @@ pub fn ledger_stats(ui: &mut egui::Ui, items: &[(String, &'static str)]) {
     ui.horizontal(|ui| {
         for (i, (value, label)) in items.iter().enumerate() {
             if i > 0 {
-                let (cell, _) = ui.allocate_exact_size(
-                    vec2(theme::space::XL, theme::sized(theme::step::DISPLAY) * 2.0),
-                    Sense::hover(),
-                );
+                let (cell, _) =
+                    ui.allocate_exact_size(vec2(theme::space::XL, figure_h()), Sense::hover());
                 ornament::diamond(ui.painter(), cell.center(), 3.0, theme::gold_deep());
             }
             ui.vertical(|ui| {
@@ -50,6 +48,63 @@ pub fn ledger_stats(ui: &mut egui::Ui, items: &[(String, &'static str)]) {
             });
         }
     });
+}
+
+/// The height of one ledger figure — the value, its gold rule, and the name
+/// under it — so the separator between two figures is cut from the same measure
+/// the column is set in rather than from a pixel count that agreed with it at
+/// one text scale.
+fn figure_h() -> f32 {
+    figure_box(
+        register::line_h(theme::step::DISPLAY),
+        register::line_h(theme::step::META),
+    )
+}
+
+/// Pure: the figure column's own arithmetic. The two line boxes, the rule
+/// between them, and the half-step of air the column sets its items with.
+fn figure_box(value_h: f32, label_h: f32) -> f32 {
+    value_h + theme::space::XS + theme::RULE_ACCENT_W + theme::space::XS + label_h
+}
+
+/// The height of a chip carrying one line of type at `step` — the count tally,
+/// the kind chip, a key cap. `galley_h` is what the text actually laid out to.
+///
+/// The one number three files used to write as `sized(META) + space::S`, which
+/// is a nominal size plus a gap standing in for a line box: at 2.2 the type it
+/// was meant to hold is taller than the chip drawn around it.
+pub(super) fn chip_h(step: f32, galley_h: f32) -> f32 {
+    chip_box(register::line_h(step), galley_h)
+}
+
+/// Pure: never shorter than the line box the type lays out into, and never
+/// shorter than the galley it was actually handed.
+fn chip_box(line_h: f32, galley_h: f32) -> f32 {
+    let galley_h = if galley_h.is_finite() {
+        galley_h.max(0.0)
+    } else {
+        0.0
+    };
+    line_h.max(galley_h + theme::space::XS)
+}
+
+/// The height of a [`plate`], for a caller that has to reserve the plate's room
+/// before it has the plate — the bulk-action verb slots, which allocate a fixed
+/// cell so the row does not reflow as verbs come and go.
+///
+/// Never less than the line box the label lays out into, so the slot fits the
+/// plate at every text scale rather than at the one it was measured on.
+pub(super) fn plate_h() -> f32 {
+    plate_box(
+        theme::sized(theme::step::LABEL),
+        register::line_h(theme::step::LABEL),
+    )
+}
+
+/// Pure: the plate's own arithmetic — the nominal size with its symmetric
+/// padding, floored at the line box that size lays out into.
+fn plate_box(nominal: f32, line_h: f32) -> f32 {
+    (nominal + theme::space::M * 2.0).max(line_h)
 }
 
 /// The colophon block: a raised ground with one 45-degree cut at the top-right
@@ -107,7 +162,7 @@ pub fn ext_chip(ui: &mut egui::Ui, path: &str) {
     let galley =
         ui.painter()
             .layout_no_wrap(ext, theme::font(theme::step::CAPTION, theme::fam_mono()), c);
-    let h = theme::sized(theme::step::META) + theme::space::S;
+    let h = chip_h(theme::step::CAPTION, galley.size().y);
     let w = (galley.size().x + theme::space::M)
         .max(theme::sized(theme::step::DISPLAY) + theme::space::L);
     let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
@@ -176,7 +231,7 @@ pub(super) fn plate(
     );
     let size = vec2(
         galley.size().x + theme::space::XL * 2.0,
-        (theme::sized(theme::step::LABEL) + theme::space::M * 2.0).max(galley.size().y),
+        plate_h().max(galley.size().y),
     );
     let (rect, resp) = ui.allocate_at_least(size, Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
@@ -327,30 +382,55 @@ fn measure_frac(frac: f32) -> f32 {
 
 /// A page with nothing written on it: the khatam watermark from `ornament`
 /// behind the reason it is empty and what to do about it.
+///
+/// Both lines are laid out into the page's own measure before anything is
+/// allocated, so a long hint wraps inside the page instead of running off its
+/// edge, and the page is as tall as the two lines came out rather than as tall
+/// as they were once assumed to be.
 pub fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
-    let h = (theme::density().row_h() * 4.0).max(96.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(0.0), h), Sense::hover());
-    if rect.width() <= 0.0 {
+    let width = ui.available_width().max(0.0);
+    if width <= 0.0 {
+        return;
+    }
+    // A measure, not the full width: centred prose set edge to edge is a page
+    // with no margins, and the wrap is what keeps a long hint on the page.
+    let wrap = (width - theme::space::XXL * 2.0).max(width * 0.5);
+    let p = ui.painter();
+    let title_g = p.layout(
+        title.to_owned(),
+        theme::font(theme::step::BODY, theme::fam_medium()),
+        theme::ink_muted(),
+        wrap,
+    );
+    let hint_g = p.layout(
+        hint.to_owned(),
+        theme::font(theme::step::META, FontFamily::Proportional),
+        theme::ink_faint(),
+        wrap,
+    );
+    let block = empty_block_h(title_g.size().y, hint_g.size().y);
+    let h = (theme::density().row_h() * 4.0).max(block + theme::density().block_pad() * 2.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
+    if !rect.is_positive() {
         return;
     }
     ornament::watermark(&ui.painter_at(rect), rect, theme::gold());
     let p = ui.painter();
-    let mut y = rect.center().y - theme::sized(theme::step::BODY);
-    p.text(
-        pos2(rect.center().x, y),
-        Align2::CENTER_CENTER,
-        title,
-        theme::font(theme::step::BODY, theme::fam_medium()),
-        theme::ink_muted(),
-    );
-    y += theme::sized(theme::step::BODY) + theme::space::M;
-    p.text(
-        pos2(rect.center().x, y),
-        Align2::CENTER_CENTER,
-        hint,
-        theme::font(theme::step::META, FontFamily::Proportional),
-        theme::ink_faint(),
-    );
+    let mut y = rect.center().y - block * 0.5;
+    for (galley, color) in [(title_g, theme::ink_muted()), (hint_g, theme::ink_faint())] {
+        let size = galley.size();
+        p.galley(
+            pos2((rect.center().x - size.x * 0.5).round(), y.round()),
+            galley,
+            color,
+        );
+        y += size.y + theme::space::M;
+    }
+}
+
+/// Pure: the two laid-out lines and the air between them.
+fn empty_block_h(title_h: f32, hint_h: f32) -> f32 {
+    title_h + theme::space::M + hint_h
 }
 
 /// A rect on the pixel grid, so a hairline renders as one crisp line instead of
@@ -374,6 +454,24 @@ pub(super) fn centre(rect: Rect, size: egui::Vec2) -> Pos2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every text scale the control can actually reach — stored in twentieths,
+    /// so this is the whole set rather than a sample of it.
+    fn scales() -> impl Iterator<Item = f32> {
+        (14..=44).map(|k| k as f32 / 20.0)
+    }
+
+    /// The line box `register::line_h` returns, as arithmetic: Plex Sans Arabic
+    /// is 1.5em and every stack in this window ends in it.
+    fn line_box(step: f32, scale: f32) -> f32 {
+        step * scale * 1.5
+    }
+
+    /// What Plex's Latin faces actually lay out to — the galley a chip is
+    /// handed when its text is Latin.
+    fn latin(step: f32, scale: f32) -> f32 {
+        step * scale * 1.3
+    }
 
     #[test]
     fn common_extensions_get_a_chip() {
@@ -436,5 +534,112 @@ mod tests {
         assert_eq!(measure_frac(2.0), 1.0);
         assert_eq!(measure_frac(f32::NAN), 0.0);
         assert_eq!(measure_frac(f32::INFINITY), 0.0);
+    }
+
+    // ── measures that used to be pixel counts ──
+
+    /// The defect this replaced, stated as arithmetic: a chip ruled at
+    /// `sized(META) + space::S` is shorter than the caption inside it once the
+    /// text scale passes roughly 1.9, and shorter still for Arabic.
+    #[test]
+    fn a_chip_is_never_shorter_than_the_type_in_it() {
+        let step = theme::step::CAPTION;
+        for scale in scales() {
+            let line = line_box(step, scale);
+            for galley in [latin(step, scale), line, 0.0] {
+                let h = chip_box(line, galley);
+                assert!(h >= galley, "chip {h} holds a {galley} galley at {scale}");
+                assert!(h >= line, "chip {h} under the line box {line} at {scale}");
+            }
+            // The formula this replaced: a nominal size one step up, plus a
+            // gap, standing in for a line box it stops covering past ~1.9.
+            let was = theme::step::META * scale + theme::space::S;
+            if scale >= 2.0 {
+                assert!(
+                    chip_box(line, latin(step, scale)) > was,
+                    "the old pixel count is still the taller of the two at {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_chip_grows_with_the_text_scale() {
+        let step = theme::step::CAPTION;
+        let mut prev: Option<(f32, f32)> = None;
+        for scale in scales() {
+            let h = chip_box(line_box(step, scale), latin(step, scale));
+            if let Some((was, before)) = prev {
+                assert!(h > before, "chip flat from {was} to {scale}");
+            }
+            prev = Some((scale, h));
+        }
+    }
+
+    /// A nonsense galley height must cost the chip nothing rather than ruling
+    /// the row it sits in at an infinite height.
+    #[test]
+    fn a_chip_survives_a_galley_it_cannot_measure() {
+        let line = line_box(theme::step::CAPTION, 1.0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -50.0] {
+            assert_eq!(chip_box(line, bad), line, "{bad} escaped the chip");
+        }
+    }
+
+    /// The slot a bulk verb is reserved in is the plate's own height, so the
+    /// plate cannot outgrow the cell that was allocated for it.
+    #[test]
+    fn a_plate_slot_clears_the_plate_at_every_scale() {
+        for scale in scales() {
+            let step = theme::step::LABEL;
+            let line = line_box(step, scale);
+            let h = plate_box(step * scale, line);
+            assert!(
+                h >= line,
+                "a {line} line box does not fit the plate at {scale}"
+            );
+            assert!(h >= latin(step, scale), "latin label clipped at {scale}");
+        }
+    }
+
+    /// The separator between two ledger figures is cut from the column's own
+    /// measure, so it can never be tuned against a column it no longer matches.
+    #[test]
+    fn a_ledger_separator_spans_the_figure_beside_it() {
+        let mut prev: Option<(f32, f32)> = None;
+        for scale in scales() {
+            let h = figure_box(
+                line_box(theme::step::DISPLAY, scale),
+                line_box(theme::step::META, scale),
+            );
+            assert!(
+                h > line_box(theme::step::DISPLAY, scale) + line_box(theme::step::META, scale),
+                "the rule between value and name is unaccounted for at {scale}"
+            );
+            if let Some((was, before)) = prev {
+                assert!(h > before, "figure height flat from {was} to {scale}");
+            }
+            prev = Some((scale, h));
+        }
+    }
+
+    /// An empty page is as tall as the two lines came out, whether they wrapped
+    /// to one line each or to five.
+    #[test]
+    fn an_empty_page_follows_the_lines_it_holds() {
+        let one = empty_block_h(20.0, 16.0);
+        let wrapped = empty_block_h(20.0, 16.0 * 5.0);
+        assert!(wrapped > one, "a wrapped hint did not make the page taller");
+        assert!(one >= 20.0 + 16.0, "the air between the lines went missing");
+        for scale in scales() {
+            let block = empty_block_h(
+                line_box(theme::step::BODY, scale),
+                line_box(theme::step::META, scale),
+            );
+            assert!(
+                block >= line_box(theme::step::BODY, scale) + line_box(theme::step::META, scale),
+                "block {block} clips its own lines at {scale}"
+            );
+        }
     }
 }

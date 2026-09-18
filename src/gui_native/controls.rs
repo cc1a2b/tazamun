@@ -199,7 +199,10 @@ pub fn chevron(ui: &mut egui::Ui, open: bool) -> egui::Response {
 /// record, so when the line is too narrow the key elides and the value stays
 /// whole.
 pub fn leader_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    let h = theme::sized(theme::step::BODY) + theme::space::S;
+    // The line box of the taller of the two faces on the line, not a nominal
+    // size with a gap after it: the key is the label step, and at 2.2 that lays
+    // out taller than `sized(BODY) + space::S` ever reserved for it.
+    let h = register::line_h(theme::step::LABEL);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(0.0), h), Sense::hover());
     if rect.width() <= 0.0 {
         return;
@@ -272,7 +275,7 @@ pub fn count_chip(ui: &mut egui::Ui, n: usize) {
         theme::font(theme::step::CAPTION, theme::fam_mono_medium()),
         c,
     );
-    let h = theme::sized(theme::step::META) + theme::space::S;
+    let h = components::chip_h(theme::step::CAPTION, galley.size().y);
     let (rect, _) = ui.allocate_exact_size(
         vec2((galley.size().x + theme::space::M).max(h), h),
         Sense::hover(),

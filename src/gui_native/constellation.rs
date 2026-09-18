@@ -25,7 +25,7 @@ use eframe::egui;
 use egui::{Color32, Galley, Key, Modifiers, Pos2, Rect, Sense, Stroke};
 use egui::{pos2, vec2};
 
-use super::{a11y, focusnav, ornament, telemetry, theme};
+use super::{a11y, focusnav, ornament, register, telemetry, theme};
 use crate::consts::{GRADE_GOOD_MAX_RTT_MS, GRADE_POOR_MIN_RTT_MS};
 
 /// Log-compression knee: RTTs near this many ms use the scale's steep part.
@@ -44,8 +44,8 @@ const CANVAS_MARGIN: f32 = 10.0;
 /// enough that the innermost orbit clears the centre and its label — see
 /// [`band_for`] — or a 0 ms peer would have nowhere to sit.
 const MIN_SKY_R: f32 = 72.0;
-/// Vertical room the centre mark's own "you" label occupies beneath it.
-const CENTRE_LABEL_BAND: f32 = 22.0;
+/// Gap between the centre mark and the "you" label hanging under it.
+const CENTRE_LABEL_GAP: f32 = theme::space::S;
 /// Breathing room between the centre's label and the nearest star.
 const CENTRE_CLEARANCE: f32 = 6.0;
 /// How much of the draw-on is spent staggering outer stars behind inner ones.
@@ -110,7 +110,7 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         ui.id().with("constellation-sky"),
         Sense::focusable_noninteractive(),
     );
-    let placement = band_for(avail).map(|band| {
+    let placement = band_for(avail, register::line_h(theme::step::META)).map(|band| {
         let (placed, overflow) = place(stars, &band);
         (band, placed, overflow)
     });
@@ -171,7 +171,10 @@ pub fn sky(ui: &mut egui::Ui, rect: egui::Rect, stars: &[Star<'_>], t: f32) -> O
         theme::alpha(theme::ink_muted(), (255.0 * ease) as u8),
     );
     let you_size = you.size();
-    let you_pos = pos2(centre.x - you_size.x * 0.5, centre.y + band.centre_r + 4.0);
+    let you_pos = pos2(
+        centre.x - you_size.x * 0.5,
+        centre.y + band.centre_r + CENTRE_LABEL_GAP,
+    );
     p.galley(you_pos, you, theme::ink_muted());
 
     if stars.is_empty() {
@@ -614,8 +617,8 @@ impl Band {
     }
 }
 
-fn band_for(avail: f32) -> Option<Band> {
-    if !avail.is_finite() || avail < MIN_SKY_R {
+fn band_for(avail: f32, label_h: f32) -> Option<Band> {
+    if !avail.is_finite() || avail < MIN_SKY_R || !label_h.is_finite() {
         return None;
     }
     let centre_r = (avail * 0.16).clamp(9.0, 15.0);
@@ -623,8 +626,10 @@ fn band_for(avail: f32) -> Option<Band> {
     // case rather than a corner one. The centre mark carries its "you" label
     // underneath, so the innermost orbit has to clear the khatam, that label,
     // and the widest a star can be drawn — otherwise the nearest peer lands on
-    // top of the centre with its round-trip written across it.
-    let r_min = centre_r + CENTRE_LABEL_BAND + star_radius(3) + CENTRE_CLEARANCE;
+    // top of the centre with its round-trip written across it. The label is
+    // type, so its room is measured and handed in: a fixed 22 was one line of
+    // meta type at 100% and well under it by 150%.
+    let r_min = centre_r + CENTRE_LABEL_GAP + label_h.max(0.0) + star_radius(3) + CENTRE_CLEARANCE;
     let r_meas = avail * 0.86;
     if r_min >= r_meas {
         return None;
@@ -1100,18 +1105,26 @@ mod tests {
 
     // ── band ──
 
+    /// The room the "you" label needs at a given text scale — what
+    /// `register::line_h(META)` returns, as arithmetic.
+    fn label_h(scale: f32) -> f32 {
+        theme::step::META * scale * 1.5
+    }
+
     #[test]
     fn band_rejects_tiny_and_non_finite() {
-        assert!(band_for(f32::NAN).is_none());
-        assert!(band_for(f32::INFINITY).is_none());
-        assert!(band_for(-10.0).is_none());
-        assert!(band_for(MIN_SKY_R - 1.0).is_none());
-        assert!(band_for(MIN_SKY_R).is_some());
+        assert!(band_for(f32::NAN, label_h(1.0)).is_none());
+        assert!(band_for(f32::INFINITY, label_h(1.0)).is_none());
+        assert!(band_for(-10.0, label_h(1.0)).is_none());
+        assert!(band_for(MIN_SKY_R - 1.0, label_h(1.0)).is_none());
+        assert!(band_for(MIN_SKY_R, label_h(1.0)).is_some());
+        assert!(band_for(200.0, f32::NAN).is_none());
+        assert!(band_for(200.0, f32::INFINITY).is_none());
     }
 
     #[test]
     fn band_orders_radii() {
-        let b = band_for(200.0).unwrap();
+        let b = band_for(200.0, label_h(1.0)).unwrap();
         assert!(b.centre_r < b.r_min);
         assert!(b.r_min < b.r_meas);
         assert!(b.r_meas < b.r_rim);
@@ -1240,18 +1253,35 @@ mod tests {
         assert!(local_t(0.5, 0.0) > local_t(0.5, 1.0), "inner stars first");
     }
 
+    /// A 0 ms peer is drawn at r_min; on a LAN that is the common case. It must
+    /// not overlap the centre khatam or the "you" label beneath it — at any
+    /// text scale, which is what the fixed 22px band could not promise: at 2.2
+    /// the label is 36 tall and a star used to be drawn through it.
     #[test]
     fn the_innermost_orbit_clears_the_centre_and_its_label() {
-        // A 0 ms peer is drawn at r_min; on a LAN that is the common case. It
-        // must not overlap the centre khatam or the "you" label beneath it.
-        for avail in [40.0f32, 80.0, 200.0, 600.0] {
-            let Some(b) = band_for(avail) else { continue };
-            let nearest = b.radius_of_frac(radial_frac(0));
-            assert!(
-                nearest - star_radius(3) > b.centre_r + CENTRE_LABEL_BAND,
-                "a 0 ms peer overlaps the centre at avail={avail}"
-            );
+        for scale in (14..=44).map(|k| k as f32 / 20.0) {
+            let label = label_h(scale);
+            for avail in [40.0f32, 80.0, 200.0, 600.0] {
+                let Some(b) = band_for(avail, label) else {
+                    continue;
+                };
+                let nearest = b.radius_of_frac(radial_frac(0));
+                assert!(
+                    nearest - star_radius(3) > b.centre_r + label,
+                    "a 0 ms peer overlaps the centre at avail={avail}, scale={scale}"
+                );
+            }
         }
+    }
+
+    /// A sky too cramped to keep the innermost orbit clear of the label is no
+    /// sky at all — the centre mark is drawn alone rather than drawn over.
+    #[test]
+    fn a_sky_with_no_room_for_the_label_is_refused_outright() {
+        // The label at 2.2 is taller than the whole measured band at the
+        // smallest half-extent the sky is drawn into.
+        assert!(band_for(MIN_SKY_R, label_h(2.2)).is_none());
+        assert!(band_for(600.0, label_h(2.2)).is_some());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 use eframe::egui;
 
-use super::{ornament, theme};
+use super::{ornament, register, theme};
 
 /// What a toast is announcing; drives its seal colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,7 +113,7 @@ pub fn draw(ui: &egui::Ui, q: &Queue, now: f64) {
     if q.is_empty() {
         return;
     }
-    let pitch = theme::density().row_h() + theme::space::M;
+    let pitch = pitch();
     // Index 0 sits at the bottom, so walk newest-first.
     for (i, toast) in q.items.iter().rev().enumerate() {
         let age = now - toast.born;
@@ -166,6 +166,30 @@ pub fn draw(ui: &egui::Ui, q: &Queue, now: f64) {
     // This cadence drives expiry, not decoration: without it a slip would stay
     // on screen until the next input event, so reduced motion must not stop it.
     ui.ctx().request_repaint_after(theme::motion::CADENCE);
+}
+
+/// The tallest a slip can be drawn: the frame's symmetric margin plus the line
+/// box its text lays out into. The seal beside the text is cut from the label
+/// step, which that line box already covers.
+fn slip_h() -> f32 {
+    slip_box(register::line_h(theme::step::LABEL))
+}
+
+/// Pure: the slip around one line box.
+fn slip_box(line_h: f32) -> f32 {
+    line_h + theme::space::M * 2.0
+}
+
+/// How far one slip sits above the next. The density sets the rhythm, but a
+/// slip is not a register entry and must never be allowed to grow past the step
+/// between two of them — a stack that overlaps itself hides the line under it.
+fn pitch() -> f32 {
+    stack_pitch(theme::density().row_h(), slip_h())
+}
+
+/// Pure: the density's own step, floored at the slip plus a gap.
+fn stack_pitch(row_h: f32, slip_h: f32) -> f32 {
+    (row_h + theme::space::M).max(slip_h + theme::space::S)
 }
 
 /// A 0..=1 ramp over `over` seconds. A zero-length ramp — what [`theme::dur`]
@@ -294,6 +318,73 @@ mod tests {
         assert!(!q.is_empty());
         q.expire(1.0 + TTL);
         assert!(q.is_empty());
+    }
+
+    // ── the stack's own measure ──
+
+    /// Every text scale the control can actually reach.
+    fn scales() -> impl Iterator<Item = f32> {
+        (14..=44).map(|k| k as f32 / 20.0)
+    }
+
+    fn line_box(step: f32, scale: f32) -> f32 {
+        step * scale * 1.5
+    }
+
+    /// Mirrors `theme::Density::row_h`: the base at the text scale, which the
+    /// density deliberately stops following below 100%.
+    fn row_h(base: f32, scale: f32) -> f32 {
+        base * scale.clamp(1.0, 2.2)
+    }
+
+    /// Three slips are stacked bottom-up at one pitch. If the pitch is shorter
+    /// than a slip, the newest toast is drawn over the one before it and the
+    /// burst this queue exists to show becomes unreadable again.
+    #[test]
+    fn the_stack_never_laps_over_itself() {
+        for base in [24.0, 28.0, 34.0] {
+            for scale in scales() {
+                let slip = slip_box(line_box(theme::step::LABEL, scale));
+                let pitch = stack_pitch(row_h(base, scale), slip);
+                assert!(
+                    pitch > slip,
+                    "density {base} at {scale}: {pitch} pitch under a {slip} slip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_stack_grows_with_the_text_scale() {
+        for base in [24.0, 28.0, 34.0] {
+            let small = stack_pitch(
+                row_h(base, 0.7),
+                slip_box(line_box(theme::step::LABEL, 0.7)),
+            );
+            let large = stack_pitch(
+                row_h(base, 2.2),
+                slip_box(line_box(theme::step::LABEL, 2.2)),
+            );
+            assert!(large > small, "density {base}: {small} to {large} is flat");
+        }
+    }
+
+    /// A roomier density spaces the stack out too, exactly as it does the
+    /// register — the floor must not flatten the three densities into one.
+    #[test]
+    fn the_stack_follows_the_density() {
+        let slip = slip_box(line_box(theme::step::LABEL, 2.2));
+        let mut prev: Option<f32> = None;
+        for base in [24.0, 28.0, 34.0] {
+            let pitch = stack_pitch(row_h(base, 2.2), slip);
+            if let Some(was) = prev {
+                assert!(
+                    pitch > was,
+                    "density {base} did not open the stack: {pitch}"
+                );
+            }
+            prev = Some(pitch);
+        }
     }
 
     #[test]

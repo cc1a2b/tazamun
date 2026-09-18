@@ -9,9 +9,30 @@ use eframe::egui;
 use egui::{CornerRadius, FontFamily, Margin, Rangef, Rect, Sense, Stroke, StrokeKind};
 use egui::{pos2, vec2};
 
-use super::theme;
+use super::{register, theme};
 
-const FIELD_H: f32 = 30.0;
+/// The magnifier and the clear mark, as fractions of the field's own type step:
+/// a mark beside 27px text cannot be the 4px circle that suited 12px text.
+const GLASS_R: f32 = 0.34;
+const CLEAR_SIDE: f32 = 1.3;
+/// The mark's cross arm, as a fraction of its cell.
+const CLEAR_ARM: f32 = 0.21;
+
+/// The well's height: the line box the type inside it lays out into, with the
+/// air the focus underline needs beneath the descenders.
+///
+/// It used to be 30, which held a 12.5pt label and nothing else — at 2.2 the
+/// type is 27.5pt and the well it is typed into had not moved. Ruled at the
+/// label step whichever face the well carries, so a ticket well and a text well
+/// standing side by side are still one height.
+fn field_h() -> f32 {
+    well_h(register::line_h(theme::step::LABEL))
+}
+
+/// Pure: the well around one line box.
+fn well_h(line_h: f32) -> f32 {
+    line_h + theme::space::M * 2.0
+}
 
 /// Validation tint for a field's rule and border.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,7 +53,8 @@ struct FieldSpec {
 
 /// The house text field: a recessed well with a hairline rule that grows into
 /// a gold underline from the centre outward as the field takes focus.
-/// `state` tints the rule (settled / blocked) when not Neutral. Height 30.
+/// `state` tints the rule (settled / blocked) when not Neutral. As tall as the
+/// type it holds.
 pub fn text_field(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -88,25 +110,36 @@ pub struct SearchOut {
 /// A search field: a painter-drawn magnifier at the leading edge and, once
 /// there is text, a clear mark at the trailing edge.
 pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> SearchOut {
+    let glass_r = theme::sized(theme::step::LABEL) * GLASS_R;
+    let clear_side = theme::sized(theme::step::LABEL) * CLEAR_SIDE;
     let spec = FieldSpec {
         state: FieldState::Neutral,
         mono: false,
-        lead: 16.0,
-        trail: if text.is_empty() { 0.0 } else { 18.0 },
+        // Each mark reserves its own width rather than a number that used to
+        // clear it: the marks grow with the type they sit beside.
+        lead: glass_r * 2.0 + theme::space::M,
+        trail: if text.is_empty() {
+            0.0
+        } else {
+            clear_side + theme::space::XS
+        },
     };
     let (response, rect) = field_impl(ui, text, hint, width, spec);
 
     // Magnifier: glass sits up-left of the mark centre so glass plus handle
-    // reads optically centred at (left + 17, centre y).
+    // reads optically centred in the room the lead reserved for it.
     let s = Stroke::new(1.3, theme::ink_muted());
-    let glass = pos2(rect.left() + 15.6, rect.center().y - 1.4);
+    let glass = pos2(
+        rect.left() + inset_x() + glass_r,
+        rect.center().y - glass_r * 0.33,
+    );
     let d = std::f32::consts::FRAC_1_SQRT_2;
     let p = ui.painter();
-    p.circle_stroke(glass, 4.2, s);
+    p.circle_stroke(glass, glass_r, s);
     p.line_segment(
         [
-            pos2(glass.x + 4.2 * d, glass.y + 4.2 * d),
-            pos2(glass.x + 7.8 * d, glass.y + 7.8 * d),
+            pos2(glass.x + glass_r * d, glass.y + glass_r * d),
+            pos2(glass.x + glass_r * 1.86 * d, glass.y + glass_r * 1.86 * d),
         ],
         s,
     );
@@ -116,8 +149,11 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
     let mut cleared = false;
     if !text.is_empty() {
         let clear_rect = Rect::from_min_size(
-            pos2(rect.right() - 20.0, rect.center().y - 8.0),
-            vec2(16.0, 16.0),
+            pos2(
+                rect.right() - theme::space::S - clear_side,
+                rect.center().y - clear_side * 0.5,
+            ),
+            vec2(clear_side, clear_side),
         );
         let mark = ui
             .interact(clear_rect, response.id.with("clear"), Sense::click())
@@ -128,7 +164,7 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
             theme::ink_muted()
         };
         let c = clear_rect.center();
-        let r = 3.4;
+        let r = clear_side * CLEAR_ARM;
         let s = Stroke::new(1.3, color);
         let p = ui.painter();
         p.line_segment([pos2(c.x - r, c.y - r), pos2(c.x + r, c.y + r)], s);
@@ -175,6 +211,12 @@ pub fn focus_ring(ui: &egui::Ui, rect: Rect, t: f32) {
     }
 }
 
+/// The well's horizontal inset: where the type starts, and where a painted mark
+/// is set from the edge.
+fn inset_x() -> f32 {
+    theme::space::M + theme::space::XS
+}
+
 /// Shared body: paints the well, hosts the frameless edit, then draws the
 /// resting hairline and the focus-grown rule.
 fn field_impl(
@@ -184,13 +226,20 @@ fn field_impl(
     width: f32,
     spec: FieldSpec,
 ) -> (egui::Response, Rect) {
-    let min_w = 40.0 + spec.lead + spec.trail;
+    let step = if spec.mono {
+        theme::step::DATA
+    } else {
+        theme::step::LABEL
+    };
+    // Room for a few characters of the type actually being typed, not for a few
+    // characters of the type this was measured against once.
+    let min_w = theme::sized(step) * 3.0 + spec.lead + spec.trail;
     let width = if width.is_finite() {
         width.max(min_w)
     } else {
         min_w
     };
-    let (rect, _bg) = ui.allocate_exact_size(vec2(width, FIELD_H), Sense::hover());
+    let (rect, _bg) = ui.allocate_exact_size(vec2(width, field_h()), Sense::hover());
 
     let p = ui.painter();
     p.rect_filled(
@@ -206,8 +255,14 @@ fn field_impl(
     );
 
     let inner = Rect::from_min_max(
-        pos2(rect.left() + 10.0 + spec.lead, rect.top() + 4.0),
-        pos2(rect.right() - 10.0 - spec.trail, rect.bottom() - 4.0),
+        pos2(
+            rect.left() + inset_x() + spec.lead,
+            rect.top() + theme::space::S,
+        ),
+        pos2(
+            rect.right() - inset_x() - spec.trail,
+            rect.bottom() - theme::space::S,
+        ),
     );
 
     let te = egui::TextEdit::singleline(text)
@@ -217,9 +272,9 @@ fn field_impl(
         .text_color(theme::ink())
         .margin(Margin::ZERO)
         .font(if spec.mono {
-            theme::font(theme::step::DATA, theme::fam_mono())
+            theme::font(step, theme::fam_mono())
         } else {
-            theme::font(theme::step::LABEL, FontFamily::Proportional)
+            theme::font(step, FontFamily::Proportional)
         });
     // TextEdit recolors its hint with `weak_text_color`, so scope that to the
     // faint ink rather than tinting the hint text directly.
@@ -249,7 +304,7 @@ fn field_impl(
             theme::alpha(theme::custody_blocked(), 128),
         ),
     };
-    let y = rect.bottom() - 3.0;
+    let y = rect.bottom() - theme::space::S + theme::RULE_W;
     let p = ui.painter();
     p.hline(
         Rangef::new(inner.left(), inner.right()),
@@ -267,4 +322,67 @@ fn field_impl(
     }
 
     (resp, rect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every text scale the control can actually reach.
+    fn scales() -> impl Iterator<Item = f32> {
+        (14..=44).map(|k| k as f32 / 20.0)
+    }
+
+    /// The line box `register::line_h` returns: Plex Sans Arabic is 1.5em, and
+    /// a path or a folder name typed into one of these wells is ordinary.
+    fn line_box(step: f32, scale: f32) -> f32 {
+        step * scale * 1.5
+    }
+
+    /// The defect, as arithmetic: at 30px the well stopped clearing its own
+    /// type somewhere around 115%, which is where the user first saw it.
+    #[test]
+    fn a_well_clears_the_type_typed_into_it() {
+        for scale in scales() {
+            let line = line_box(theme::step::LABEL, scale);
+            let h = well_h(line);
+            assert!(
+                h >= line,
+                "a {line} line box does not fit a {h} well at {scale}"
+            );
+            // The inner rect the edit is put into, which is the well less the
+            // symmetric inset, still has to hold the line.
+            let inner = h - theme::space::S * 2.0;
+            assert!(
+                inner >= line,
+                "the edit is given {inner} for a {line} line at {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_grows_with_the_text_scale() {
+        let mut prev: Option<(f32, f32)> = None;
+        for scale in scales() {
+            let h = well_h(line_box(theme::step::LABEL, scale));
+            if let Some((was, before)) = prev {
+                assert!(h > before, "well flat from {was} to {scale}");
+            }
+            prev = Some((scale, h));
+        }
+    }
+
+    /// The well is the same height whichever face it carries, or a ticket field
+    /// and the field beside it sit on two different baselines.
+    #[test]
+    fn both_faces_rule_the_same_well() {
+        for scale in scales() {
+            let label = well_h(line_box(theme::step::LABEL, scale));
+            let data = well_h(line_box(theme::step::DATA, scale));
+            assert!(
+                label >= data,
+                "the mono well is the taller of the two at {scale}"
+            );
+        }
+    }
 }

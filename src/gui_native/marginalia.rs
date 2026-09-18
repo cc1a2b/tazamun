@@ -151,7 +151,10 @@ fn verb_slot(
     if !width.is_finite() || width < 2.0 {
         return false;
     }
-    let size = vec2(width, 30.0);
+    // The plate's own height, not a number that fitted it once: the slot is
+    // reserved before the plate exists, and at 2.2 a 30px cell held a 43px
+    // button that overran the row beneath it.
+    let size = vec2(width, components::plate_h());
     if offered {
         ui.allocate_ui_with_layout(
             size,

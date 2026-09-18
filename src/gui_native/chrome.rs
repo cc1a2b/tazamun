@@ -76,6 +76,28 @@ pub fn paint_root(ui: &egui::Ui, maximized: bool) {
     }
 }
 
+/// Where the girih band is ruled inside a title bar of `bar`: a band the height
+/// of one space step, inset from both ends and standing clear of the seam
+/// hairline at the bar's foot.
+///
+/// Pure, and separate from the painting because the band is the seam between
+/// the title bar and everything under it: the menu heads above rule themselves
+/// against the space it leaves, and a band that crept up into them would strike
+/// the words out.
+pub fn band_rect(bar: Rect) -> Rect {
+    let h = theme::space::M;
+    Rect::from_min_max(
+        egui::pos2(
+            bar.left() + theme::space::XXL,
+            bar.bottom() - h - theme::space::XS,
+        ),
+        egui::pos2(
+            bar.right() - theme::space::XXL,
+            bar.bottom() - theme::space::XS,
+        ),
+    )
+}
+
 /// Paints the title-bar surface (rounded top corners only).
 pub fn paint_titlebar_bg(ui: &egui::Ui, maximized: bool) {
     let rect = ui.max_rect();
@@ -88,17 +110,45 @@ pub fn paint_titlebar_bg(ui: &egui::Ui, maximized: bool) {
     };
     let p = ui.painter();
     p.rect_filled(rect, cr, theme::bg_chrome());
-    // The brand signature: a whisper of girih strapwork along the bar's foot,
-    // with the hairline underneath keeping the edge crisp.
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 10.0, rect.bottom() - 7.0),
-        egui::pos2(rect.right() - 10.0, rect.bottom() - 1.5),
-    );
-    ornament::girih_band(p, band, theme::wash::of(theme::gold(), theme::wash::GHOST));
+    // The brand signature, and the one piece of ornament always on screen:
+    // girih strapwork ruled along the bar's foot, stopped at each end by the
+    // house diamond so it reads as a drawn rule rather than a texture that ran
+    // off the edge.
+    //
+    // Struck at a wash, not at full `gold_deep`. This ornament has failed in
+    // both directions: at watermark alphas nobody could see it, and at full
+    // strength it became the brightest thing in the window and out-shouted the
+    // register it is supposed to introduce. It is a seam between the chrome and
+    // the page — legible as weave, never as a chain.
+    let band = band_rect(rect);
+    if band.is_positive() {
+        ornament::girih_band(
+            p,
+            band,
+            theme::wash::of(theme::gold_deep(), theme::wash::SELECT),
+        );
+        // Half the band's height, so the diamond's points land exactly on its
+        // two edges and the strapwork reads as stopped rather than as cut off.
+        let r = band.height() * 0.5;
+        ornament::diamond(
+            p,
+            egui::pos2(band.left(), band.center().y),
+            r,
+            theme::gold(),
+        );
+        ornament::diamond(
+            p,
+            egui::pos2(band.right(), band.center().y),
+            r,
+            theme::gold(),
+        );
+    }
+    // The seam itself: one crisp gold hairline where the chrome ends and the
+    // page begins.
     p.hline(
         rect.x_range(),
-        rect.bottom() - 0.5,
-        Stroke::new(theme::RULE_W, theme::alpha(theme::gold(), 41)),
+        theme::snap(rect.bottom() - theme::RULE_W),
+        Stroke::new(theme::RULE_W, theme::gold_deep()),
     );
 }
 
@@ -264,5 +314,34 @@ pub fn resize_zones(ui: &egui::Ui) {
     if ui.input(|i| i.pointer.primary_pressed()) {
         ui.ctx()
             .send_viewport_cmd(ViewportCommand::BeginResize(dir));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bar(w: f32) -> Rect {
+        Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, TITLEBAR_H))
+    }
+
+    /// The band belongs to the bar's foot and to nothing above it: the menu
+    /// heads rule themselves in the space it leaves.
+    #[test]
+    fn the_band_sits_clear_at_the_foot_of_the_bar() {
+        let bar = bar(900.0);
+        let band = band_rect(bar);
+        assert!(band.is_positive());
+        assert!(band.bottom() < bar.bottom(), "{band:?}");
+        assert!(band.top() > bar.center().y, "{band:?}");
+        assert!(band.left() > bar.left() && band.right() < bar.right());
+    }
+
+    /// A window squeezed narrower than the band's own insets must not paint a
+    /// band inside out.
+    #[test]
+    fn a_bar_too_narrow_for_the_band_yields_nothing_to_paint() {
+        assert!(!band_rect(bar(8.0)).is_positive());
+        assert!(!band_rect(bar(0.0)).is_positive());
     }
 }

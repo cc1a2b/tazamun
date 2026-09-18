@@ -13,7 +13,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/cc1a2b/tazamun)](https://github.com/cc1a2b/tazamun/stargazers)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/cc1a2b/tazamun/releases)
 
-<img src="assets/screenshots/home.png" alt="The tazamun desktop app: every session on this machine in one window" width="820">
+<img src="assets/screenshots/home.png" alt="The tazamun desktop app: every session on this machine in one window, under a session / tools / display / help menu bar" width="820">
 
 </div>
 
@@ -39,7 +39,7 @@ Two people behind two different NATs connect with nothing but an invite string. 
                             and can never open what it forwards
 ```
 
-> **Status — v0.1.0.** The sync engine, the CLI, the loopback dashboard and the native desktop app are all built and gate-clean: `fmt`, `clippy -D warnings`, and the full test suite pass on every commit. Every load-bearing decision — with the reasoning, including the ones that turned out to be wrong — is written down in [DECISIONS.md](DECISIONS.md).
+> **Status — v0.2.1.** The sync engine, the CLI, the loopback dashboard and the native desktop app are all built and gate-clean: `fmt`, `clippy -D warnings`, and the full test suite (781 tests) pass on every commit. Every load-bearing decision — with the reasoning, including the ones that turned out to be wrong — is written down in [DECISIONS.md](DECISIONS.md).
 
 ---
 
@@ -91,37 +91,41 @@ machine, peered over the LAN, with a lease actually held. Nothing is a mockup.
 
 <div align="center">
 
-<img src="assets/screenshots/overview.png" alt="Session overview: member health, activity feed, and the invite ticket with its QR" width="880">
+<img src="assets/screenshots/overview.png" alt="Session overview: a plain-sentence summary, a standing notice about the held file, the session's facts, and live movement" width="880">
 
 </div>
 
-**One session, at a glance.** Files, mode, role, peers online and conflicts across
-the top; every member with its grade, path and round-trip; the activity feed showing
-this peer arriving *relayed at 647 ms* and then upgrading to a *direct 0 ms* path —
-hole-punching, visible as it happens. The invite is generated in-process as text and
-as a scannable QR. (Blurred here on purpose: **a ticket carries the session secret.**)
+**One session, at a glance.** It opens with a sentence, not a scoreboard —
+*5 files, you hold 1 file, in step with 1 peer.* Under it, anything that wants a
+decision stands as a **notice with the action attached**: one file is still held
+by you, and the way out is the button beside the words. Then the facts of the
+session, ruled like a ledger — mode, role, tracked files, peers reachable,
+preserved copies — followed by what is moving right now, and the invite.
 
 <table>
 <tr>
-<td width="50%"><img src="assets/screenshots/files.png" alt="The Files tab: files grouped by folder with weight bars, one file leased" width="100%"></td>
-<td width="50%"><img src="assets/screenshots/peers.png" alt="The Peers tab: the mesh drawn as a constellation" width="100%"></td>
+<td width="50%"><img src="assets/screenshots/files.png" alt="The Files tab: a numbered register of files, the held one sealed in the margin" width="100%"></td>
+<td width="50%"><img src="assets/screenshots/peers.png" alt="The Peers tab: the mesh drawn as a constellation over a register of links" width="100%"></td>
 </tr>
 <tr>
 <td valign="top">
 
-**Files.** Grouped by folder, each group carrying a bar for its share of the
-session's bytes, so you can see what is actually heavy. `button.tsx` is checked
-out — sealed, marked <b>locked · you</b>, and the button offers <b>Unlock</b>.
-Every other file shows <b>Lock</b>, because every other file is read-only on disk.
+**Files.** A register, not a grid of cards: every file is a ruled entry with a
+folio number in the margin, grouped by folder, each group carrying its share of
+the session's bytes so you can see what is actually heavy. `button.tsx` is checked
+out — its folio is replaced by a **khatam seal**, it reads <b>held · you</b>, and
+the button offers <b>Unlock</b>. Every other file shows <b>Lock</b>, because every
+other file is read-only on disk.
 
 </td>
 <td valign="top">
 
 **Peers.** A mesh is a shape, not a list — the questions are spatial. You are the
 centre; each peer is a star on a log round-trip scale, with hairline rings at the
-80 ms and 300 ms grade thresholds. A **taut woven band** means a direct path; a
-broken thread means relayed. Angles come from a hash of the peer id, so the sky
-never shimmers between refreshes.
+80 ms and 300 ms grade thresholds. Angles come from a hash of the peer id, so the
+sky never shimmers between refreshes. Below it the same peers as ruled entries:
+how each is reached, its round-trip, a sparkline of this window's own record, and
+bytes up and down.
 
 </td>
 </tr>
@@ -671,12 +675,50 @@ Prefer a real app to a terminal? `tazamun gui` opens a **native desktop window**
 tazamun gui                    # open the native window
 ```
 
-It looks like an app made this decade, because it draws its own window: OS decorations are off and the frameless, **rounded-corner** body — title bar, minimize/maximize/close, edge resizing, drag, double-click-to-maximize — is painted by the app itself, identically on every platform. The design system comes from the project's own brand: deep lapis surfaces, the gold accent, and a wordmark typeset live from the embedded Inter — a gold `T` and the rest in ink. (It began as a pre-rendered texture of the shaped Arabic `تزامُن`, because egui has no bidi or shaping and would have drawn the letters disjoint; the Latin form needs neither, stays crisp at any display scale, and is simply easier to read at UI size. Arabic stays where it earns its place: file and session names, which render as content, with an embedded Noto Sans Arabic fallback so they never become tofu boxes. Fonts are OFL-licensed and their licenses ship in `assets/fonts/`.) Tabs slide a gold underline, cards and buttons hover with animated fills, toasts fade and rise — motion in the tens-of-milliseconds range, not a slideshow.
+### It is a register, not a dashboard
+
+The window is built on one idea, and it is worth saying plainly because it
+explains every other choice: **a folder under strict checkout is a register of
+custody** — a deed book recording who holds what — so the app is drawn as one.
+There are no cards, no capsule pills, no row of big numbers across the top. Files
+and peers are **ruled entries** with a folio number in the margin, the way a bound
+ledger numbers its lines. Colour carries exactly one meaning, custody: gold is
+held by you, green is free, red is contested. A file under lease gets the
+**khatam seal** in its margin where the folio number would be — the seal is
+reserved for that and used nowhere else.
+
+The chrome is the app's own: OS decorations are off and the frameless,
+rounded-corner body — title bar, window buttons, edge resizing, drag,
+double-click-to-maximize — is painted identically on every platform. Type is the
+**IBM Plex** superfamily, embedded: Serif is the engraved voice for headings and
+the wordmark, Sans is the reading voice, and **Mono carries every figure** in the
+app — sizes, round-trips, counts, ids — because egui cannot reach OpenType's
+`tnum` and unlined figures make columns of numbers jitter as they update. Arabic
+file and session names render through IBM Plex Sans Arabic, so they never become
+tofu boxes. All faces are OFL and the license ships in `assets/fonts/`.
+
+Three palettes, switchable live from **display** in the menu bar: **Contrast**
+(the default — maximum separation), **Night**, and **Paper** for a lit room or a
+projector. Every pairing is unit-tested against a contrast floor, so a palette
+cannot ship with text that is merely decorative. Text size is `Ctrl+±` across
+85%–150%, and everything sized in the window derives from the type scale rather
+than a constant, which is why nothing clips when you scale it.
+
+### The menu bar
+
+The title bar carries a real menu bar — `session · tools · display · help` — so
+the window's whole vocabulary is reachable without hunting:
+
+- **session** — start, stop, pause, resume, open the folder, copy its path, rename it.
+- **tools** — `doctor`, the web dashboard, garbage collection, key rotation, conflict pruning, and installing or removing the OS supervisor service.
+- **display** — palette, density, reduced motion, text size.
+- **help** — the shortcut sheet, the colophon, and **check / apply update** (the in-app updater; it reuses `tazamun update`, and an install owned by npm or Homebrew is told to use its own manager's command instead of being overwritten behind its back).
 
 A sidebar lists every folder you've ever `init`'d or `join`'d — live or stopped — each with a status dot, its role and strict/easy mode, file count and size, peer health, and a quarantine badge. `Ctrl+K` opens a command palette that fuzzy-jumps to any session, starts or stops it, or switches tabs. The session workspace:
 
-- **Overview** — member health (grade, connection type, RTT, LAN), live transfer progress with rates, the recent-activity feed, and the folder's invite as text **and** a scannable QR, both generated in-process.
-- **Files** — every tracked file with one-click lock/unlock, filterable; each file expands into its **version history** with restore, pin, and tag actions inline.
+- **Overview** — a plain-sentence summary of where the folder stands, then anything wanting a decision as a standing notice with its action attached, then the session's facts (mode, role, tracked files, peers reachable, preserved copies), live transfer progress with rates, and the folder's invite as text **and** a scannable QR, both generated in-process.
+- **Peers** — the mesh drawn as a constellation on a log round-trip scale, over one ruled entry per device: how it is reached (direct or relayed, LAN or not), its round-trip, a sparkline of the trend this window has actually recorded, and bytes moved each way.
+- **Files** — every tracked file as a numbered entry with one-click lock/unlock, filterable, grouped by folder with each group's share of the bytes; each file expands into its **version history** with restore, pin, and tag actions inline. The list is virtualised, so a folder with tens of thousands of files scrolls at the same speed as one with five.
 - **Conflicts** — the preserved-copy browser: *keep mine* runs the guided lock → apply → publish → discard (the copy is deleted only after the write is published), or *keep theirs* — which asks for explicit confirmation before the one destructive step.
 - **History** — the whole folder's version timeline, newest first, with the same restore/pin/tag actions.
 - **Audit** — the folder's event log with color-coded event kinds, readable even while the session is stopped.
@@ -694,9 +736,9 @@ What makes it safe and small:
 
 <div align="center">
 
-<img src="assets/screenshots/files.png" alt="The Files tab, with one file checked out" width="860">
+<img src="assets/screenshots/files.png" alt="The Files tab, with one file checked out and sealed in the margin" width="860">
 
-<sub>Files, grouped by folder and weighted by share of the session's bytes. One file is checked out; every other file is read-only on disk.</sub>
+<sub>The register: one ruled entry per file, folio-numbered in the margin, grouped by folder and weighted by share of the session's bytes. <code>button.tsx</code> is checked out, so its folio is replaced by the khatam seal; every other file is read-only on disk.</sub>
 
 </div>
 

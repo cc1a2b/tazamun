@@ -18,7 +18,7 @@
 
 use eframe::egui;
 
-use super::{a11y, focusnav, ornament, theme};
+use super::{a11y, focusnav, ornament, register, theme};
 
 /// Everything the strip reports, gathered by the caller.
 pub struct Status<'a> {
@@ -37,8 +37,26 @@ pub struct Status<'a> {
     pub version: Option<&'a str>,
 }
 
-/// Height the caller should give the bottom panel.
+/// The shortest the strip is ever drawn: at 100% the counts do not fill this,
+/// and a rail thinner than it reads as a seam rather than a foot. It is a floor
+/// only — [`strip_h`] is the height the caller must give the panel.
 pub const STRIP_H: f32 = 26.0;
+
+/// Height the caller should give the bottom panel: the line box the strip's
+/// counts actually lay out into, with air above and below, and never less than
+/// [`STRIP_H`].
+///
+/// A constant could not answer this. The strip's type follows the text scale
+/// and a 26px rail does not, so at 200% the counts were taller than the rail
+/// painting them.
+pub fn strip_h() -> f32 {
+    rail_h(register::line_h(theme::step::META))
+}
+
+/// Pure: the rail around one line box.
+fn rail_h(line_h: f32) -> f32 {
+    (line_h + theme::space::M).max(STRIP_H)
+}
 
 /// Bottom-corner radius when the window is restored. Mirrors `theme::R_WINDOW`
 /// (and therefore `chrome::radius`) — the strip sits on the window's bottom
@@ -49,14 +67,26 @@ const R_WINDOW_BOTTOM: u8 = theme::R_WINDOW;
 const PAD_L: f32 = 14.0;
 /// Air on each side of a separator diamond.
 const SEP_AIR: f32 = 10.0;
-/// Right edge shared by the counts' hard bound and the note's alignment —
-/// leaves the seal its own air.
-const CONTENT_RIGHT: f32 = 34.0;
-/// Below this much free space the note is dropped rather than squeezed.
-const NOTE_MIN_W: f32 = 60.0;
 /// Breathing space between the last count and the note.
 const NOTE_AIR: f32 = 8.0;
+/// The seal's centre, inset from the strip's right edge.
+const SEAL_INSET: f32 = 16.0;
 const SEAL_R: f32 = 6.0;
+
+/// Right edge shared by the counts' hard bound and the note's alignment. Cut
+/// from where the seal actually is rather than written down beside it: the two
+/// used to be separate numbers that happened to clear each other.
+fn content_right() -> f32 {
+    SEAL_INSET + SEAL_R + theme::space::L
+}
+
+/// Below this much free space the note is dropped rather than squeezed. About
+/// five characters of the strip's own type, so the threshold means the same
+/// thing at 70% as at 220% — a fixed 60 was five characters at one scale and
+/// two at another.
+fn note_min_w() -> f32 {
+    theme::sized(theme::step::META) * 5.0
+}
 
 /// What the strip is called when it is read out rather than seen.
 const LEAD: &str = "status";
@@ -99,12 +129,19 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
 
     // Top edge: a whisper of strapwork with the hairline over it keeping the
     // seam crisp. Intersected with the strip so a squeezed panel can't bleed.
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 12.0, rect.top() + 1.0),
-        egui::pos2(rect.right() - 12.0, rect.top() + 6.0),
-    )
-    .intersect(rect);
-    ornament::girih_band(p, band, theme::wash::of(theme::gold(), theme::wash::GHOST));
+    //
+    // The strapwork is the first thing to go when the rail is shorter than the
+    // counts it carries — a panel still sized from the old constant at a large
+    // text scale — because a band drawn across the words is worse than no band.
+    // The hairline stays: it is the seam, not an ornament.
+    if rect.height() >= strip_h() {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 12.0, rect.top() + 1.0),
+            egui::pos2(rect.right() - 12.0, rect.top() + 6.0),
+        )
+        .intersect(rect);
+        ornament::girih_band(p, band, theme::wash::of(theme::gold(), theme::wash::GHOST));
+    }
     p.hline(
         rect.x_range(),
         rect.top() + 0.5,
@@ -113,7 +150,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
 
     // Counts are hard-clipped short of the seal, so no count can ever run
     // under the note or the khatam however narrow the window gets.
-    let bound = rect.right() - CONTENT_RIGHT;
+    let bound = rect.right() - content_right();
     let counts = p.with_clip_rect(egui::Rect::from_min_max(
         rect.left_top(),
         egui::pos2(bound, rect.bottom()),
@@ -191,7 +228,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
     // screen says which build is running.
     let mut bound = bound;
     if let Some(v) = s.version.map(str::trim).filter(|v| !v.is_empty())
-        && bound - x >= NOTE_MIN_W
+        && bound - x >= note_min_w()
     {
         let galley = p.layout_no_wrap(v.to_owned(), font.clone(), theme::ink_faint());
         let size = galley.size();
@@ -212,7 +249,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
     // right-aligned; if that is cramped it is dropped whole rather than shown
     // as a stub.
     if let Some(note) = s.note
-        && bound - x >= NOTE_MIN_W
+        && bound - x >= note_min_w()
     {
         let galley = p.layout_no_wrap(note.to_owned(), font, theme::ink_faint());
         let size = galley.size();
@@ -230,7 +267,7 @@ pub fn status_strip(ui: &mut egui::Ui, s: Status<'_>, maximized: bool) {
 
     // The seal: outlined and still at rest, filled while busy — breathing only
     // when the user has not asked for stillness.
-    let seal = egui::pos2(rect.right() - 16.0, cy);
+    let seal = egui::pos2(rect.right() - SEAL_INSET, cy);
     let breathing = s.busy && !theme::reduced_motion();
     if breathing {
         let phase = (ui.input(|i| i.time) * 2.2).sin() as f32 * 0.5 + 0.5;
@@ -363,6 +400,50 @@ mod tests {
         assert_eq!(
             strip_sentence(&empty),
             "status: 0 sessions, 0 running, 0 peers online, idle"
+        );
+    }
+
+    // ── the rail's own measure ──
+
+    /// Every text scale the control can actually reach.
+    fn scales() -> impl Iterator<Item = f32> {
+        (14..=44).map(|k| k as f32 / 20.0)
+    }
+
+    fn line_box(step: f32, scale: f32) -> f32 {
+        step * scale * 1.5
+    }
+
+    /// The strip centres its counts in the panel it is given, so a panel
+    /// shorter than the line box slices them top and bottom.
+    #[test]
+    fn the_rail_clears_the_counts_painted_on_it() {
+        for scale in scales() {
+            let line = line_box(theme::step::META, scale);
+            let h = rail_h(line);
+            assert!(
+                h >= line,
+                "a {line} line box does not fit a {h} rail at {scale}"
+            );
+            assert!(h >= STRIP_H, "the rail dropped under its floor at {scale}");
+        }
+    }
+
+    #[test]
+    fn the_rail_grows_with_the_text_scale() {
+        let small = rail_h(line_box(theme::step::META, 0.7));
+        let large = rail_h(line_box(theme::step::META, 2.2));
+        assert_eq!(small, STRIP_H, "small text still gets the house floor");
+        assert!(large > small, "{small} to {large} is not a text scale");
+    }
+
+    /// The counts stop where the seal's own air begins, whatever the seal is
+    /// drawn at — one measure, not two numbers that agree today.
+    #[test]
+    fn the_counts_stop_clear_of_the_seal() {
+        assert!(
+            content_right() >= SEAL_INSET + SEAL_R,
+            "a count can be drawn under the seal"
         );
     }
 

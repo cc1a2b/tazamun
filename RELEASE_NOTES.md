@@ -1,3 +1,73 @@
+# Tazamun v0.2.1
+
+One reported defect, its whole family hunted down, and the head of the window
+given the hand the rest of the register is written in.
+
+## The defect
+
+In the first-run guide, steps 2 and 3 sat below the numbered medallions they
+belonged to — the thread ran from one mark to a point a little above the next.
+The connector between steps was drawn at a constant length while the step's own
+text set its real height, so the two agreed only at the text scale the constant
+was picked at.
+
+The fix is the rule this release is really about: **a mark now reports where it
+was struck, and the thread is drawn between the two reported positions.** No
+number in the middle to keep in sync.
+
+## Its whole family
+
+The same mistake — a constant standing in for the size of laid-out type — was
+sitting in twelve more places across the window, several of them already broken
+at the default text size:
+
+- **The balance figure drew the conflict cards over their own caption.** The
+  cards started at a fixed 96 from the top of the figure, and the weight written
+  under the sinking pan reached past that before the text scale even got to
+  100%. The figure is now measured from the lines it actually holds — four per
+  card, one of them wrapped — and the same arithmetic that rules it walks down
+  it while drawing, so what was measured and what is painted cannot drift.
+- **The peer mesh drew a 0 ms peer through the "you" label.** On a LAN that is
+  the common case, not an edge case: the label's room was a fixed 22, which is
+  one line of meta type at 100% and well short of it by 150%.
+- **The invite ticket's QR, its seal and its indent were three numbers that had
+  to agree with each other.** They are now one, and the string is indented past
+  the mark's own measured width.
+- Toasts, the status strip, the colophon seal, the marginalia caps, the field
+  rows and the drop zone were each ruled by a constant chosen at 100%; all are
+  now derived from the type scale. The khatam over the wordmark was a fixed
+  40 px above type that doubles — a wordmark wearing a button.
+
+Each fix ships with the defect written down as arithmetic in a test, so the
+constant cannot come back: the tests assert the figures fit their content at
+every text scale the control can reach, not merely at the one it was drawn at.
+
+## The head of the window
+
+The menu bar was correct and plain — it read like a toolbar, which is the one
+thing the rest of the window is not. It is now set the way the register is:
+
+- The open head **cuts a doorway through the girih band**, so the panel reads as
+  something opened in the page rather than a box floating over it.
+- A panel is a **leaf of the deed book** — a serif title, a gold roman folio
+  (I, II, III, IV), section heads out-dented into the margin the way a scribe
+  heads a passage, and a gutter rule whose gold swell marks the choice in force.
+- Corner flourishes and the house diamond as the separator between heads,
+  instead of a vertical bar.
+
+The band itself is struck at the select wash rather than at full gold — at full
+strength it was the brightest thing on screen and pulled the eye off the work.
+
+## Display left Home
+
+Palette, density, motion and text size appeared both on Home and under
+**display** in the bar. Two places to change one thing is two places to
+disagree; Home's copy is gone and the bar's is the only one. The bar is reachable
+from inside a session, which is where you actually notice the text is too small —
+Home's copy never was.
+
+---
+
 # Tazamun v0.2.0
 
 A menu bar in the head of the window, the high-contrast palette as the one it
